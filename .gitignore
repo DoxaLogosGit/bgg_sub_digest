@@ -1,0 +1,17 @@
+node_modules/
+dist/
+
+# Never commit credentials or personal data
+config.json
+state.json
+
+# Playwright saves a browser profile here (includes session cookies)
+bgg-browser-profile/
+
+# Generated digest output and logs
+digests/
+logs/
+.playwright-mcp/
+
+# PID lock file used to prevent duplicate cron runs
+bgg-digest.pid

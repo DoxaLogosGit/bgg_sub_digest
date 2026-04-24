@@ -1,0 +1,29 @@
+{
+  "bgg": {
+    "username": "your_bgg_username",
+    "password": "your_bgg_password",
+    "apiKey": "your_bgg_xml_api_key"
+  },
+  "topics": {
+    "games": [
+      "Twilight Imperium",
+      "Spirit Island",
+      "Gloomhaven"
+    ],
+    "keywords": [
+      "solo",
+      "cooperative",
+      "expansion",
+      "kickstarter",
+      "review"
+    ],
+    "importantGeeklistTitles": ["SGOYT"],
+    "importantThreadTitles": []
+  },
+  "digest": {
+    "outputDir": "./digests",
+    "scheduleMode": "daily",
+    "maxNewItemsPerSubscription": 50,
+    "headless": true
+  }
+}
