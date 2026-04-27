@@ -112,6 +112,158 @@ function extractNotifiedId(href: string, type: SubscriptionType): number | null 
   }
 }
 
+// ---- parseUnreadCount ----------------------------------------
+//
+// Tries to extract BGG's advertised count of unread posts/items/comments
+// from the full text content of a GG-ITEM-LINK-UI notification row.
+//
+// BGG shows one row per subscription with a summary of what's new:
+//   Threads:   "3 more replies"   or  "3 more posts"
+//   Geeklists: "5 new items"      and/or "2 new comments"
+//
+// We don't know the exact format without seeing real rows, so we cast a
+// wide net and sum any numbers we find next to these keywords.
+// A debug log of the raw fullText is emitted so we can tune the patterns.
+//
+// Returns the total count (sum across all matched phrases), or 0 if nothing
+// matched — 0 means unknown, not "no new content".
+//
+// PYTHON CONTEXT: `re.findall(r'(\d+)\s+(?:more|new)\s+\w+', text)` collects
+// all matches. We use String.matchAll() which returns an iterator of matches —
+// Python: list(re.finditer(pattern, text))
+function parseUnreadCount(rowText: string): number {
+  if (!rowText) return 0;
+
+  // Emit the raw text once so we can inspect BGG's actual format and tune these
+  // patterns. Comment this out after we've confirmed the patterns are correct.
+  log.debug('BGG notification row fullText (for unreadCount tuning)', {
+    text: rowText.slice(0, 300),
+  });
+
+  // Pattern: optional "more" or "new", then a count keyword.
+  // `String.matchAll(re)` returns an iterator of all match objects.
+  // Python: re.finditer(pattern, text, re.IGNORECASE)
+  //
+  // We use a single pattern that covers:
+  //   "3 more replies"    →  (\d+)\s+more\s+repl
+  //   "5 new items"       →  (\d+)\s+new\s+item
+  //   "7 new comments"    →  (\d+)\s+new\s+comment
+  //   "2 more posts"      →  (\d+)\s+more\s+post
+  const pattern = /(\d+)\s+(?:more|new)\s+(?:repl|post|item|comment)/gi;
+  const matches = [...rowText.matchAll(pattern)];
+
+  if (matches.length === 0) {
+    // Broader fallback: any number directly before the keyword (no "more"/"new" qualifier).
+    // Catches formats like "4 replies" or "12 items".
+    const fallback = /(\d+)\s+(?:repl|post|item|comment)/gi;
+    const fallbackMatches = [...rowText.matchAll(fallback)];
+    if (fallbackMatches.length > 0) {
+      // `.reduce()` sums all matches — Python: sum(int(m.group(1)) for m in matches)
+      return fallbackMatches.reduce((sum, m) => sum + parseInt(m[1], 10), 0);
+    }
+    return 0;
+  }
+
+  // Sum all matched counts — a geeklist row might say "5 new items, 3 new comments"
+  // giving a total of 8. Python: sum(int(m.group(1)) for m in matches)
+  return matches.reduce((sum, m) => sum + parseInt(m[1], 10), 0);
+}
+
+// ---- parseNotificationDate ----------------------------------------
+//
+// Tries to extract a date from the full text content of a GG-ITEM-LINK-UI
+// notification row. BGG renders timestamps in several formats:
+//
+//   Relative: "2 hours ago"  "3 days ago"  "Yesterday"  "Today"
+//   Absolute: "Apr 20, 2025"  "April 20, 2025"  "2025-04-20"
+//
+// WHY: The XML API returns ALL comments on a geeklist item, not just new
+// ones. Without a "last visited" date we can't tell which comments were
+// added since the user's last visit. The notification row's timestamp is
+// our best approximation — comments newer than that date are "new".
+//
+// Returns a Date on success, null if nothing parseable is found.
+//
+// PYTHON CONTEXT: equivalent to dateutil.parser.parse() for relative times.
+// Python's dateutil handles "3 days ago" natively; we do it by hand here
+// because there's no built-in JS equivalent.
+function parseNotificationDate(rowText: string): Date | null {
+  if (!rowText) return null;
+
+  // ---- Relative time: "N minutes/hours/days/weeks ago" ----
+  //
+  // Regex: (\d+) captures the number, (minute|hour|day|week) captures the unit.
+  // `i` flag = case-insensitive — Python: re.IGNORECASE
+  const relMatch = rowText.match(/(\d+)\s+(minute|hour|day|week)s?\s+ago/i);
+  if (relMatch) {
+    const amount = parseInt(relMatch[1], 10);
+    const unit   = relMatch[2].toLowerCase();
+    const now    = new Date();
+    // Map each unit to milliseconds — no JS equivalent of Python's timedelta
+    const msMap: Record<string, number> = {
+      minute: 60 * 1000,
+      hour:   60 * 60 * 1000,
+      day:    24 * 60 * 60 * 1000,
+      week:   7 * 24 * 60 * 60 * 1000,
+    };
+    // Date arithmetic in JS uses milliseconds since epoch (Unix timestamp * 1000)
+    // Python: datetime.now() - timedelta(milliseconds=ms)
+    return new Date(now.getTime() - ((msMap[unit] ?? 0) * amount));
+  }
+
+  // "Yesterday" — treat as midnight of yesterday
+  // `.test()` = Python's bool(re.search(...))
+  if (/yesterday/i.test(rowText)) {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    d.setHours(0, 0, 0, 0);  // midnight — Python: d.replace(hour=0, minute=0, second=0)
+    return d;
+  }
+
+  // "Today" or "Just now"
+  if (/\btoday\b|\bjust now\b/i.test(rowText)) {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+
+  // Month-name absolute date: "Apr 20, 2025", "April 20, 2025", or "Apr 20" (no year)
+  //
+  // BGG omits the year when the date is in the current year — e.g. "Apr 20" instead
+  // of "Apr 20, 2025". `new Date("Apr 20")` in Node.js V8 parses to year 2001, not
+  // the current year, so we must supply the year manually when it's absent.
+  //
+  // We default to the current year, then step back one year if the resulting date is
+  // in the future (handles the edge case of a "Dec 31" notification seen in January).
+  const monthNamePattern = /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:,\s+\d{4})?/i;
+  const monthMatch = rowText.match(monthNamePattern);
+  if (monthMatch) {
+    const matched = monthMatch[0];
+    // Check whether the match already contains a 4-digit year.
+    // Python: bool(re.search(r'\d{4}', matched))
+    const hasYear = /\d{4}/.test(matched);
+    // If no year, append the current year so Node.js doesn't default to 2001.
+    // Python: f"{matched}, {datetime.now().year}" if not has_year else matched
+    const dateStr = hasYear ? matched : `${matched}, ${new Date().getFullYear()}`;
+    const d = new Date(dateStr);
+    if (!isNaN(d.getTime())) {
+      // If the resulting date is in the future (e.g. "Dec 31" seen in January),
+      // subtract one year — BGG notification dates are never in the future.
+      if (d > new Date()) d.setFullYear(d.getFullYear() - 1);
+      return d;
+    }
+  }
+
+  // Numeric absolute: "2025-04-20" (ISO) or "04/20/2025" (US)
+  const numericMatch = rowText.match(/\b(\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4})\b/);
+  if (numericMatch) {
+    const d = new Date(numericMatch[1]);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  return null;
+}
+
 // ============================================================
 // scrapeSubscriptions — main export
 // ============================================================
@@ -210,75 +362,116 @@ export async function scrapeSubscriptions(
     // `while (true)` = infinite loop, broken by `break` when no Next page exists.
     // Python: while True: ... if not next_link: break
     while (true) {
-      // ---- Query all notification links on this page ----
+      // ---- Query all notification rows on this page ----
       //
-      // page.$$eval(selector, callback) is Playwright's "evaluate a function
-      // on ALL matching elements". It runs the callback INSIDE the browser
-      // process and returns a serializable result.
+      // KEY CHANGE: we now query the GG-ITEM-LINK-UI ELEMENTS themselves
+      // (not just the <a> tags inside them). This lets us also read the
+      // full row text, which contains the notification date BGG renders.
+      //
+      // Each row object has:
+      //   links    — all <a href> anchors inside this row
+      //   fullText — the entire text content of the row, including the
+      //              "N hours ago" or "Apr 20" timestamp
       //
       // Python Playwright equivalent:
-      //   elements = page.query_selector_all('gg-item-link-ui a[href]')
-      //   links = [{'href': el.get_attribute('href'), 'text': el.text_content()} for el in elements]
-      //
-      // The TypeScript version batches the extraction into ONE call to avoid
-      // the round-trip overhead of calling .getAttribute() once per element.
-      //
-      // `(els: Element[]) => ...` — the callback receives a real DOM Element
-      // array (NOT Playwright handles). `as HTMLAnchorElement[]` is a type cast
-      // that tells TypeScript "trust me, these are anchor elements with .href".
-      const links = await page.$$eval(
-        'gg-item-link-ui a[href]',
-        (els: Element[]) => (els as HTMLAnchorElement[]).map((el) => ({
-          href: el.href,                       // Absolute URL (browser resolves relative URLs)
-          text: el.textContent?.trim() ?? '',  // Visible link text, whitespace-stripped
+      //   rows = page.query_selector_all('gg-item-link-ui')
+      //   data = [
+      //     {'links': [(a.href, a.text_content()) for a in el.query_selector_all('a[href]')],
+      //      'fullText': el.text_content()}
+      //     for el in rows
+      //   ]
+      const rows = await page.$$eval(
+        'gg-item-link-ui',
+        (els: Element[]) => els.map((el) => ({
+          // All <a href> anchors inside this notification row.
+          // querySelectorAll is scoped to `el` — only finds descendants.
+          // Array.from() converts a NodeList to a plain array.
+          // Python: list(el.query_selector_all('a[href]'))
+          links: Array.from(el.querySelectorAll('a[href]')).map((a) => ({
+            href: (a as HTMLAnchorElement).href,  // Absolute URL
+            text: a.textContent?.trim() ?? '',
+          })),
+          // Full text of the entire row element — includes the timestamp BGG renders.
+          // `.textContent` returns ALL text in the element, including child elements.
+          // Python: el.text_content() or ''
+          fullText: el.textContent?.trim() ?? '',
         })),
       );
-      // `.textContent?.trim()` — the `?` is "optional chaining":
-      //   if textContent is null/undefined, don't call .trim(), just return undefined.
-      //   `?? ''` — if the result is undefined/null, use '' as fallback.
-      //   Python: (el.text_content() or '').strip()
 
-      // ---- Classify each link and accumulate subscriptions ----
-      for (const { href, text } of links) {
-        // Determine if this URL belongs to a thread or geeklist, and get its ID
-        const classified = classifyUrl(href);
-        if (!classified) continue;  // Skip URLs we don't recognize (ads, nav, etc.)
+      // We also track the EARLIEST (oldest) notification date per subscription.
+      // "Earliest" = the first piece of content we missed = best cutoff for
+      // "show geeklist comments newer than this date".
+      // Python: earliest_notif_date: dict[str, datetime] = {}
+      const earliestNotifDate = new Map<string, Date>();
 
-        // Build the deduplication key: "thread:3456789" or "geeklist:123456"
-        // Multiple notification rows from the same subscription share this key.
-        const key = `${classified.type}:${classified.id}`;
-        const notifiedId = extractNotifiedId(href, classified.type);
+      // ---- Process each notification row ----
+      for (const row of rows) {
+        // Attempt to parse the notification date and unread count from the row text.
+        // rowDate  — when this item was added/commented on (cutoff for date filter)
+        // rowCount — BGG's advertised number of unread posts/items/comments
+        const rowDate  = parseNotificationDate(row.fullText);
+        const rowCount = parseUnreadCount(row.fullText);
 
-        if (!found.has(key)) {
-          // First time we see this subscription — create a new entry.
-          // Strip the item/article anchor from the URL to get the subscription root.
-          const canonicalUrl = classified.type === 'thread'
-            ? `https://boardgamegeek.com/thread/${classified.id}`
-            : `https://boardgamegeek.com/geeklist/${classified.id}`;
+        for (const { href, text } of row.links) {
+          // Determine if this URL belongs to a thread or geeklist, and get its ID
+          const classified = classifyUrl(href);
+          if (!classified) continue;  // Skip URLs we don't recognize (ads, nav, etc.)
 
-          found.set(key, {
-            type:            classified.type,
-            id:              classified.id,
-            title:           text || `${classified.type} ${classified.id}`,
-            url:             canonicalUrl,
-            notifiedItemIds: notifiedId ? [notifiedId] : [],
-            // `notifiedId ? [notifiedId] : []` — if we found an ID, wrap it in
-            // an array; otherwise start with an empty array.
-          });
-        } else if (notifiedId) {
-          // We've seen this subscription before — just add the new item ID.
-          // `found.get(key)!` — the `!` is a "non-null assertion operator".
-          // We just confirmed .has(key) is true, so .get() won't return undefined.
-          // TypeScript can't figure that out on its own, so we tell it: "trust me".
-          const sub = found.get(key)!;
-          if (!sub.notifiedItemIds.includes(notifiedId)) {
-            sub.notifiedItemIds.push(notifiedId);
+          // Build the deduplication key: "thread:3456789" or "geeklist:123456"
+          // Multiple notification rows from the same subscription share this key.
+          const key = `${classified.type}:${classified.id}`;
+          const notifiedId = extractNotifiedId(href, classified.type);
+
+          if (!found.has(key)) {
+            // First time we see this subscription — create a new entry.
+            const canonicalUrl = classified.type === 'thread'
+              ? `https://boardgamegeek.com/thread/${classified.id}`
+              : `https://boardgamegeek.com/geeklist/${classified.id}`;
+
+            found.set(key, {
+              type:             classified.type,
+              id:               classified.id,
+              title:            text || `${classified.type} ${classified.id}`,
+              url:              canonicalUrl,
+              notifiedItemIds:  notifiedId ? [notifiedId] : [],
+              notificationDate: rowDate,
+              unreadCount:      rowCount,
+            });
+
+            if (rowDate) earliestNotifDate.set(key, rowDate);
+
+          } else {
+            // We've seen this subscription before — accumulate additional data.
+            // `found.get(key)!` — the `!` is a "non-null assertion operator".
+            // We just confirmed .has(key) is true, so .get() won't return undefined.
+            // TypeScript can't figure that out on its own, so we tell it: "trust me".
+            const sub = found.get(key)!;
+
+            if (notifiedId && !sub.notifiedItemIds.includes(notifiedId)) {
+              sub.notifiedItemIds.push(notifiedId);
+            }
+
+            // Accumulate unread counts across rows for the same subscription.
+            // Python: sub.unread_count += row_count
+            sub.unreadCount += rowCount;
+
+            // Keep whichever notification date is EARLIER (the oldest new content).
+            // Earlier date = we missed content from further back = broader filter window.
+            // `rowDate < existing` — JS Date comparison via milliseconds since epoch.
+            // Python: row_date < existing  (datetime objects compare directly)
+            if (rowDate) {
+              const existing = earliestNotifDate.get(key);
+              if (!existing || rowDate < existing) {
+                earliestNotifDate.set(key, rowDate);
+                sub.notificationDate = rowDate;
+              }
+            }
           }
         }
       }
 
       log.info(
-        `Subscriptions page ${contentPage}: ${links.length} notification rows, ` +
+        `Subscriptions page ${contentPage}: ${rows.length} notification rows, ` +
         `${found.size} unique subscriptions so far`,
       );
 

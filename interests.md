@@ -10,10 +10,14 @@ Highlight any mentions of these games with ⭐:
 - Earthborne Rangers
 - Marvel Champions
 - Deckers
+- Spacecorp
 - Western Front Ace
 - RAF: The Battle of Britain 1940
 - Terraforming Mars
 - Silent War
+- Away Team
+- Firefight Tactical
+- Star Wars: Outer Rim
 
 ## Keywords to Highlight
 Mark content touching these topics with ⭐:
@@ -22,7 +26,7 @@ Mark content touching these topics with ⭐:
 - expansion
 - kickstarter / crowdfunding
 - review
-- Giveaways
+- Giveaway
 
 ## Priority Subscriptions — Put These First
 These subscriptions are most important to me. Always show them at the top:
@@ -32,6 +36,7 @@ These subscriptions are most important to me. Always show them at the top:
 - Anything with "Acquisition" in the title
 - Anything with "Dave's" in the title
 - Anything with "SpaceBiff" in the title
+- Anything with "solo" in the title
 - Auction geeklists
 - Solo RPGs geeklists
 

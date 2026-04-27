@@ -39,12 +39,20 @@ import {
   fetchGeeklist,
   recentArticles,
   recentItems,
+  articlesNewerThan,
+  itemsNewerThan,
 } from './bgg/api';
 import {
-  summarizeAllContent,
   formatThreadContent,
   formatGeeklistContent,
+  writeSubscriptionFile,
+  writeManifest,
+  runClaudeDigest,
 } from './claude';
+// `import type` imports only the TypeScript type, not runtime code — erased at compile time.
+// Python: from typing import TYPE_CHECKING; if TYPE_CHECKING: from .claude import ManifestEntry
+import type { ManifestEntry, DigestResult } from './claude';
+import type { BggGeeklistItem, BggThreadArticle } from './types';
 import { buildMarkdown, writeDigest } from './digest';
 
 // ============================================================
@@ -223,11 +231,21 @@ async function main(): Promise<void> {
 
       // ---- 5. Fetch content for each outstanding subscription
 
-      // This array accumulates formatted content for all subscriptions.
-      // Type annotation: `Array<{ title: string; url: string; content: string }>`
-      // = an array of plain objects with those three fields.
-      // Python: content_sections: list[dict[str, str]] = []
-      const contentSections: Array<{ title: string; url: string; content: string }> = [];
+      // The directory where each subscription's data is written as its own file.
+      // Cleared and recreated each run so stale files from prior runs never linger.
+      // Claude reads files from this directory using its Read tool.
+      // Python: digest_data_dir = os.path.abspath('./digest-data')
+      const digestDataDir = path.resolve('./digest-data');
+      if (fs.existsSync(digestDataDir)) {
+        // rmSync with recursive:true = rm -rf — safe here because we own this directory.
+        // Python: shutil.rmtree(digest_data_dir, ignore_errors=True)
+        fs.rmSync(digestDataDir, { recursive: true, force: true });
+      }
+
+      // Each entry records the metadata for one subscription file on disk.
+      // After the loop, these are written as manifest.json for Claude to index.
+      // Python: manifest_entries: list[ManifestEntry] = []
+      const manifestEntries: ManifestEntry[] = [];
 
       // The per-subscription item cap from config (default: 15).
       // Stored in a local variable for convenience — avoids repeating
@@ -251,18 +269,67 @@ async function main(): Promise<void> {
             continue;  // `continue` skips the rest of this loop iteration — same as Python
           }
 
-          // Take the N most-recently-active articles (sorted by max(postdate, editdate))
-          const articles = recentArticles(thread.articles, maxItems);
-          log.info(`Thread "${thread.subject}": ${articles.length} articles to include`);
+          // ---- Filter to articles with new activity since the last visit ----
+          //
+          // PRIMARY: use notificationDate to find ALL articles posted since then.
+          // BGG's notification page only surfaces a few article IDs per thread even
+          // when many new posts exist — the April 2026 Culling thread showed 4 new
+          // posts but notifiedItemIds only captured 1, causing the other 3 to be
+          // dropped. Date-based filtering solves this the same way we solved it for
+          // geeklists.
+          //
+          // FALLBACK: if notificationDate is null, use notifiedItemIds; then recency.
+          //
+          // `let articles: BggThreadArticle[]` — explicit type since the if/else
+          // branches each assign different expressions. Python: articles: list[BggThreadArticle]
+          let articles: BggThreadArticle[];
 
-          // Only add to contentSections if there's something to show.
-          // An empty articles array would produce a useless section in Claude's output.
+          if (sub.notificationDate !== null) {
+            // Date-based filter — all articles posted AFTER the last-visit cutoff.
+            // articlesNewerThan() returns them sorted oldest→newest (reading flow).
+            // Python: articles = articles_newer_than(thread.articles, sub.notification_date)
+            articles = articlesNewerThan(thread.articles, sub.notificationDate);
+
+            if (articles.length === 0) {
+              // No articles newer than the cutoff — fall back to notifiedItemIds or recency.
+              const notifiedFallback = new Set(sub.notifiedItemIds);
+              articles = notifiedFallback.size > 0
+                ? thread.articles.filter((a) => notifiedFallback.has(a.id))
+                    .sort((a, b) => a.postdate.getTime() - b.postdate.getTime())
+                : recentArticles(thread.articles, maxItems);
+            }
+          } else {
+            // No notificationDate — use sparse BGG-surfaced IDs, then recency.
+            const notified = new Set(sub.notifiedItemIds);
+            articles = notified.size > 0
+              ? thread.articles
+                  .filter((a) => notified.has(a.id))
+                  .sort((a, b) => a.postdate.getTime() - b.postdate.getTime())
+              : recentArticles(thread.articles, maxItems);
+            if (articles.length === 0) articles = recentArticles(thread.articles, maxItems);
+          }
+
+          log.info(`Thread "${thread.subject}": ${articles.length} articles selected`, {
+            notifiedIds:  sub.notifiedItemIds.length,
+            hasDate:      sub.notificationDate !== null,
+            totalArticles: thread.articles.length,
+          });
+
+          // Write this thread's content to a file for Claude to read.
           if (articles.length > 0) {
-            contentSections.push({
-              // Prefer the thread's actual subject over the scraped title (more reliable)
-              title:   thread.subject || sub.title,
-              url:     sub.url,
-              content: formatThreadContent(thread.subject, articles),
+            const threadContent  = formatThreadContent(thread.subject, articles);
+            const threadFilePath = writeSubscriptionFile(sub, threadContent, digestDataDir);
+            manifestEntries.push({
+              subscriptionId:   sub.id,
+              type:             sub.type,
+              title:            thread.subject || sub.title,
+              url:              sub.url,
+              filePath:         threadFilePath,
+              itemCount:        articles.length,
+              unreadCount:      sub.unreadCount,
+              // sub.notificationDate?.toISOString() converts Date→ISO string, or ?? null if absent.
+              // Python: sub.notification_date.isoformat() if sub.notification_date else None
+              notificationDate: sub.notificationDate?.toISOString() ?? null,
             });
           }
 
@@ -274,14 +341,78 @@ async function main(): Promise<void> {
             continue;
           }
 
-          const items = recentItems(geeklist.items, maxItems);
-          log.info(`Geeklist "${geeklist.title}": ${items.length} items to include`);
+          // ---- Filter to items with new activity since the last visit ----
+          //
+          // PRIMARY path: use notificationDate (the date BGG marked this subscription
+          // as last visited) to find ALL items with activity since then.
+          //
+          // This is the correct fix for high-volume subscriptions like SGOYT — BGG's
+          // notification page only surfaces a few rows even if 400+ items are new,
+          // so notifiedItemIds only captures 2-3 IDs. notificationDate captures WHEN
+          // you last visited, letting us include everything since then.
+          //
+          // FALLBACK: if notificationDate is null (couldn't parse), use the sparse
+          // notifiedItemIds set, or fall back to most-recent N by recency.
+          //
+          // `let items: BggGeeklistItem[]` — explicit type annotation because the
+          // if/else branches each assign different expressions. TypeScript can infer
+          // the type from a single expression, but with branching it's cleaner to
+          // declare it up front.
+          // Python: items: list[BggGeeklistItem]
+          let items: BggGeeklistItem[];
+
+          if (sub.notificationDate !== null) {
+            // Date-based filter — includes ALL items with activity after the cutoff.
+            // itemsNewerThan() checks max(postdate, editdate) > notificationDate
+            // and returns them sorted newest-first.
+            // Python: items = items_newer_than(geeklist.items, sub.notification_date)
+            items = itemsNewerThan(geeklist.items, sub.notificationDate);
+
+            if (items.length === 0) {
+              // Date filter produced nothing — notificationDate may have been parsed
+              // incorrectly, or BGG has no items newer than the cutoff. Fall back.
+              const notifiedFallback = new Set(sub.notifiedItemIds);
+              items = notifiedFallback.size > 0
+                ? geeklist.items.filter((item) => notifiedFallback.has(item.id))
+                : recentItems(geeklist.items, maxItems);
+            }
+          } else {
+            // No notificationDate — use the sparse BGG-surfaced IDs, then recency.
+            const notified = new Set(sub.notifiedItemIds);
+            items = notified.size > 0
+              ? geeklist.items
+                  .filter((item) => notified.has(item.id))
+                  .sort((a, b) => {
+                    const da = a.editdate > a.postdate ? a.editdate : a.postdate;
+                    const db = b.editdate > b.postdate ? b.editdate : b.postdate;
+                    return db.getTime() - da.getTime();  // Newest first
+                  })
+              : recentItems(geeklist.items, maxItems);
+            // Last resort — ID set matched nothing (ID mismatch with cached API data)
+            if (items.length === 0) items = recentItems(geeklist.items, maxItems);
+          }
+
+          log.info(`Geeklist "${geeklist.title}": ${items.length} items selected`, {
+            notifiedIds: sub.notifiedItemIds.length,
+            hasDate:     sub.notificationDate !== null,
+            totalItems:  geeklist.items.length,
+          });
 
           if (items.length > 0) {
-            contentSections.push({
-              title:   geeklist.title,
-              url:     sub.url,
-              content: formatGeeklistContent(geeklist.title, items),
+            // Write geeklist content to a file. No item cap here — the file-based
+            // approach lets Claude skim large files and summarize by theme rather
+            // than us truncating to an arbitrary limit before Claude ever sees the data.
+            const geeklistContent  = formatGeeklistContent(geeklist.title, items, sub.notificationDate);
+            const geeklistFilePath = writeSubscriptionFile(sub, geeklistContent, digestDataDir);
+            manifestEntries.push({
+              subscriptionId:   sub.id,
+              type:             sub.type,
+              title:            geeklist.title,
+              url:              sub.url,
+              filePath:         geeklistFilePath,
+              itemCount:        items.length,
+              unreadCount:      sub.unreadCount,
+              notificationDate: sub.notificationDate?.toISOString() ?? null,
             });
           }
         }
@@ -299,18 +430,49 @@ async function main(): Promise<void> {
       await apiPage.close();
       await subPage.close();
 
-      // ---- 6. Build the complete digest via one Claude call
+      // ---- 6. Write manifest and run Claude with file access ----------
 
-      log.info(`Summarizing ${contentSections.length} subscriptions in one Claude call`);
+      if (manifestEntries.length === 0) {
+        log.info('No subscription content was successfully fetched — skipping digest');
+        return;
+      }
 
-      // summarizeAllContent() builds the prompt, calls `claude --print`,
-      // and returns Claude's markdown response.
-      // This is synchronous (claude --print blocks until Claude responds).
-      const digestBody = summarizeAllContent(contentSections, interests);
+      // Write manifest.json — Claude's index of all subscription data files.
+      const manifestPath = writeManifest(manifestEntries, digestDataDir);
+      log.info(
+        `Data written: ${manifestEntries.length} subscriptions in ${digestDataDir} — running Claude`,
+      );
+
+      // runClaudeDigest() launches `claude --dangerously-skip-permissions --print`
+      // which reads the manifest, then reads each subscription file, and produces
+      // a markdown digest. Returns { body, inputTokens, outputTokens, costUsd, durationMs }.
+      // This is synchronous — we wait for Claude to finish before continuing.
+      let digestResult: DigestResult;
+      try {
+        digestResult = runClaudeDigest(manifestPath, interests);
+      } catch (err) {
+        log.error('Claude digest run failed', { err: String(err) });
+        // Fallback — show a minimal digest pointing at the data files so the user
+        // can inspect them manually if Claude can't be reached.
+        digestResult = {
+          body:
+            `*⚠️ Summarization failed — subscription data files are in \`${digestDataDir}\`*\n\n` +
+            manifestEntries
+              .map((e) => `### [${e.title}](${e.url})\n${e.itemCount} items — \`${e.filePath}\``)
+              .join('\n\n'),
+          inputTokens:  0,
+          outputTokens: 0,
+          costUsd:      0,
+          durationMs:   0,
+        };
+      }
+
+      // Append token usage stats footer to the digest body.
+      const tokenFooter = formatTokenUsage(digestResult);
 
       // ---- 7. Write the digest file -----------------------
 
-      const markdown   = buildMarkdown(runStart, digestBody);
+      const markdown   = buildMarkdown(runStart, digestResult.body + '\n\n' + tokenFooter);
       const digestPath = writeDigest(markdown, config.digest.outputDir, runStart);
 
       log.info(`Digest complete → ${digestPath}`);
@@ -344,6 +506,46 @@ async function main(): Promise<void> {
     // Python: sys.exit(1)
     process.exit(1);
   }
+}
+
+// ---- formatTokenUsage ----------------------------------------
+//
+// Formats token usage stats from a DigestResult into a markdown footer
+// line that appears at the bottom of the generated digest.
+//
+// Example output:
+//   ---
+//   *Token usage: 43,924 input + 1,234 output (45,158 total) | Cost: ~$0.0463 | 45.2s*
+//
+// PYTHON CONTEXT: `result.inputTokens.toLocaleString()` formats a number
+// with thousands separators — Python: f"{result.input_tokens:,}"
+// Template literals: `${expr}` — Python: f"{expr}"
+function formatTokenUsage(result: DigestResult): string {
+  // If both token counts are 0, JSON parsing failed — show a fallback.
+  if (result.inputTokens === 0 && result.outputTokens === 0) {
+    return '*Token usage: unavailable*';
+  }
+
+  // Ternary `condition ? value_if_true : value_if_false`
+  // Python: f" | Cost: ~${cost:.4f}" if result.cost_usd > 0 else ""
+  const costStr = result.costUsd > 0
+    ? ` | Cost: ~$${result.costUsd.toFixed(4)}`
+    : '';
+
+  const durStr = result.durationMs > 0
+    ? ` | ${(result.durationMs / 1000).toFixed(1)}s`
+    : '';
+
+  const total = result.inputTokens + result.outputTokens;
+
+  // .toLocaleString() formats numbers with thousands separators: 43924 → "43,924"
+  // Python: f"{n:,}"
+  return (
+    `---\n` +
+    `*Token usage: ${result.inputTokens.toLocaleString()} input + ` +
+    `${result.outputTokens.toLocaleString()} output ` +
+    `(${total.toLocaleString()} total)${costStr}${durStr}*`
+  );
 }
 
 // ---- sleep helper --------------------------------------------

@@ -333,8 +333,14 @@ export async function fetchThread(threadId: number, apiKey: string, page: Page):
       editdate:  parseBggDate(attr(aNode, 'editdate')),
       subject:   String(aNode['subject'] ?? ''),  // <subject> is a child element, not attribute
       body,
-      // Build a direct link to this article within the thread
-      link: `${link}&article=${articleId}`,
+      // Build a direct link to this article within the thread.
+      // BGG article URLs use ?article= as a query parameter.
+      // We check for an existing '?' in the base link to use the right
+      // separator — but BGG thread links never include query params, so
+      // in practice this is always '?'.
+      // Correct: https://boardgamegeek.com/thread/3456789?article=47582634
+      // Wrong:   https://boardgamegeek.com/thread/3456789&article=47582634
+      link: `${link}${link.includes('?') ? '&' : '?'}article=${articleId}`,
     };
   });
 
@@ -503,4 +509,67 @@ export function recentItems(items: BggGeeklistItem[], cap: number): BggGeeklistI
       return db.getTime() - da.getTime();
     })
     .slice(0, cap);
+}
+
+// ============================================================
+// articlesNewerThan — return all thread articles posted after a cutoff date
+// ============================================================
+//
+// Mirror of itemsNewerThan for threads. BGG's notification page only surfaces
+// a handful of article IDs per thread even when many new posts exist — the
+// same problem as geeklists. Date-based filtering solves it.
+//
+// For articles, "new" means postdate > cutoffDate (article was written after
+// the last visit). Unlike items, we use postdate only — editdate on an article
+// means the post was edited, not that it's a new reply.
+//
+// Returns articles sorted oldest-to-newest (reading-flow order).
+//
+// PYTHON CONTEXT:
+//   def articles_newer_than(articles: list[BggThreadArticle], cutoff: datetime) -> list[BggThreadArticle]:
+//       new_articles = [a for a in articles if a.postdate > cutoff]
+//       return sorted(new_articles, key=lambda a: a.postdate)
+export function articlesNewerThan(articles: BggThreadArticle[], cutoffDate: Date): BggThreadArticle[] {
+  return [...articles]
+    .filter((a) => a.postdate > cutoffDate)
+    .sort((a, b) => a.postdate.getTime() - b.postdate.getTime());  // oldest → newest
+}
+
+// ============================================================
+// itemsNewerThan — return all geeklist items with activity after a cutoff date
+// ============================================================
+//
+// This is the primary filter for geeklist "what's new" detection.
+// It's more reliable than notifiedItemIds because BGG's notification page
+// only surfaces a handful of rows per subscription — even if 400+ items
+// are new (e.g. SGOYT when you're two weeks behind), you might only see
+// 2-3 notifiedItemIds. By contrast, notificationDate captures WHEN you
+// last visited, so we can include ALL items with activity since then.
+//
+// "Activity" means the later of postdate and editdate — a comment added
+// to an existing item updates editdate, making it appear as new activity
+// even though the item itself was posted long ago.
+//
+// Returns items sorted newest-first (by last-activity timestamp).
+// No cap is applied — the caller (index.ts) decides how many to include.
+//
+// PYTHON CONTEXT:
+//   def items_newer_than(items: list[BggGeeklistItem], cutoff: datetime) -> list[BggGeeklistItem]:
+//       def last_activity(i): return max(i.postdate, i.editdate)
+//       new_items = [i for i in items if last_activity(i) > cutoff]
+//       return sorted(new_items, key=last_activity, reverse=True)
+export function itemsNewerThan(items: BggGeeklistItem[], cutoffDate: Date): BggGeeklistItem[] {
+  return [...items]
+    .filter((item) => {
+      // "Last activity" = whichever is later: postdate (item added) or editdate (item edited / comment added)
+      // Python: max(item.postdate, item.editdate) > cutoff_date
+      const lastActivity = item.editdate > item.postdate ? item.editdate : item.postdate;
+      return lastActivity > cutoffDate;
+    })
+    .sort((a, b) => {
+      // Sort newest-first so Claude sees the most recent items first when reading the file
+      const da = a.editdate > a.postdate ? a.editdate : a.postdate;
+      const db = b.editdate > b.postdate ? b.editdate : b.postdate;
+      return db.getTime() - da.getTime();  // newest first
+    });
 }

@@ -64,6 +64,22 @@ export interface BggSubscription {
   // If BGG's URL doesn't encode a specific item, this is an empty array [],
   // and we fall back to fetching the most-recent N items from the API.
   notifiedItemIds: number[];
+
+  // The earliest notification timestamp for this subscription, extracted
+  // from the GG-ITEM-LINK-UI row text. Used to filter geeklist comments —
+  // we only show comments posted AFTER this date, since those are the new ones.
+  //
+  // `Date | null` means "either a Date or null" — null when we couldn't
+  // parse a date from the notification row text.
+  // Python: Optional[datetime]
+  notificationDate: Date | null;
+
+  // BGG's advertised count of unread items for this subscription, parsed from
+  // the notification row's summary text (e.g. "3 more replies", "12 new items").
+  // 0 means we couldn't parse a count — not the same as "nothing new".
+  // Used in the manifest so Claude knows the true scale of outstanding activity.
+  // Python: int  (0 = unknown)
+  unreadCount: number;
 }
 
 // ---- Thread types ----------------------------------------------
