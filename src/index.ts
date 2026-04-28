@@ -39,7 +39,6 @@ import {
   fetchGeeklist,
   recentArticles,
   recentItems,
-  articlesNewerThan,
   itemsNewerThan,
 } from './bgg/api';
 import {
@@ -49,6 +48,7 @@ import {
   writeManifest,
   runClaudeDigest,
 } from './claude';
+import { fetchPageContent, formatPageContent } from './bgg/page-content';
 // `import type` imports only the TypeScript type, not runtime code — erased at compile time.
 // Python: from typing import TYPE_CHECKING; if TYPE_CHECKING: from .claude import ManifestEntry
 import type { ManifestEntry, DigestResult } from './claude';
@@ -262,60 +262,58 @@ async function main(): Promise<void> {
 
         // ---- Thread subscriptions ----
         if (sub.type === 'thread') {
-          // fetchThread() returns a BggThread object or null on failure.
-          const thread = await fetchThread(sub.id, config.bgg.apiKey, apiPage);
+          // Pass minarticledate to BGG's API — without it, the default
+          // response is the OLDEST 1000 articles (chronologically from the
+          // thread's beginning), so long threads miss every new reply.
+          //
+          // We use a 30-day lookback BEFORE notificationDate, because BGG's
+          // /subscriptions page shows only ONE row per thread (the newest
+          // unread reply), not one per unread reply. notificationDate is
+          // the date of the *latest* unread reply — earlier unread replies
+          // are older. The 30-day window catches threads visited within the
+          // last month, which covers nearly all real-world cases.
+          const lookback = sub.notificationDate
+            ? new Date(sub.notificationDate.getTime() - 30 * 24 * 3600 * 1000)
+            : null;
+          const thread = await fetchThread(sub.id, config.bgg.apiKey, apiPage, lookback);
           if (!thread) {
             log.warn(`Could not fetch thread ${sub.id} — skipping`);
             continue;  // `continue` skips the rest of this loop iteration — same as Python
           }
 
-          // ---- Filter to articles with new activity since the last visit ----
+          // ---- Select articles to include ----
           //
-          // PRIMARY: use notificationDate to find ALL articles posted since then.
-          // BGG's notification page only surfaces a few article IDs per thread even
-          // when many new posts exist — the April 2026 Culling thread showed 4 new
-          // posts but notifiedItemIds only captured 1, causing the other 3 to be
-          // dropped. Date-based filtering solves this the same way we solved it for
-          // geeklists.
+          // When we passed minarticledate to the API, thread.articles already
+          // contains only the post-cutoff window (typically last 30 days from
+          // notificationDate). Just sort oldest→newest and use them all.
           //
-          // FALLBACK: if notificationDate is null, use notifiedItemIds; then recency.
-          //
-          // `let articles: BggThreadArticle[]` — explicit type since the if/else
-          // branches each assign different expressions. Python: articles: list[BggThreadArticle]
+          // When we DIDN'T pass a cutoff (notificationDate was null), the API
+          // returned the oldest 1000 archived articles, so fall back to
+          // notifiedItemIds → recency.
           let articles: BggThreadArticle[];
 
           if (sub.notificationDate !== null) {
-            // Date-based filter — all articles posted AFTER the last-visit cutoff.
-            // articlesNewerThan() returns them sorted oldest→newest (reading flow).
-            // Python: articles = articles_newer_than(thread.articles, sub.notification_date)
-            articles = articlesNewerThan(thread.articles, sub.notificationDate);
-
-            if (articles.length === 0) {
-              // No articles newer than the cutoff — fall back to notifiedItemIds or recency.
-              const notifiedFallback = new Set(sub.notifiedItemIds);
-              articles = notifiedFallback.size > 0
-                ? thread.articles.filter((a) => notifiedFallback.has(a.id))
-                    .sort((a, b) => a.postdate.getTime() - b.postdate.getTime())
-                : recentArticles(thread.articles, maxItems);
-            }
+            articles = [...thread.articles]
+              .sort((a, b) => a.postdate.getTime() - b.postdate.getTime());
           } else {
-            // No notificationDate — use sparse BGG-surfaced IDs, then recency.
             const notified = new Set(sub.notifiedItemIds);
             articles = notified.size > 0
               ? thread.articles
                   .filter((a) => notified.has(a.id))
                   .sort((a, b) => a.postdate.getTime() - b.postdate.getTime())
               : recentArticles(thread.articles, maxItems);
-            if (articles.length === 0) articles = recentArticles(thread.articles, maxItems);
           }
 
           log.info(`Thread "${thread.subject}": ${articles.length} articles selected`, {
-            notifiedIds:  sub.notifiedItemIds.length,
-            hasDate:      sub.notificationDate !== null,
+            notifiedIds:   sub.notifiedItemIds.length,
+            hasDate:       sub.notificationDate !== null,
             totalArticles: thread.articles.length,
+            unreadCount:   sub.unreadCount,
           });
 
-          // Write this thread's content to a file for Claude to read.
+          // Skip subscriptions that filtered to nothing — don't bloat the digest
+          // with empty entries. BGG flagged it but our API fetch+filter found
+          // nothing matching, which usually means the API hasn't caught up yet.
           if (articles.length > 0) {
             const threadContent  = formatThreadContent(thread.subject, articles);
             const threadFilePath = writeSubscriptionFile(sub, threadContent, digestDataDir);
@@ -327,10 +325,11 @@ async function main(): Promise<void> {
               filePath:         threadFilePath,
               itemCount:        articles.length,
               unreadCount:      sub.unreadCount,
-              // sub.notificationDate?.toISOString() converts Date→ISO string, or ?? null if absent.
-              // Python: sub.notification_date.isoformat() if sub.notification_date else None
               notificationDate: sub.notificationDate?.toISOString() ?? null,
+              parentName:       sub.parentName,
             });
+          } else {
+            log.info(`Skipping ${sub.type} ${sub.id} "${thread.subject}" — no new articles matched`);
           }
 
         // ---- Geeklist subscriptions ----
@@ -343,65 +342,43 @@ async function main(): Promise<void> {
 
           // ---- Filter to items with new activity since the last visit ----
           //
-          // PRIMARY path: use notificationDate (the date BGG marked this subscription
-          // as last visited) to find ALL items with activity since then.
+          // PRIMARY: notifiedItemIds. Each notification row encodes the
+          // specific itemid in its URL — collected per-row by the scraper.
+          // This is the precise list of items BGG flagged as new.
           //
-          // This is the correct fix for high-volume subscriptions like SGOYT — BGG's
-          // notification page only surfaces a few rows even if 400+ items are new,
-          // so notifiedItemIds only captures 2-3 IDs. notificationDate captures WHEN
-          // you last visited, letting us include everything since then.
+          // FALLBACK 1: notificationDate. Captures cases where BGG's URL didn't
+          // include an itemid (rare).
           //
-          // FALLBACK: if notificationDate is null (couldn't parse), use the sparse
-          // notifiedItemIds set, or fall back to most-recent N by recency.
-          //
-          // `let items: BggGeeklistItem[]` — explicit type annotation because the
-          // if/else branches each assign different expressions. TypeScript can infer
-          // the type from a single expression, but with branching it's cleaner to
-          // declare it up front.
-          // Python: items: list[BggGeeklistItem]
-          let items: BggGeeklistItem[];
+          // FALLBACK 2: recentItems(maxItems). Last resort.
+          let items: BggGeeklistItem[] = [];
 
-          if (sub.notificationDate !== null) {
-            // Date-based filter — includes ALL items with activity after the cutoff.
-            // itemsNewerThan() checks max(postdate, editdate) > notificationDate
-            // and returns them sorted newest-first.
-            // Python: items = items_newer_than(geeklist.items, sub.notification_date)
+          const notified = new Set(sub.notifiedItemIds);
+          if (notified.size > 0) {
+            items = geeklist.items
+              .filter((item) => notified.has(item.id))
+              .sort((a, b) => {
+                const da = a.editdate > a.postdate ? a.editdate : a.postdate;
+                const db = b.editdate > b.postdate ? b.editdate : b.postdate;
+                return db.getTime() - da.getTime();
+              });
+          }
+
+          if (items.length === 0 && sub.notificationDate !== null) {
             items = itemsNewerThan(geeklist.items, sub.notificationDate);
+          }
 
-            if (items.length === 0) {
-              // Date filter produced nothing — notificationDate may have been parsed
-              // incorrectly, or BGG has no items newer than the cutoff. Fall back.
-              const notifiedFallback = new Set(sub.notifiedItemIds);
-              items = notifiedFallback.size > 0
-                ? geeklist.items.filter((item) => notifiedFallback.has(item.id))
-                : recentItems(geeklist.items, maxItems);
-            }
-          } else {
-            // No notificationDate — use the sparse BGG-surfaced IDs, then recency.
-            const notified = new Set(sub.notifiedItemIds);
-            items = notified.size > 0
-              ? geeklist.items
-                  .filter((item) => notified.has(item.id))
-                  .sort((a, b) => {
-                    const da = a.editdate > a.postdate ? a.editdate : a.postdate;
-                    const db = b.editdate > b.postdate ? b.editdate : b.postdate;
-                    return db.getTime() - da.getTime();  // Newest first
-                  })
-              : recentItems(geeklist.items, maxItems);
-            // Last resort — ID set matched nothing (ID mismatch with cached API data)
-            if (items.length === 0) items = recentItems(geeklist.items, maxItems);
+          if (items.length === 0) {
+            items = recentItems(geeklist.items, maxItems);
           }
 
           log.info(`Geeklist "${geeklist.title}": ${items.length} items selected`, {
             notifiedIds: sub.notifiedItemIds.length,
             hasDate:     sub.notificationDate !== null,
             totalItems:  geeklist.items.length,
+            unreadCount: sub.unreadCount,
           });
 
           if (items.length > 0) {
-            // Write geeklist content to a file. No item cap here — the file-based
-            // approach lets Claude skim large files and summarize by theme rather
-            // than us truncating to an arbitrary limit before Claude ever sees the data.
             const geeklistContent  = formatGeeklistContent(geeklist.title, items, sub.notificationDate);
             const geeklistFilePath = writeSubscriptionFile(sub, geeklistContent, digestDataDir);
             manifestEntries.push({
@@ -413,8 +390,56 @@ async function main(): Promise<void> {
               itemCount:        items.length,
               unreadCount:      sub.unreadCount,
               notificationDate: sub.notificationDate?.toISOString() ?? null,
+              parentName:       sub.parentName,
             });
+          } else {
+            log.info(`Skipping ${sub.type} ${sub.id} "${geeklist.title}" — no new items matched`);
           }
+
+        // ---- Blog post / file page subscriptions ----
+        //
+        // BGG XML API has no endpoint for these, so we render the page in
+        // Playwright and pull the post body + comments straight out of the
+        // DOM. apiPage is already on boardgamegeek.com so navigation reuses
+        // the same authenticated session. A failure leaves the digest with
+        // one fewer section but doesn't kill the run.
+        } else if (sub.type === 'blog' || sub.type === 'filepage') {
+          const kind = sub.type === 'blog' ? 'Blog Post' : 'File Page';
+          const fetched = await fetchPageContent(sub.url, apiPage);
+          if (!fetched) {
+            log.warn(`Could not fetch ${kind.toLowerCase()} content`, { url: sub.url });
+          } else {
+            const pageMarkdown = formatPageContent(kind, sub.url, fetched);
+            const filePath     = writeSubscriptionFile(sub, pageMarkdown, digestDataDir);
+            const itemCount    = (fetched.body ? 1 : 0) + fetched.comments.length;
+            manifestEntries.push({
+              subscriptionId:   sub.id,
+              type:             sub.type,
+              title:            fetched.title || sub.title,
+              url:              sub.url,
+              filePath,
+              itemCount,
+              unreadCount:      sub.unreadCount,
+              notificationDate: sub.notificationDate?.toISOString() ?? null,
+              parentName:       sub.parentName,
+            });
+            log.info(`${kind} "${fetched.title || sub.title}" — ${fetched.comments.length} comment(s) captured`);
+          }
+
+        // ---- Boardgame / boardgameexpansion stand-alone subscriptions ----
+        //
+        // These are rare in practice — most game-related notifications come
+        // paired with a /thread URL which we capture via the thread branch.
+        // A pure /boardgame notification means BGG flagged something on the
+        // game's main page (description edit, new file, etc.) without a
+        // specific entry to summarize. We still log so the user knows.
+        } else if (sub.type === 'boardgame' || sub.type === 'boardgameexpansion') {
+          log.info(`Stand-alone ${sub.type} subscription — no specific content URL`, {
+            id: sub.id,
+            title: sub.title,
+            url: sub.url,
+            unreadCount: sub.unreadCount,
+          });
         }
 
         // Tell BGG this subscription has been acknowledged.

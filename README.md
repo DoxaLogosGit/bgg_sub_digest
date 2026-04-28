@@ -161,21 +161,31 @@ runs if a previous one is still in progress.
 
 ### BGG notification page
 
-BGG's `/subscriptions` page shows one row per subscription with outstanding
-activity. Each row has:
-- A link to the **oldest unread** entry in that subscription
-- Summary text: "3 more replies" / "12 new items" / "5 new comments"
-- A timestamp showing when that oldest entry was posted
+BGG's `/subscriptions` page shows **one row per new item** (not per subscription).
+A thread with 5 new replies appears as 5 rows; a geeklist with 3 new comments
+appears as 3 rows. Rows are grouped under date headings ("Today", "Yesterday",
+"Apr 21, 2026"). Each row's URL encodes the specific article or item ID that
+triggered the notification.
 
-The script reads all of this to know what to fetch and how far back to look.
+The scraper aggregates rows by subscription, capturing:
+- The list of specific item/article IDs flagged (`notifiedItemIds`)
+- The earliest date heading any of those rows appeared under (`notificationDate`)
+- The total number of rows for that subscription (`unreadCount`)
 
 ### "What's new" detection
 
-Rather than relying on BGG's sparse notification links (which only surface
-one item ID per subscription), the script uses the **notification date** —
-the timestamp of the oldest unread entry — as a cutoff. Anything posted
-after that date is included. This ensures you see all new content even when
-you're far behind (e.g. SGOYT with 400+ new items after a vacation).
+Filter priority for each subscription:
+
+1. **`notifiedItemIds`** — the precise set of new articles/items BGG flagged.
+   This is the strongest signal we have and is preferred when present.
+2. **`notificationDate`** — used for brand-new threads where BGG's URL has
+   no `/article/N` fragment, so no specific ID was extractable. Includes
+   anything posted after that date.
+3. **Recency cap** — last resort: `recentArticles(maxItems)` /
+   `recentItems(maxItems)`. Capped at `maxNewItemsPerSubscription`.
+
+Subscriptions whose filter chain returns zero matches are skipped — no
+empty stub sections in the digest.
 
 ### File-based Claude integration
 

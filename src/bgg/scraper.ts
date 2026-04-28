@@ -54,10 +54,58 @@ const SUBSCRIPTIONS_URL = 'https://boardgamegeek.com/subscriptions';
 // `{ type: SubscriptionType; regex: RegExp }[]` means: an array of objects
 // where each object has a `type` field (SubscriptionType) and a `regex`
 // field (a compiled regular expression). The `[]` at the end means array.
+// Order matters — classifyUrl returns the FIRST match. Thread and geeklist
+// are first because when a notice contains both a /thread/ link AND a
+// /boardgame/ link (the parent game), we want the more specific thread to
+// be the subscription and treat the boardgame as parent context.
 const URL_PATTERNS: { type: SubscriptionType; regex: RegExp }[] = [
-  { type: 'thread',   regex: /\/thread\/(\d+)/   },
-  { type: 'geeklist', regex: /\/geeklist\/(\d+)/ },
+  { type: 'thread',             regex: /\/thread\/(\d+)/             },
+  { type: 'geeklist',           regex: /\/geeklist\/(\d+)/           },
+  { type: 'boardgameexpansion', regex: /\/boardgameexpansion\/(\d+)/ },
+  { type: 'boardgame',          regex: /\/boardgame\/(\d+)/          },
+  { type: 'blog',               regex: /\/blog\/(\d+)/               },
+  { type: 'filepage',           regex: /\/filepage\/(\d+)/           },
 ];
+
+// Convert a slug like "nusfjord-big-box" into a human-readable name like
+// "Nusfjord: Big Box". BGG's URL slugs lose punctuation, so this is a best
+// effort — the result is good enough as a label in the digest.
+function slugToName(slug: string): string {
+  // Title-case each word; preserve common BGG conventions like "1pg" lowercase.
+  return slug
+    .split('-')
+    .filter((w) => w.length > 0)
+    .map((w) => w[0].toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+// Find the first /boardgame or /boardgameexpansion link in a notice and
+// return its anchor text (which carries the proper game name with colons,
+// apostrophes, etc.). Falls back to a slug-derived name if the anchor has
+// no text. Returns undefined if no game link is present.
+function extractParentBoardgame(links: { href: string; text: string }[]): string | undefined {
+  for (const link of links) {
+    const m = link.href.match(/\/boardgame(?:expansion)?\/\d+\/([^/?#]+)/);
+    if (!m) continue;
+    return link.text.trim() || slugToName(m[1]);
+  }
+  return undefined;
+}
+
+// Build the canonical URL for a subscription type + id. For blog and filepage
+// we KEEP the original href (which has the specific post / comment path) so
+// the content fetcher can navigate directly to what BGG flagged as new.
+function canonicalUrlFor(type: SubscriptionType, id: number, fallback: string): string {
+  switch (type) {
+    case 'thread':             return `https://boardgamegeek.com/thread/${id}`;
+    case 'geeklist':           return `https://boardgamegeek.com/geeklist/${id}`;
+    case 'boardgame':          return `https://boardgamegeek.com/boardgame/${id}`;
+    case 'boardgameexpansion': return `https://boardgamegeek.com/boardgameexpansion/${id}`;
+    case 'blog':               return fallback;
+    case 'filepage':           return fallback;
+    default:                   return fallback;
+  }
+}
 
 // Returns the subscription type + numeric ID parsed from a BGG URL,
 // or null if the URL doesn't match any known pattern.
@@ -110,63 +158,6 @@ function extractNotifiedId(href: string, type: SubscriptionType): number | null 
            ?? href.match(/#item(\d+)/);
     return m ? parseInt(m[1], 10) : null;
   }
-}
-
-// ---- parseUnreadCount ----------------------------------------
-//
-// Tries to extract BGG's advertised count of unread posts/items/comments
-// from the full text content of a GG-ITEM-LINK-UI notification row.
-//
-// BGG shows one row per subscription with a summary of what's new:
-//   Threads:   "3 more replies"   or  "3 more posts"
-//   Geeklists: "5 new items"      and/or "2 new comments"
-//
-// We don't know the exact format without seeing real rows, so we cast a
-// wide net and sum any numbers we find next to these keywords.
-// A debug log of the raw fullText is emitted so we can tune the patterns.
-//
-// Returns the total count (sum across all matched phrases), or 0 if nothing
-// matched — 0 means unknown, not "no new content".
-//
-// PYTHON CONTEXT: `re.findall(r'(\d+)\s+(?:more|new)\s+\w+', text)` collects
-// all matches. We use String.matchAll() which returns an iterator of matches —
-// Python: list(re.finditer(pattern, text))
-function parseUnreadCount(rowText: string): number {
-  if (!rowText) return 0;
-
-  // Emit the raw text once so we can inspect BGG's actual format and tune these
-  // patterns. Comment this out after we've confirmed the patterns are correct.
-  log.debug('BGG notification row fullText (for unreadCount tuning)', {
-    text: rowText.slice(0, 300),
-  });
-
-  // Pattern: optional "more" or "new", then a count keyword.
-  // `String.matchAll(re)` returns an iterator of all match objects.
-  // Python: re.finditer(pattern, text, re.IGNORECASE)
-  //
-  // We use a single pattern that covers:
-  //   "3 more replies"    →  (\d+)\s+more\s+repl
-  //   "5 new items"       →  (\d+)\s+new\s+item
-  //   "7 new comments"    →  (\d+)\s+new\s+comment
-  //   "2 more posts"      →  (\d+)\s+more\s+post
-  const pattern = /(\d+)\s+(?:more|new)\s+(?:repl|post|item|comment)/gi;
-  const matches = [...rowText.matchAll(pattern)];
-
-  if (matches.length === 0) {
-    // Broader fallback: any number directly before the keyword (no "more"/"new" qualifier).
-    // Catches formats like "4 replies" or "12 items".
-    const fallback = /(\d+)\s+(?:repl|post|item|comment)/gi;
-    const fallbackMatches = [...rowText.matchAll(fallback)];
-    if (fallbackMatches.length > 0) {
-      // `.reduce()` sums all matches — Python: sum(int(m.group(1)) for m in matches)
-      return fallbackMatches.reduce((sum, m) => sum + parseInt(m[1], 10), 0);
-    }
-    return 0;
-  }
-
-  // Sum all matched counts — a geeklist row might say "5 new items, 3 new comments"
-  // giving a total of 8. Python: sum(int(m.group(1)) for m in matches)
-  return matches.reduce((sum, m) => sum + parseInt(m[1], 10), 0);
 }
 
 // ---- parseNotificationDate ----------------------------------------
@@ -235,7 +226,11 @@ function parseNotificationDate(rowText: string): Date | null {
   //
   // We default to the current year, then step back one year if the resulting date is
   // in the future (handles the edge case of a "Dec 31" notification seen in January).
-  const monthNamePattern = /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:,\s+\d{4})?/i;
+  // The `\b` after `\d{1,2}` is critical: without it, the pattern matches "April 20"
+  // out of "April 2026 Shopping" (greedily consumes 2 digits of the year). With \b,
+  // it requires a word boundary — fails inside a 4-digit year because adjacent digits
+  // have no word boundary between them.
+  const monthNamePattern = /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}\b(?:,\s+\d{4})?/i;
   const monthMatch = rowText.match(monthNamePattern);
   if (monthMatch) {
     const matched = monthMatch[0];
@@ -364,107 +359,146 @@ export async function scrapeSubscriptions(
     while (true) {
       // ---- Query all notification rows on this page ----
       //
-      // KEY CHANGE: we now query the GG-ITEM-LINK-UI ELEMENTS themselves
-      // (not just the <a> tags inside them). This lets us also read the
-      // full row text, which contains the notification date BGG renders.
+      // BGG's /subscriptions DOM:
+      //   - Each new item is one <gg-notice> "row" containing one or more
+      //     <gg-item-link-ui> link elements. The href on the main link
+      //     encodes the specific item/article ID that triggered the notice.
+      //   - Notices are grouped under <h3 class="subscription-date-title">
+      //     headings ("Today", "Yesterday", "Apr 21, 2026", etc.) — the
+      //     section header IS the notification date for every row beneath it.
+      //   - Row text contains TOTAL counts for the underlying subscription
+      //     ("11 Replies", "436 GeekList Items 1378 Comments") — these are
+      //     NOT unread counts. The unread count for a subscription is the
+      //     NUMBER OF NOTICE ROWS that point to it.
       //
-      // Each row object has:
-      //   links    — all <a href> anchors inside this row
-      //   fullText — the entire text content of the row, including the
-      //              "N hours ago" or "Apr 20" timestamp
-      //
-      // Python Playwright equivalent:
-      //   rows = page.query_selector_all('gg-item-link-ui')
-      //   data = [
-      //     {'links': [(a.href, a.text_content()) for a in el.query_selector_all('a[href]')],
-      //      'fullText': el.text_content()}
-      //     for el in rows
-      //   ]
-      const rows = await page.$$eval(
-        'gg-item-link-ui',
-        (els: Element[]) => els.map((el) => ({
-          // All <a href> anchors inside this notification row.
-          // querySelectorAll is scoped to `el` — only finds descendants.
-          // Array.from() converts a NodeList to a plain array.
-          // Python: list(el.query_selector_all('a[href]'))
-          links: Array.from(el.querySelectorAll('a[href]')).map((a) => ({
-            href: (a as HTMLAnchorElement).href,  // Absolute URL
-            text: a.textContent?.trim() ?? '',
-          })),
-          // Full text of the entire row element — includes the timestamp BGG renders.
-          // `.textContent` returns ALL text in the element, including child elements.
-          // Python: el.text_content() or ''
-          fullText: el.textContent?.trim() ?? '',
-        })),
-      );
+      // We pass an evaluate script as a string (not an arrow fn) because
+      // tsx/esbuild rewrites nested function declarations in evaluate
+      // callbacks in a way that references Node-only `__name`, which
+      // throws inside the browser context.
+      const rows = await page.evaluate(`(() => {
+        // Walk the DOM in document order, tracking the most recent
+        // subscription-date-title header. Every notice we hit inherits
+        // that header's text as its date string.
+        var out = [];
+        var currentHeader = '';
 
-      // We also track the EARLIEST (oldest) notification date per subscription.
-      // "Earliest" = the first piece of content we missed = best cutoff for
-      // "show geeklist comments newer than this date".
-      // Python: earliest_notif_date: dict[str, datetime] = {}
+        // Pull all date headers and notices in document order via a
+        // single querySelectorAll, then sort by document position.
+        var nodes = Array.from(document.querySelectorAll(
+          'h3.subscription-date-title, gg-notice'
+        ));
+
+        for (var i = 0; i < nodes.length; i++) {
+          var n = nodes[i];
+          if (n.tagName === 'H3') {
+            currentHeader = (n.textContent || '').replace(/\\s+/g, ' ').trim();
+            continue;
+          }
+          // It's a gg-notice. Collect every <a href> inside its
+          // gg-item-link-ui descendants. We deliberately ignore other
+          // anchors (avatars, "Mark as Read", etc.) to focus on the
+          // links we know how to classify.
+          var links = [];
+          var linkEls = n.querySelectorAll('gg-item-link-ui a[href]');
+          for (var j = 0; j < linkEls.length; j++) {
+            var a = linkEls[j];
+            links.push({
+              href: a.href,
+              text: (a.textContent || '').trim()
+            });
+          }
+          out.push({
+            links: links,
+            // The row's text content (incl. "N Replies", "1 Thread"
+            // indicators). Used as a fallback signal for brand-new
+            // threads — current code primarily uses the section header
+            // for the date and the link IDs for what to fetch.
+            fullText: (n.textContent || '').replace(/\\s+/g, ' ').trim(),
+            // The date heading that this notice falls under.
+            headerText: currentHeader
+          });
+        }
+        return out;
+      })()`) as Array<{
+        links: { href: string; text: string }[];
+        fullText: string;
+        headerText: string;
+      }>;
+
+      // Earliest (oldest) date per subscription — the right cutoff for
+      // "include everything newer than this." Multiple rows for the same
+      // subscription land under multiple date headers; we keep the oldest.
       const earliestNotifDate = new Map<string, Date>();
 
       // ---- Process each notification row ----
       for (const row of rows) {
-        // Attempt to parse the notification date and unread count from the row text.
-        // rowDate  — when this item was added/commented on (cutoff for date filter)
-        // rowCount — BGG's advertised number of unread posts/items/comments
-        const rowDate  = parseNotificationDate(row.fullText);
-        const rowCount = parseUnreadCount(row.fullText);
+        // The date for this row comes from the section header above it
+        // ("Today", "Yesterday", "Apr 21, 2026"). The row text itself only
+        // carries TOTAL counts, not unread or per-row dates.
+        const rowDate = parseNotificationDate(row.headerText);
 
-        for (const { href, text } of row.links) {
-          // Determine if this URL belongs to a thread or geeklist, and get its ID
-          const classified = classifyUrl(href);
-          if (!classified) continue;  // Skip URLs we don't recognize (ads, nav, etc.)
+        // Find the MOST SPECIFIC link in this notice — URL_PATTERNS is ordered
+        // thread > geeklist > boardgame > expansion > blog > filepage, so the
+        // first classifying link wins. A notice with both a thread URL and a
+        // boardgame URL becomes a thread subscription (with the boardgame as
+        // parent context). A notice with only a /boardgame URL becomes a
+        // boardgame subscription.
+        let primaryLink: { href: string; text: string; classified: { type: SubscriptionType; id: number } } | null = null;
+        for (const link of row.links) {
+          const classified = classifyUrl(link.href);
+          if (classified) { primaryLink = { ...link, classified }; break; }
+        }
+        if (!primaryLink) continue;
 
-          // Build the deduplication key: "thread:3456789" or "geeklist:123456"
-          // Multiple notification rows from the same subscription share this key.
-          const key = `${classified.type}:${classified.id}`;
-          const notifiedId = extractNotifiedId(href, classified.type);
+        const { href, text, classified } = primaryLink;
+        const key = `${classified.type}:${classified.id}`;
 
-          if (!found.has(key)) {
-            // First time we see this subscription — create a new entry.
-            const canonicalUrl = classified.type === 'thread'
-              ? `https://boardgamegeek.com/thread/${classified.id}`
-              : `https://boardgamegeek.com/geeklist/${classified.id}`;
+        // Look at sibling links for a /boardgame URL — it's the parent game
+        // for thread/geeklist/blog/filepage subs (e.g. a Nusfjord file page
+        // notice carries a /boardgameexpansion link to "Nusfjord: Big Box").
+        // Skip when the subscription IS the boardgame itself.
+        const parentName =
+          classified.type === 'boardgame' || classified.type === 'boardgameexpansion'
+            ? undefined
+            : extractParentBoardgame(row.links);
 
-            found.set(key, {
-              type:             classified.type,
-              id:               classified.id,
-              title:            text || `${classified.type} ${classified.id}`,
-              url:              canonicalUrl,
-              notifiedItemIds:  notifiedId ? [notifiedId] : [],
-              notificationDate: rowDate,
-              unreadCount:      rowCount,
-            });
+        const notifiedId = extractNotifiedId(href, classified.type);
 
-            if (rowDate) earliestNotifDate.set(key, rowDate);
+        if (!found.has(key)) {
+          const canonicalUrl = canonicalUrlFor(classified.type, classified.id, href);
 
-          } else {
-            // We've seen this subscription before — accumulate additional data.
-            // `found.get(key)!` — the `!` is a "non-null assertion operator".
-            // We just confirmed .has(key) is true, so .get() won't return undefined.
-            // TypeScript can't figure that out on its own, so we tell it: "trust me".
-            const sub = found.get(key)!;
+          found.set(key, {
+            type:             classified.type,
+            id:               classified.id,
+            title:            text || `${classified.type} ${classified.id}`,
+            url:              canonicalUrl,
+            notifiedItemIds:  notifiedId ? [notifiedId] : [],
+            notificationDate: rowDate,
+            unreadCount:      1,
+            parentName,
+            rowText:          row.fullText,
+          });
 
-            if (notifiedId && !sub.notifiedItemIds.includes(notifiedId)) {
-              sub.notifiedItemIds.push(notifiedId);
-            }
+          if (rowDate) earliestNotifDate.set(key, rowDate);
 
-            // Accumulate unread counts across rows for the same subscription.
-            // Python: sub.unread_count += row_count
-            sub.unreadCount += rowCount;
+        } else {
+          const sub = found.get(key)!;
 
-            // Keep whichever notification date is EARLIER (the oldest new content).
-            // Earlier date = we missed content from further back = broader filter window.
-            // `rowDate < existing` — JS Date comparison via milliseconds since epoch.
-            // Python: row_date < existing  (datetime objects compare directly)
-            if (rowDate) {
-              const existing = earliestNotifDate.get(key);
-              if (!existing || rowDate < existing) {
-                earliestNotifDate.set(key, rowDate);
-                sub.notificationDate = rowDate;
-              }
+          if (notifiedId && !sub.notifiedItemIds.includes(notifiedId)) {
+            sub.notifiedItemIds.push(notifiedId);
+          }
+
+          sub.unreadCount += 1;
+
+          // Keep the parent name once we've seen it — sibling rows for the
+          // same subscription typically all carry the same /boardgame URL.
+          if (parentName && !sub.parentName) sub.parentName = parentName;
+
+          if (rowDate) {
+            const existing = earliestNotifDate.get(key);
+            if (!existing || rowDate < existing) {
+              earliestNotifDate.set(key, rowDate);
+              sub.notificationDate = rowDate;
             }
           }
         }
@@ -536,80 +570,77 @@ export async function scrapeSubscriptions(
 // clearSubscriptionShortcut — post-processing cleanup
 // ============================================================
 //
-// After processing a subscription, click BGG's "shortcut-remove" button
-// to acknowledge it. This removes it from the subscriptions sidebar so
-// the next run won't re-process it.
+// After processing a subscription, click each per-row "Mark as Read" button
+// (`button.quick-read-btn` inside `<gg-notice>`) so BGG drops the row on the
+// next visit. A subscription with N new replies has N notice rows on the
+// /subscriptions page, each with its own button — we click them all.
 //
-// BGG's sidebar shows GG-SHORTCUT cards, one per subscription with outstanding
-// activity. Each card has a ".shortcut-remove" button.
+// The button is `tw-invisible tw-hidden` until the row is hovered, so we
+// invoke `.click()` directly on the DOM element via `evaluate` rather than
+// going through Playwright's mouse-based click which would respect visibility.
 //
 // debugClear (default true): log the action WITHOUT clicking.
-//   Set to false in config.json when you're ready to clear for real.
-//
-// `Promise<void>` — async function that returns nothing (like Python `-> None`).
 
 export async function clearSubscriptionShortcut(
   subPage: Page,
   sub: BggSubscription,
   debugClear: boolean,
 ): Promise<void> {
-  // Build a URL fragment to match against the shortcut card's links.
-  // e.g. "/thread/3456789" or "/geeklist/123456"
+  // URL fragment that identifies this subscription on the page.
+  // Both /thread/N and /geeklist/N appear inside their notice rows.
   const fragment = sub.type === 'thread'
     ? `/thread/${sub.id}`
     : `/geeklist/${sub.id}`;
 
-  // page.$$() returns ALL matching elements as an array of ElementHandles.
-  // ElementHandle is a reference to a DOM element in the browser.
-  // Python: sub_page.query_selector_all('gg-shortcut')
-  const shortcuts = await subPage.$$('gg-shortcut');
-
-  // Iterate over each GG-SHORTCUT card and find the one for this subscription
-  for (const shortcut of shortcuts) {
-    // For each shortcut card, get all the <a> href values within it.
-    // shortcut.$$eval() is like page.$$eval() but scoped to this element.
-    // Python: [el.get_attribute('href') for el in shortcut.query_selector_all('a[href]')]
-    const hrefs = await shortcut.$$eval(
-      'a[href]',
-      (els: Element[]) => (els as HTMLAnchorElement[]).map((el) => el.href),
-    );
-
-    // Array.some() returns true if ANY element passes the test — like Python's any().
-    // Skip this card if none of its links contain our subscription's URL fragment.
-    if (!hrefs.some((href) => href.includes(fragment))) continue;
-
-    // Found the right shortcut card!
-    if (debugClear) {
-      // Debug mode: just log what we would do, don't actually click
-      log.info(`[DEBUG] Would click shortcut-remove for "${sub.title}" (${sub.type} ${sub.id})`);
-      return;  // Early return — stop after logging
-    }
-
-    // Find the remove button within this specific shortcut card.
-    // shortcut.$() is like querySelector() scoped to this element.
-    // Python: remove_btn = shortcut.query_selector('.shortcut-remove')
-    const removeBtn = await shortcut.$('.shortcut-remove');
-    if (!removeBtn) {
-      log.warn(`No .shortcut-remove button found for ${sub.type} ${sub.id}`);
-      return;
-    }
-
-    // Click the button — this tells BGG we've acknowledged the subscription.
-    await removeBtn.click();
-    log.info(`Cleared BGG shortcut for "${sub.title}" (${sub.type} ${sub.id})`);
-
-    // Brief pause after clicking to let BGG's Angular app process the removal
-    // before we click the next one. Without this, rapid clicks can confuse the SPA.
-    //
-    // `new Promise<void>((resolve) => setTimeout(resolve, 500))`:
-    //   Promise constructor takes a callback with `resolve` and `reject` functions.
-    //   setTimeout(resolve, 500) calls resolve after 500ms, completing the Promise.
-    //   Python equivalent: await asyncio.sleep(0.5)
-    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+  if (debugClear) {
+    // Match the row count we'd click in non-debug mode so the log is honest.
+    const wouldClick = await subPage.evaluate(({ frag }: { frag: string }) => {
+      const notices = Array.from(document.querySelectorAll('gg-notice'));
+      let count = 0;
+      for (const n of notices) {
+        const links = n.querySelectorAll('a[href]');
+        let matches = false;
+        for (let i = 0; i < links.length; i++) {
+          if ((links[i] as HTMLAnchorElement).href.includes(frag)) { matches = true; break; }
+        }
+        if (matches && n.querySelector('button.quick-read-btn')) count++;
+      }
+      return count;
+    }, { frag: fragment });
+    log.info(`[DEBUG] Would click ${wouldClick} quick-read-btn(s) for "${sub.title}" (${sub.type} ${sub.id})`);
     return;
   }
 
-  // No matching shortcut found in the sidebar — log at debug level (not a problem;
-  // the shortcut may already have been cleared or may be on a later sidebar page).
-  log.debug(`No gg-shortcut found for ${sub.type} ${sub.id}`);
+  // Click every quick-read-btn inside notices that reference this subscription.
+  // We do it in one evaluate call — DOM mutations during clicking would
+  // invalidate ElementHandles between calls otherwise.
+  const clicked = await subPage.evaluate(({ frag }: { frag: string }) => {
+    const notices = Array.from(document.querySelectorAll('gg-notice'));
+    let count = 0;
+    for (const n of notices) {
+      const links = n.querySelectorAll('a[href]');
+      let matches = false;
+      for (let i = 0; i < links.length; i++) {
+        if ((links[i] as HTMLAnchorElement).href.includes(frag)) { matches = true; break; }
+      }
+      if (!matches) continue;
+      const btn = n.querySelector('button.quick-read-btn') as HTMLButtonElement | null;
+      if (btn) {
+        btn.click();
+        count++;
+      }
+    }
+    return count;
+  }, { frag: fragment }).catch((err: unknown) => {
+    log.warn(`clearSubscriptionShortcut: evaluate failed for ${sub.type} ${sub.id}`, { err: String(err) });
+    return 0;
+  });
+
+  if (clicked > 0) {
+    log.info(`Cleared ${clicked} BGG notice row(s) for "${sub.title}" (${sub.type} ${sub.id})`);
+    // Pause to let BGG's Angular app process the removals before the next sub.
+    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+  } else {
+    log.debug(`No quick-read-btn found for ${sub.type} ${sub.id} — already cleared or not on page`);
+  }
 }

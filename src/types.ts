@@ -29,7 +29,18 @@
 //   SubscriptionType = Literal['thread', 'geeklist', 'unknown']
 //
 // The | character is "or" for types (not bitwise OR).
-export type SubscriptionType = 'thread' | 'geeklist' | 'unknown';
+// Includes "stub" subscription types we recognize but don't have an XML API
+// for — boardgame/expansion/blog/filepage. For these we just include the
+// notification-row text and URL in the digest so the user knows there's new
+// activity worth checking manually.
+export type SubscriptionType =
+  | 'thread'
+  | 'geeklist'
+  | 'boardgame'
+  | 'boardgameexpansion'
+  | 'blog'
+  | 'filepage'
+  | 'unknown';
 
 // ---- Interfaces ------------------------------------------------
 //
@@ -80,6 +91,18 @@ export interface BggSubscription {
   // Used in the manifest so Claude knows the true scale of outstanding activity.
   // Python: int  (0 = unknown)
   unreadCount: number;
+
+  // Parent boardgame/expansion name from a sibling /boardgame/N URL in the
+  // same notice row, if any. For threads in a game's forum BGG includes both
+  // the thread URL and the game URL — capturing the game lets the digest
+  // attribute "Question about scoring" to "Nusfjord: Big Box" instead of
+  // dropping the context entirely.
+  parentName?: string;
+
+  // The notification row's full text content. For stub subscription types
+  // (boardgame/blog/filepage — no XML API) this is the only content we have
+  // to show. For thread/geeklist subs it's available as a fallback.
+  rowText?: string;
 }
 
 // ---- Thread types ----------------------------------------------

@@ -133,26 +133,27 @@ export function formatGeeklistContent(
 
     // ---- Filter and label comments ----
     //
-    // Sort comments newest-first so if we must cap, we keep the most recent.
-    // `[...item.comments]` creates a shallow copy before sorting — we never
-    // mutate the original array. Python: sorted(item.comments, key=..., reverse=True)
-    const sortedComments = [...item.comments]
-      .sort((a, b) => b.date.getTime() - a.date.getTime())  // Newest first
-      .slice(0, 10);  // Cap at 10 per item — Python: [:10]
+    // When we have a notificationDate, drop comments older than the cutoff
+    // entirely — they were already read on a prior visit and just bloat the
+    // file. Without a date, fall back to "10 newest" as a sensible cap.
+    // Python: [c for c in item.comments if not notif_date or c.date > notif_date]
+    const filteredComments = notificationDate !== null
+      ? item.comments.filter((c) => c.date > notificationDate)
+      : item.comments;
+
+    const sortedComments = [...filteredComments]
+      .sort((a, b) => b.date.getTime() - a.date.getTime())
+      .slice(0, 10);
 
     for (const c of sortedComments) {
       const cd = c.date.toLocaleDateString('en-US');
-      // Label comments that are newer than the notification cutoff as "[NEW]".
-      // These are comments that were added since the user's last visit.
-      // Python: '[NEW] ' if notification_date and c.date > notification_date else ''
-      const commentTag = (notificationDate !== null && c.date > notificationDate) ? ' [NEW]' : '';
-      // `↳` is a visual cue that this is a reply/comment
-      lines.push(`  ↳ Comment by ${c.username} on ${cd}${commentTag}: ${c.body}`);
+      lines.push(`  ↳ Comment by ${c.username} on ${cd}: ${c.body}`);
     }
 
-    // Note if we omitted older comments due to the cap
-    if (item.comments.length > 10) {
-      lines.push(`  ↳ (${item.comments.length - 10} older comments not shown)`);
+    // Note if we capped (or filtered out) any comments
+    const omitted = filteredComments.length > 10 ? filteredComments.length - 10 : 0;
+    if (omitted > 0) {
+      lines.push(`  ↳ (${omitted} older comments not shown)`);
     }
 
     lines.push('');
@@ -184,8 +185,10 @@ export interface ManifestEntry {
   // BGG's internal numeric ID for this subscription
   subscriptionId: number;
 
-  // 'thread' for forum threads, 'geeklist' for community curated lists
-  type: 'thread' | 'geeklist' | 'unknown';
+  // 'thread' for forum threads, 'geeklist' for community curated lists,
+  // plus the secondary types for game-page / blog / file-page subscriptions
+  // that we follow for new content (no XML API but we scrape the HTML).
+  type: 'thread' | 'geeklist' | 'boardgame' | 'boardgameexpansion' | 'blog' | 'filepage' | 'unknown';
 
   // Human-readable title (from BGG's notification page or API)
   title: string;
@@ -211,6 +214,12 @@ export interface ManifestEntry {
   // null if we couldn't parse a date from the notification row text.
   // Python: Optional[str]
   notificationDate: string | null;
+
+  // The parent boardgame/expansion name when this thread or geeklist lives
+  // inside a game's forum (e.g. "Nusfjord: Big Box"). Lets the digest group
+  // and label related discussion. Captured from a sibling /boardgame URL in
+  // the same notice row.
+  parentName?: string;
 }
 
 // ============================================================
@@ -336,17 +345,20 @@ Read the manifest file at this exact path: ${manifestPath}
 The manifest is a JSON array where each entry describes one subscription:
   - "title": subscription name
   - "url": BGG URL for this subscription
-  - "type": "thread" (forum thread) or "geeklist" (community curated list)
+  - "type": "thread", "geeklist", "blog", "filepage", "boardgame", or "boardgameexpansion"
   - "filePath": absolute path to the subscription's data file — read this with your Read tool
   - "itemCount": how many items are in the data file
-  - "unreadCount": BGG's reported number of unread posts/items/comments (0 = unknown); treat this as ground truth for how much new activity exists
+  - "unreadCount": number of new-activity rows BGG showed for this subscription (1 per new article/item)
   - "notificationDate": when this subscription was last visited (ISO timestamp or null)
+  - "parentName" (optional): when present, this thread/geeklist/page lives inside a specific game's
+    forum (e.g. "Nusfjord: Big Box", "Marvel Champions: The Card Game"). Use it to label and group.
 
 For EACH subscription in the manifest:
 1. Read the subscription's data file (use the "filePath" value from the manifest)
-2. Write a section in this exact markdown format:
+2. Write a section in this markdown format:
 
 ### [Subscription Title](URL)
+*Parent: <parentName>* — only include this line if parentName is set in the manifest entry
 
 **Summary:** 2–4 sentences on what's new and the overall tone.
 
@@ -357,11 +369,18 @@ For EACH subscription in the manifest:
 
 ---
 
-Ordering and structure rules:
-- Order sections with the most relevant-to-my-interests subscriptions FIRST
-- Write a "## ⭐ Highlights" section at the very top, listing ⭐ items across ALL subscriptions before the individual sections
-- For high-volume subscriptions (itemCount > 30), summarize activity by THEME rather than listing individual items — e.g. "15 posts discussed solo experiences with Wingspan" rather than 15 separate bullets
-- Skip subscriptions with no meaningful content to report
+Output rules:
+- Begin your output IMMEDIATELY with "## ⭐ Highlights" — no preamble, no progress narration, no "I have all the data" lines, no duplicate title (the digest already has a wrapper header)
+- After Highlights, render each subscription section in the format above
+- Order sections this way:
+  1. Subscriptions matching my "Priority Subscriptions" interests FIRST
+  2. Subscriptions whose parentName matches one of my "Games I'm Tracking"
+  3. Other subscriptions whose parentName is set (game-related discussion not on my priority list)
+  4. Everything else last
+- The Highlights section lists ⭐ items across ALL subscriptions before the individual sections
+- For high-volume subscriptions (itemCount > 30), summarize activity by THEME rather than listing individual items
+- INCLUDE every subscription in the manifest at least briefly — even pure trade/sale or off-topic threads. For low-relevance ones, a one-line summary with the link is fine. Do not silently omit a subscription.
+- When grouping multiple subscriptions with the same parentName, put them adjacent so the user can see all activity for one game together.
 - Read ONLY the files listed in the manifest — do not explore the rest of the filesystem`;
 }
 

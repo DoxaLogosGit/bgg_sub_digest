@@ -120,6 +120,15 @@ async function fetchXml(url: string, page: Page, apiKey: string): Promise<string
       continue;  // `continue` jumps to the next loop iteration — same as Python
     }
 
+    if (result.status === 429) {
+      // Rate limit exceeded — same retry strategy as 202. We don't get a
+      // Retry-After header from BGG, so use exponential backoff.
+      const delay = RETRY_DELAYS_MS[attempt] ?? 30_000;
+      log.warn(`BGG returned 429 (rate limited), retrying in ${delay}ms`, { url, attempt });
+      await sleep(delay);
+      continue;
+    }
+
     // Any other status (401, 403, 404, 500, etc.) is an unrecoverable error.
     // We throw immediately rather than retrying.
     // `result.text.slice(0, 200)` — first 200 chars of the response body.
@@ -234,8 +243,25 @@ function truncate(text: string, max = 1000): string {
 // "this Promise resolves to either a BggThread or null".
 // Python: async def fetch_thread(...) -> Optional[BggThread]
 
-export async function fetchThread(threadId: number, apiKey: string, page: Page): Promise<BggThread | null> {
-  const url = `${BGG_V2}/thread?id=${threadId}`;
+export async function fetchThread(
+  threadId: number,
+  apiKey: string,
+  page: Page,
+  // Optional date cutoff. When provided, BGG's XML API returns only articles
+  // posted on or after this date — which is what we actually want for digest
+  // purposes. Long threads (Dad Jokes, 13K+ posts since 2018) otherwise return
+  // archived oldest-first content and miss the new replies entirely.
+  minArticleDate: Date | null = null,
+): Promise<BggThread | null> {
+  // BGG's date format for minarticledate is YYYY-MM-DD HH:mm:ss (URL-encoded space).
+  // Verified empirically: ISO-8601 with "T" separator returns 400.
+  const params = new URLSearchParams({ id: String(threadId) });
+  if (minArticleDate) {
+    const iso = minArticleDate.toISOString();   // 2026-04-28T05:00:00.000Z
+    const bgg = iso.slice(0, 10) + ' ' + iso.slice(11, 19);  // 2026-04-28 05:00:00
+    params.set('minarticledate', bgg);
+  }
+  const url = `${BGG_V2}/thread?${params.toString()}`;
   log.debug('Fetching thread', { threadId, url });
 
   // Fetch the XML string, returning null on network/HTTP errors
