@@ -1,4 +1,5 @@
 node_modules/
+digest-data/
 dist/
 
 # Never commit credentials or personal data
