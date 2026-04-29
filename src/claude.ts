@@ -369,8 +369,17 @@ For EACH subscription in the manifest:
 
 ---
 
+CRITICAL WORKFLOW — follow exactly:
+1. Read the manifest.json file first
+2. Read EVERY file listed in the manifest's "filePath" fields — all of them, in order
+3. Do NOT write any content while reading files — no progress narration, no partial sections
+4. ONLY AFTER reading ALL files: write the complete digest in a SINGLE response
+5. That single response MUST begin with "## ⭐ Highlights"
+6. The entire digest — every section — must be in that ONE final response
+7. Do NOT say "the digest is above" or reference earlier turns
+
 Output rules:
-- Begin your output IMMEDIATELY with "## ⭐ Highlights" — no preamble, no progress narration, no "I have all the data" lines, no duplicate title (the digest already has a wrapper header)
+- Begin your output with "## ⭐ Highlights" — no preamble, no duplicate title (the digest already has a wrapper header)
 - After Highlights, render each subscription section in the format above
 - Order sections this way:
   1. Subscriptions matching my "Priority Subscriptions" interests FIRST
@@ -378,7 +387,7 @@ Output rules:
   3. Other subscriptions whose parentName is set (game-related discussion not on my priority list)
   4. Everything else last
 - The Highlights section lists ⭐ items across ALL subscriptions before the individual sections
-- For high-volume subscriptions (itemCount > 30), summarize activity by THEME rather than listing individual items
+- For high-volume subscriptions (itemCount > 30), summarize overall activity by THEME — but still list individual ⭐ bullets for any items that match my tracked games or priority interests, even if there are dozens of them. Priority items always get the full bullet treatment; the rest of the volume gets the thematic summary.
 - INCLUDE every subscription in the manifest at least briefly — even pure trade/sale or off-topic threads. For low-relevance ones, a one-line summary with the link is fine. Do not silently omit a subscription.
 - When grouping multiple subscriptions with the same parentName, put them adjacent so the user can see all activity for one game together.
 - Read ONLY the files listed in the manifest — do not explore the rest of the filesystem`;
