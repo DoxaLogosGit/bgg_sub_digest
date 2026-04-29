@@ -162,44 +162,43 @@ function extractNotifiedId(href: string, type: SubscriptionType): number | null 
 
 // ---- parseUnreadCount ----------------------------------------
 //
-// Parses the total activity count from a gg-notice row's full text content.
-// BGG embeds counts in the row text — the exact format varies by type:
+// Parses the unread/activity count from a gg-notice row's full text.
+// BGG embeds the count in the row text — format varies by subscription type:
 //
-//   Geeklists: "436 GeekList Items"  "1378 Comments"  (may have both)
-//   Threads:   "11 Replies"          "3 more replies"
-//   General:   "5 new items"         "2 new comments"
+//   Threads (new, never read):    "1 Thread"
+//   Threads (subscribed, unread): "3 replies"  "3 more replies"
+//   Geeklists:                    "436 GeekList Items"  "1378 Comments"
 //
-// Note: these are TOTAL counts on the subscription, not the unread delta.
-// We still store them in the manifest so Claude knows the scale of each
-// subscription (a 436-item geeklist vs a 12-item one warrants different depth).
-// For threads, we count notice rows instead (one row = one unread reply) which
-// IS the unread count — call this with type='thread' and it returns 0 so the
-// caller can fall back to row-counting.
+// Each subscription has ONE notice row regardless of how many items are new.
+// The count in that row is what BGG considers outstanding for that subscription.
 //
 // Returns the count found, or 0 if nothing matched.
-function parseUnreadCount(text: string, type: SubscriptionType): number {
+function parseUnreadCount(text: string): number {
   if (!text) return 0;
-  // For threads, each notice row IS one new reply — caller counts rows directly.
-  if (type === 'thread') return 0;
 
-  let total = 0;
+  // "1 Thread" — brand-new thread, entirely unread
+  if (/\b1\s+Thread\b/i.test(text)) return 1;
 
-  // "N GeekList Items" — geeklist item count
+  // "N replies" / "N more replies" — unread replies on a subscribed thread
+  const replies = text.match(/(\d[\d,]*)\s+(?:more\s+)?repl(?:ies|y)/i);
+  if (replies) return parseInt(replies[1].replace(/,/g, ''), 10);
+
+  // "N GeekList Items" — geeklist items (BGG shows the subscription total here,
+  // but it gives Claude useful scale context even if it's not strictly "unread")
   const glItems = text.match(/(\d[\d,]*)\s+GeekList\s+Items?/i);
-  if (glItems) total += parseInt(glItems[1].replace(/,/g, ''), 10);
+  let total = glItems ? parseInt(glItems[1].replace(/,/g, ''), 10) : 0;
 
-  // "N Comments" — comment count on geeklist items
+  // "N Comments" — comments on geeklist items (add to item count)
   const comments = text.match(/(\d[\d,]*)\s+Comments?(?!\s+\w)/i);
   if (comments) total += parseInt(comments[1].replace(/,/g, ''), 10);
 
-  // Fallback: "N Replies" / "N more replies" / "N new items" / "N new comments"
-  if (total === 0) {
-    const fallback = /(\d[\d,]*)\s+(?:more\s+|new\s+)?(?:repl(?:ies|y)|items?|comments?)/i;
-    const m = text.match(fallback);
-    if (m) total = parseInt(m[1].replace(/,/g, ''), 10);
-  }
+  if (total > 0) return total;
 
-  return total;
+  // Generic fallback: "N new items" / "N new comments"
+  const generic = text.match(/(\d[\d,]*)\s+(?:new\s+|more\s+)?(?:items?|comments?)/i);
+  if (generic) return parseInt(generic[1].replace(/,/g, ''), 10);
+
+  return 0;
 }
 
 // ---- parseNotificationDate ----------------------------------------
@@ -506,10 +505,10 @@ export async function scrapeSubscriptions(
 
         const notifiedId = extractNotifiedId(href, classified.type);
 
-        // For threads, each notice row is one new reply → count rows.
-        // For geeklists/blogs/etc., parse the count from the row text (BGG
-        // embeds totals like "436 GeekList Items" or "11 Replies" in the row).
-        const parsedCount = parseUnreadCount(row.fullText, classified.type);
+        // Parse the unread count from the row text. BGG embeds it directly:
+        // "1 Thread", "3 replies", "436 GeekList Items 1378 Comments", etc.
+        // Fall back to 1 if nothing parses — at minimum there's 1 new item.
+        const parsedCount = parseUnreadCount(row.fullText) || 1;
 
         if (!found.has(key)) {
           const canonicalUrl = canonicalUrlFor(classified.type, classified.id, href);
@@ -521,8 +520,7 @@ export async function scrapeSubscriptions(
             url:              canonicalUrl,
             notifiedItemIds:  notifiedId ? [notifiedId] : [],
             notificationDate: rowDate,
-            // Threads: 1 (will be incremented per row). Others: parsed from text.
-            unreadCount:      classified.type === 'thread' ? 1 : (parsedCount || 1),
+            unreadCount:      parsedCount,
             parentName,
             rowText:          row.fullText,
           });
@@ -536,13 +534,9 @@ export async function scrapeSubscriptions(
             sub.notifiedItemIds.push(notifiedId);
           }
 
-          // Threads accumulate one count per notice row (each = one new reply).
-          // For others, take the max of what we've seen — multiple rows for the
-          // same geeklist should all report the same total, but take the largest
-          // in case BGG updates the count between page loads.
-          if (sub.type === 'thread') {
-            sub.unreadCount += 1;
-          } else if (parsedCount > sub.unreadCount) {
+          // If the same subscription appears on multiple pages, take the largest
+          // count seen — they should be the same but the last page might be stale.
+          if (parsedCount > sub.unreadCount) {
             sub.unreadCount = parsedCount;
           }
 
