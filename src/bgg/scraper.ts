@@ -160,6 +160,48 @@ function extractNotifiedId(href: string, type: SubscriptionType): number | null 
   }
 }
 
+// ---- parseUnreadCount ----------------------------------------
+//
+// Parses the total activity count from a gg-notice row's full text content.
+// BGG embeds counts in the row text — the exact format varies by type:
+//
+//   Geeklists: "436 GeekList Items"  "1378 Comments"  (may have both)
+//   Threads:   "11 Replies"          "3 more replies"
+//   General:   "5 new items"         "2 new comments"
+//
+// Note: these are TOTAL counts on the subscription, not the unread delta.
+// We still store them in the manifest so Claude knows the scale of each
+// subscription (a 436-item geeklist vs a 12-item one warrants different depth).
+// For threads, we count notice rows instead (one row = one unread reply) which
+// IS the unread count — call this with type='thread' and it returns 0 so the
+// caller can fall back to row-counting.
+//
+// Returns the count found, or 0 if nothing matched.
+function parseUnreadCount(text: string, type: SubscriptionType): number {
+  if (!text) return 0;
+  // For threads, each notice row IS one new reply — caller counts rows directly.
+  if (type === 'thread') return 0;
+
+  let total = 0;
+
+  // "N GeekList Items" — geeklist item count
+  const glItems = text.match(/(\d[\d,]*)\s+GeekList\s+Items?/i);
+  if (glItems) total += parseInt(glItems[1].replace(/,/g, ''), 10);
+
+  // "N Comments" — comment count on geeklist items
+  const comments = text.match(/(\d[\d,]*)\s+Comments?(?!\s+\w)/i);
+  if (comments) total += parseInt(comments[1].replace(/,/g, ''), 10);
+
+  // Fallback: "N Replies" / "N more replies" / "N new items" / "N new comments"
+  if (total === 0) {
+    const fallback = /(\d[\d,]*)\s+(?:more\s+|new\s+)?(?:repl(?:ies|y)|items?|comments?)/i;
+    const m = text.match(fallback);
+    if (m) total = parseInt(m[1].replace(/,/g, ''), 10);
+  }
+
+  return total;
+}
+
 // ---- parseNotificationDate ----------------------------------------
 //
 // Tries to extract a date from the full text content of a GG-ITEM-LINK-UI
@@ -464,6 +506,11 @@ export async function scrapeSubscriptions(
 
         const notifiedId = extractNotifiedId(href, classified.type);
 
+        // For threads, each notice row is one new reply → count rows.
+        // For geeklists/blogs/etc., parse the count from the row text (BGG
+        // embeds totals like "436 GeekList Items" or "11 Replies" in the row).
+        const parsedCount = parseUnreadCount(row.fullText, classified.type);
+
         if (!found.has(key)) {
           const canonicalUrl = canonicalUrlFor(classified.type, classified.id, href);
 
@@ -474,7 +521,8 @@ export async function scrapeSubscriptions(
             url:              canonicalUrl,
             notifiedItemIds:  notifiedId ? [notifiedId] : [],
             notificationDate: rowDate,
-            unreadCount:      1,
+            // Threads: 1 (will be incremented per row). Others: parsed from text.
+            unreadCount:      classified.type === 'thread' ? 1 : (parsedCount || 1),
             parentName,
             rowText:          row.fullText,
           });
@@ -488,7 +536,15 @@ export async function scrapeSubscriptions(
             sub.notifiedItemIds.push(notifiedId);
           }
 
-          sub.unreadCount += 1;
+          // Threads accumulate one count per notice row (each = one new reply).
+          // For others, take the max of what we've seen — multiple rows for the
+          // same geeklist should all report the same total, but take the largest
+          // in case BGG updates the count between page loads.
+          if (sub.type === 'thread') {
+            sub.unreadCount += 1;
+          } else if (parsedCount > sub.unreadCount) {
+            sub.unreadCount = parsedCount;
+          }
 
           // Keep the parent name once we've seen it — sibling rows for the
           // same subscription typically all carry the same /boardgame URL.
@@ -537,9 +593,10 @@ export async function scrapeSubscriptions(
     // in its initial state (sidebar doesn't paginate the same way).
     if (contentPage > 1) {
       await page.goto(SUBSCRIPTIONS_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-      // .catch(() => undefined) swallows errors — if there are no shortcuts,
-      // waitForSelector times out, but that's fine. We proceed regardless.
-      await page.waitForSelector('gg-shortcut', { timeout: 15_000 }).catch(() => undefined);
+      // Wait for gg-notice rows to render so clearSubscriptionShortcut() can
+      // find button.quick-read-btn inside them. Without this, the Angular SPA
+      // may not have rendered the notice rows by the time we try to click.
+      await page.waitForSelector('gg-notice', { timeout: 15_000 }).catch(() => undefined);
     }
 
     // `[...found.values()]` — spread the Map's values into an Array.
@@ -587,10 +644,8 @@ export async function clearSubscriptionShortcut(
   debugClear: boolean,
 ): Promise<void> {
   // URL fragment that identifies this subscription on the page.
-  // Both /thread/N and /geeklist/N appear inside their notice rows.
-  const fragment = sub.type === 'thread'
-    ? `/thread/${sub.id}`
-    : `/geeklist/${sub.id}`;
+  // Matches the path segment in notice row links.
+  const fragment = `/${sub.type}/${sub.id}`;
 
   if (debugClear) {
     // Match the row count we'd click in non-debug mode so the log is honest.

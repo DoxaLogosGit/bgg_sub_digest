@@ -342,29 +342,36 @@ async function main(): Promise<void> {
 
           // ---- Filter to items with new activity since the last visit ----
           //
-          // PRIMARY: notifiedItemIds. Each notification row encodes the
-          // specific itemid in its URL — collected per-row by the scraper.
-          // This is the precise list of items BGG flagged as new.
+          // BGG shows ONE gg-notice row for the entire geeklist subscription
+          // (not one row per new item, unlike threads). This means notifiedItemIds
+          // only has 1 ID — the oldest unread item BGG chose to link to.
+          // Using IDs-first would return just that single item regardless of how
+          // many items are actually new (e.g. SGOYT with 200+ items behind).
           //
-          // FALLBACK 1: notificationDate. Captures cases where BGG's URL didn't
-          // include an itemid (rare).
+          // PRIMARY: notificationDate from the section header. This tells us when
+          // the oldest unread item was posted — everything newer is "new".
+          //
+          // FALLBACK 1: notifiedItemIds. Catches edge cases where date parsing
+          // failed but BGG gave us an explicit item link.
           //
           // FALLBACK 2: recentItems(maxItems). Last resort.
           let items: BggGeeklistItem[] = [];
 
-          const notified = new Set(sub.notifiedItemIds);
-          if (notified.size > 0) {
-            items = geeklist.items
-              .filter((item) => notified.has(item.id))
-              .sort((a, b) => {
-                const da = a.editdate > a.postdate ? a.editdate : a.postdate;
-                const db = b.editdate > b.postdate ? b.editdate : b.postdate;
-                return db.getTime() - da.getTime();
-              });
+          if (sub.notificationDate !== null) {
+            items = itemsNewerThan(geeklist.items, sub.notificationDate);
           }
 
-          if (items.length === 0 && sub.notificationDate !== null) {
-            items = itemsNewerThan(geeklist.items, sub.notificationDate);
+          if (items.length === 0) {
+            const notified = new Set(sub.notifiedItemIds);
+            if (notified.size > 0) {
+              items = geeklist.items
+                .filter((item) => notified.has(item.id))
+                .sort((a, b) => {
+                  const da = a.editdate > a.postdate ? a.editdate : a.postdate;
+                  const db = b.editdate > b.postdate ? b.editdate : b.postdate;
+                  return db.getTime() - da.getTime();
+                });
+            }
           }
 
           if (items.length === 0) {
