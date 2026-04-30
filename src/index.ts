@@ -156,11 +156,18 @@ async function main(): Promise<void> {
     const config    = loadConfig();
     const interests = loadInterests(config.digest.interestsFile);
 
+    // Parse --model <name> from CLI args, e.g. `npm start -- --model sonnet`
+    // process.argv: ['node', 'index.ts', '--model', 'sonnet']
+    // Default to opus for best digest quality.
+    const modelArgIndex = process.argv.indexOf('--model');
+    const model = modelArgIndex !== -1 ? process.argv[modelArgIndex + 1] : 'opus';
+
     log.info('Config loaded', {
       scheduleMode:  config.digest.scheduleMode,
       interestsFile: config.digest.interestsFile,
       hasInterests:  interests.length > 0,
       debugClear:    config.digest.debugClear,
+      model,
     });
 
     if (!interests) {
@@ -482,7 +489,7 @@ async function main(): Promise<void> {
       // This is synchronous — we wait for Claude to finish before continuing.
       let digestResult: DigestResult;
       try {
-        digestResult = runClaudeDigest(manifestPath, interests);
+        digestResult = runClaudeDigest(manifestPath, interests, model);
       } catch (err) {
         log.error('Claude digest run failed', { err: String(err) });
         // Fallback — show a minimal digest pointing at the data files so the user

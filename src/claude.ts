@@ -432,7 +432,7 @@ Output rules:
 //           return DigestResult(body=parsed['result'], ...)
 //       finally:
 //           os.unlink(tmp)
-export function runClaudeDigest(manifestPath: string, interests: string): DigestResult {
+export function runClaudeDigest(manifestPath: string, interests: string, model = 'opus'): DigestResult {
   const prompt = buildDigestPrompt(manifestPath, interests);
 
   // Write prompt to a temp file — avoids shell argument length limits.
@@ -470,7 +470,7 @@ export function runClaudeDigest(manifestPath: string, interests: string): Digest
     const augmentedPath = [...extraPaths, process.env.PATH ?? ''].join(':');
 
     const result = spawnSync(
-      `claude --model opus --dangerously-skip-permissions --print --output-format json < "${tmpFile}"`,
+      `claude --model ${model} --dangerously-skip-permissions --print --output-format json < "${tmpFile}"`,
       {
         shell:     true,
         encoding:  'utf-8',

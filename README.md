@@ -174,6 +174,12 @@ npm start
 
 Output is written to `./digests/bgg-digest-YYYY-MM-DD.md`.
 
+To use a cheaper model (Sonnet costs ~5× less than Opus):
+
+```bash
+npm start -- --model sonnet
+```
+
 ### Running on a schedule (cron)
 
 ```cron
@@ -243,7 +249,11 @@ Read tool, and produces the full digest. This means:
 - Claude can skim low-priority subscriptions and read high-priority ones fully
 - The digest prompt respects your `interests.md` for ordering and highlighting
 
-Claude runs with `--model opus` for best summarization quality.
+Claude runs with `--model opus` by default for best summarization quality.
+Pass `-- --model sonnet` (or `haiku`) to `npm start` to use a cheaper model.
+
+If `email` config is present, the digest is also converted to HTML and sent
+via Resend after the file is written.
 
 ## Troubleshooting
 
