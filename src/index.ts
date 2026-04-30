@@ -54,6 +54,7 @@ import { fetchPageContent, formatPageContent } from './bgg/page-content';
 import type { ManifestEntry, DigestResult } from './claude';
 import type { BggGeeklistItem, BggThreadArticle } from './types';
 import { buildMarkdown, writeDigest } from './digest';
+import { sendDigestEmail, buildEmailSubject } from './email';
 
 // ============================================================
 // PID lock — prevent concurrent runs
@@ -508,10 +509,13 @@ async function main(): Promise<void> {
       const digestPath = writeDigest(markdown, config.digest.outputDir, runStart);
 
       log.info(`Digest complete → ${digestPath}`);
-
-      // console.log() goes to stdout (not the log file) — useful for
-      // piping the path to another command or just seeing it clearly.
       console.log(`\nDigest written to: ${digestPath}`);
+
+      // ---- 8. Email the digest (optional) -------------------
+      if (config.email) {
+        const subject = buildEmailSubject(runStart);
+        await sendDigestEmail(config.email, subject, markdown);
+      }
 
     } finally {
       // Close the browser regardless of success or failure.

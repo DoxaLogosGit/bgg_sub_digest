@@ -83,6 +83,21 @@ const ConfigSchema = z.object({
     // Leave true until you've verified the right shortcuts are being targeted.
     debugClear: z.boolean().default(true),
   }),
+
+  // Optional email delivery via Resend (https://resend.com).
+  // If this section is absent, the digest is only written to disk.
+  // Python: Optional[EmailConfig] = None
+  email: z.object({
+    // Resend API key from https://resend.com/api-keys
+    resendApiKey: z.string().min(1),
+
+    // "From" address — must be a verified sender domain in Resend.
+    // e.g. "BGG Digest <digest@yourdomain.com>" or just "you@yourdomain.com"
+    from: z.string().min(1),
+
+    // Recipient address — where the digest is delivered.
+    to: z.string().min(1),
+  }).optional(),
 });
 
 // ---- loadConfig -----------------------------------------------

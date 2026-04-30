@@ -2,28 +2,19 @@
   "bgg": {
     "username": "your_bgg_username",
     "password": "your_bgg_password",
-    "apiKey": "your_bgg_xml_api_key"
-  },
-  "topics": {
-    "games": [
-      "Twilight Imperium",
-      "Spirit Island",
-      "Gloomhaven"
-    ],
-    "keywords": [
-      "solo",
-      "cooperative",
-      "expansion",
-      "kickstarter",
-      "review"
-    ],
-    "importantGeeklistTitles": ["SGOYT"],
-    "importantThreadTitles": []
+    "apiKey":   "your_bgg_xml_api_key"
   },
   "digest": {
-    "outputDir": "./digests",
-    "scheduleMode": "daily",
-    "maxNewItemsPerSubscription": 50,
-    "headless": true
+    "outputDir":                  "./digests",
+    "scheduleMode":               "daily",
+    "maxNewItemsPerSubscription": 15,
+    "headless":                   true,
+    "interestsFile":              "./interests.md",
+    "debugClear":                 true
+  },
+  "email": {
+    "resendApiKey": "re_......",
+    "from":         "your send@domain.com",
+    "to":           "your_read@someother_domain.com"
   }
 }

@@ -96,6 +96,32 @@ Edit `config.json`:
 | `digest.headless` | `true` | Set `false` on first run to watch Chromium and solve any Cloudflare challenge manually |
 | `digest.interestsFile` | `./interests.md` | Path to your interests file (see below) |
 | `digest.debugClear` | `true` | `true` = log what would be cleared but don't actually click; set `false` once you've verified targeting is correct |
+| `email.resendApiKey` | — | Resend API key (omit entire `email` block to disable) |
+| `email.from` | — | Verified sender address, e.g. `BGG Digest <digest@yourdomain.com>` |
+| `email.to` | — | Recipient address |
+
+### 3. Email delivery (optional)
+
+The digest can be emailed to you automatically via [Resend](https://resend.com).
+Resend's free tier (3,000 emails/month) is more than enough for a daily digest.
+
+1. Sign up at [resend.com](https://resend.com) and create an API key
+2. Add a verified sender domain (or use Resend's shared `onboarding@resend.dev`
+   address for testing before you set one up)
+3. Add the `email` section to your `config.json`:
+
+```json
+"email": {
+  "resendApiKey": "re_your_api_key",
+  "from":         "BGG Digest <digest@yourdomain.com>",
+  "to":           "you@gmail.com"
+}
+```
+
+The digest is converted from markdown to HTML before sending, so it renders
+fully formatted in Gmail (headers, bold, bullet lists, links).
+
+Omit the `email` section entirely to skip email and only write to disk.
 
 ### 2. Create `interests.md`
 
