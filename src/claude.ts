@@ -456,6 +456,19 @@ export function runClaudeDigest(manifestPath: string, interests: string): Digest
     //
     // Timeout is 20 minutes — file reading adds multiple round-trips vs. a single prompt.
     // Python: subprocess.run(..., shell=True, capture_output=True, text=True, timeout=1200)
+    // Cron runs with a minimal PATH that typically doesn't include ~/.local/bin
+    // or wherever `claude` was installed. We extend the inherited PATH with the
+    // common locations so spawnSync can find the binary regardless of how this
+    // process was launched (interactive shell vs. cron vs. systemd timer).
+    const home = process.env.HOME ?? '';
+    const extraPaths = [
+      `${home}/.local/bin`,           // npm global on Linux (most common for claude)
+      `${home}/.npm-global/bin`,      // npm with custom prefix
+      `${home}/.nvm/versions/node/current/bin`, // nvm current
+      '/usr/local/bin',               // homebrew / manual installs
+    ].filter(Boolean);
+    const augmentedPath = [...extraPaths, process.env.PATH ?? ''].join(':');
+
     const result = spawnSync(
       `claude --model opus --dangerously-skip-permissions --print --output-format json < "${tmpFile}"`,
       {
@@ -463,6 +476,7 @@ export function runClaudeDigest(manifestPath: string, interests: string): Digest
         encoding:  'utf-8',
         timeout:   20 * 60 * 1000,    // 20 minutes in milliseconds
         maxBuffer: 20 * 1024 * 1024,  // 20 MB max output buffer
+        env:       { ...process.env, PATH: augmentedPath },
       },
     );
 
