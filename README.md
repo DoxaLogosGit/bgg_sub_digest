@@ -1,8 +1,9 @@
 # BGG Subscription Digest
 
 Generates a daily or weekly markdown digest of new activity across your
-[BoardGameGeek](https://boardgamegeek.com) subscriptions (threads and
-geeklists), summarized and prioritized by Claude AI based on your interests.
+[BoardGameGeek](https://boardgamegeek.com) subscriptions (threads, geeklists,
+blogs, file pages, and game pages), summarized and prioritized by Claude AI
+based on your interests.
 
 Instead of clicking through each BGG subscription individually, you get one
 file with everything new — highlights first, ordered by what you actually
@@ -157,34 +158,50 @@ Output is written to `./digests/bgg-digest-YYYY-MM-DD.md`.
 The script uses a PID lock file (`./bgg-digest.pid`) to prevent overlapping
 runs if a previous one is still in progress.
 
+> **Note on PATH:** cron runs with a minimal `PATH` that typically does not
+> include `~/.local/bin` where the `claude` CLI is installed. The script
+> automatically prepends `~/.local/bin`, `~/.npm-global/bin`, and `/usr/local/bin`
+> to the subprocess PATH when calling Claude, so no extra cron PATH configuration
+> is needed.
+
 ## How it works
 
 ### BGG notification page
 
-BGG's `/subscriptions` page shows **one row per new item** (not per subscription).
-A thread with 5 new replies appears as 5 rows; a geeklist with 3 new comments
-appears as 3 rows. Rows are grouped under date headings ("Today", "Yesterday",
-"Apr 21, 2026"). Each row's URL encodes the specific article or item ID that
-triggered the notification.
+BGG's `/subscriptions` page shows **one `gg-notice` row per subscription** with
+outstanding activity. Rows are grouped under date headings ("Today", "Yesterday",
+"Apr 21, 2026") — the heading is the date of the oldest unread item, which becomes
+the cutoff for "show me everything newer than this."
 
-The scraper aggregates rows by subscription, capturing:
-- The list of specific item/article IDs flagged (`notifiedItemIds`)
-- The earliest date heading any of those rows appeared under (`notificationDate`)
-- The total number of rows for that subscription (`unreadCount`)
+Each row embeds the unread count in its text:
+- Threads: `"3 replies"` or `"1 Thread"` (brand-new, never read)
+- Geeklists: `"436 GeekList Items"` and/or `"1378 Comments"`
+- Blogs / file pages: `"3 replies"` (same as threads)
+
+The scraper captures:
+- The oldest-unread date from the section heading (`notificationDate`)
+- The unread count parsed from the row text (`unreadCount`)
+- The specific article/item ID encoded in the row's link URL (`notifiedItemIds`)
 
 ### "What's new" detection
 
-Filter priority for each subscription:
+**Threads** use `minarticledate` — the BGG XML API accepts a date parameter so
+only articles from the relevant window are fetched, rather than the full thread
+history (long threads like "Dad Jokes" have thousands of archived posts). A
+30-day lookback before `notificationDate` is used to ensure all unread replies
+are captured even if they predate the notification.
 
-1. **`notifiedItemIds`** — the precise set of new articles/items BGG flagged.
-   This is the strongest signal we have and is preferred when present.
-2. **`notificationDate`** — used for brand-new threads where BGG's URL has
-   no `/article/N` fragment, so no specific ID was extractable. Includes
-   anything posted after that date.
-3. **Recency cap** — last resort: `recentArticles(maxItems)` /
-   `recentItems(maxItems)`. Capped at `maxNewItemsPerSubscription`.
+**Geeklists** use date-based filtering — `notificationDate` is the cutoff and
+`itemsNewerThan()` returns everything posted after it. This correctly handles
+high-volume geeklists like SGOYT where you may be hundreds of items behind.
+The BGG geeklist API has no date filter, so the full geeklist is fetched and
+filtered locally.
 
-Subscriptions whose filter chain returns zero matches are skipped — no
+Fallback chain for both types when the primary path returns nothing:
+1. `notifiedItemIds` — the specific item/article ID from the notice row URL
+2. `recentItems(maxItems)` / `recentArticles(maxItems)` — most-recent N by date
+
+Subscriptions whose filter chain returns zero matches are skipped entirely — no
 empty stub sections in the digest.
 
 ### File-based Claude integration
@@ -216,8 +233,14 @@ Set `headless: false`, run once, and complete the challenge manually.
 
 **Digest looks empty or missing subscriptions** — check `./logs/` for errors
 and inspect `./digest-data/manifest.json` to see what was fetched. The
-`unreadCount` field in the manifest will be 0 if BGG's row text format
-didn't match our parser — check the debug logs for the raw row text.
+`unreadCount` field shows BGG's advertised total parsed from the notice row
+text; `itemCount` shows how many items were actually fetched. If `itemCount`
+is unexpectedly low, check the debug logs for the raw notification row text.
+
+**`claude: command not found` in cron** — the cron PATH does not include
+`~/.local/bin`. The script handles this automatically by augmenting the
+subprocess PATH. If you still see this error, find the full path to `claude`
+(`which claude`) and verify it matches one of the paths the script prepends.
 
 **Links 404** — should be fixed as of April 2026. Thread article links use
 `?article=ID` format. Geeklist item links use `#itemID` fragments (correct
@@ -229,21 +252,22 @@ page, may not scroll to exact item depending on browser).
 bgg_sub_digest/
 ├── src/
 │   ├── bgg/
-│   │   ├── auth.ts        # Playwright login + browser profile
-│   │   ├── scraper.ts     # Notification page scraping
-│   │   └── api.ts         # BGG XML API client
-│   ├── claude.ts          # File writing + Claude subprocess
-│   ├── digest.ts          # Markdown assembly + file output
-│   ├── index.ts           # Main orchestrator
-│   ├── types.ts           # TypeScript interfaces
-│   ├── config.ts          # Config loading + validation
-│   └── logger.ts          # Logging
-├── config.example.json    # Copy this to config.json
-├── interests.md           # Your personalization file (edit freely)
-├── digests/               # Generated digest files (gitignored)
-├── digest-data/           # Per-subscription data files (recreated each run)
-├── logs/                  # Run logs
-└── bgg-browser-profile/   # Persistent Chromium session (gitignored)
+│   │   ├── auth.ts           # Playwright login + browser profile
+│   │   ├── scraper.ts        # Notification page scraping
+│   │   ├── api.ts            # BGG XML API client (threads + geeklists)
+│   │   └── page-content.ts   # Playwright content fetch (blogs + file pages)
+│   ├── claude.ts             # File writing + Claude subprocess
+│   ├── digest.ts             # Markdown assembly + file output
+│   ├── index.ts              # Main orchestrator
+│   ├── types.ts              # TypeScript interfaces
+│   ├── config.ts             # Config loading + validation
+│   └── logger.ts             # Logging
+├── config.example.json       # Copy this to config.json
+├── interests.md              # Your personalization file (edit freely)
+├── digests/                  # Generated digest files (gitignored)
+├── digest-data/              # Per-subscription data files (recreated each run)
+├── logs/                     # Run logs
+└── bgg-browser-profile/      # Persistent Chromium session (gitignored)
 ```
 
 ## Notes on commenting style
