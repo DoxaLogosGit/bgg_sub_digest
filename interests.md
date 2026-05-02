@@ -14,6 +14,7 @@ Highlight any mentions of these games with ⭐:
 - Western Front Ace
 - RAF: The Battle of Britain 1940
 - Terraforming Mars
+- Lord of the Rings: Fate of the Fellowship
 - Silent War
 - Away Team
 - Firefight Tactical
