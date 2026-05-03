@@ -46,12 +46,12 @@ import {
   formatGeeklistContent,
   writeSubscriptionFile,
   writeManifest,
-  runClaudeDigest,
-} from './claude';
+  runDigest,
+} from './agent';
 import { fetchPageContent, formatPageContent } from './bgg/page-content';
 // `import type` imports only the TypeScript type, not runtime code — erased at compile time.
-// Python: from typing import TYPE_CHECKING; if TYPE_CHECKING: from .claude import ManifestEntry
-import type { ManifestEntry, DigestResult } from './claude';
+// Python: from ./agent import ManifestEntry
+import type { ManifestEntry, DigestResult, AgentName } from './agent';
 import type { BggGeeklistItem, BggThreadArticle } from './types';
 import { buildMarkdown, writeDigest } from './digest';
 import { sendDigestEmail, buildEmailSubject } from './email';
@@ -156,18 +156,38 @@ async function main(): Promise<void> {
     const config    = loadConfig();
     const interests = loadInterests(config.digest.interestsFile);
 
-    // Parse --model <name> from CLI args, e.g. `npm start -- --model sonnet`
-    // process.argv: ['node', 'index.ts', '--model', 'sonnet']
-    // Default to opus for best digest quality.
+    // Parse --agent <name> and --model <name> from CLI args.
+    //   `npm start -- --agent tallow --model omnicoder-oc`
+    //   `npm start -- --model sonnet`                         (claude is the default agent)
+    //
+    // Default agent is `claude`. Default model varies by agent:
+    //   - claude → opus
+    //   - tallow → qwen3-coder-next:cloud (per ~/.tallow/settings.json)
+    const agentArgIndex = process.argv.indexOf('--agent');
+    const agentArg      = agentArgIndex !== -1 ? process.argv[agentArgIndex + 1] : 'claude';
+    if (agentArg !== 'claude' && agentArg !== 'tallow') {
+      throw new Error(`--agent must be "claude" or "tallow" (got "${agentArg}")`);
+    }
+    const agent: AgentName = agentArg;
+
     const modelArgIndex = process.argv.indexOf('--model');
-    const model = modelArgIndex !== -1 ? process.argv[modelArgIndex + 1] : 'opus';
+    const model = modelArgIndex !== -1
+      ? process.argv[modelArgIndex + 1]
+      : (agent === 'tallow' ? 'qwen3-coder-next:cloud' : 'opus');
+
+    // --reuse-data: skip the entire BGG download phase and run the agent
+    // against whatever is already in ./digest-data/. Useful when iterating
+    // on agent/model choice — no need to re-scrape BGG between runs.
+    const reuseData = process.argv.includes('--reuse-data');
 
     log.info('Config loaded', {
       scheduleMode:  config.digest.scheduleMode,
       interestsFile: config.digest.interestsFile,
       hasInterests:  interests.length > 0,
       debugClear:    config.digest.debugClear,
+      agent,
       model,
+      reuseData,
     });
 
     if (!interests) {
@@ -176,6 +196,40 @@ async function main(): Promise<void> {
         `Claude will summarize without personalization. ` +
         `Create interests.md to describe what you care about.`,
       );
+    }
+
+    // ---- Fast iteration path: --reuse-data ----------------
+    //
+    // Skip every BGG-side step (browser, login, scrape, fetch, file write,
+    // notification clear) and run the agent against the manifest already
+    // sitting in ./digest-data/ from a prior run. Lets you iterate on
+    // agent/model choice in seconds instead of minutes.
+    if (reuseData) {
+      const digestDataDir = path.resolve('./digest-data');
+      const manifestPath  = path.join(digestDataDir, 'manifest.json');
+
+      if (!fs.existsSync(manifestPath)) {
+        throw new Error(
+          `--reuse-data was specified but ${manifestPath} does not exist. ` +
+          `Run a normal digest first to populate ./digest-data/.`,
+        );
+      }
+
+      const reusedEntries = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as ManifestEntry[];
+      log.info(
+        `--reuse-data: skipping BGG download, running ${agent} (${model}) ` +
+        `against ${reusedEntries.length} subscription(s) in ${digestDataDir}`,
+      );
+
+      const reusedDigest = await runAgentAndWriteDigest(
+        agent, model, manifestPath, interests, reusedEntries, digestDataDir,
+        config, runStart,
+      );
+
+      const reusedElapsed = Date.now() - runStart.getTime();
+      log.info(`=== Reuse-data digest complete in ${(reusedElapsed / 1000).toFixed(1)}s ===`);
+      console.log(`\nDigest written to: ${reusedDigest}`);
+      return;
     }
 
     // ---- 2. Launch browser and log into BGG ---------------
@@ -470,59 +524,20 @@ async function main(): Promise<void> {
       await apiPage.close();
       await subPage.close();
 
-      // ---- 6. Write manifest and run Claude with file access ----------
+      // ---- 6. Write manifest and run agent with file access ----------
 
       if (manifestEntries.length === 0) {
         log.info('No subscription content was successfully fetched — skipping digest');
         return;
       }
 
-      // Write manifest.json — Claude's index of all subscription data files.
+      // Write manifest.json — the agent's index of all subscription data files.
       const manifestPath = writeManifest(manifestEntries, digestDataDir);
-      log.info(
-        `Data written: ${manifestEntries.length} subscriptions in ${digestDataDir} — running Claude`,
+
+      await runAgentAndWriteDigest(
+        agent, model, manifestPath, interests, manifestEntries, digestDataDir,
+        config, runStart,
       );
-
-      // runClaudeDigest() launches `claude --dangerously-skip-permissions --print`
-      // which reads the manifest, then reads each subscription file, and produces
-      // a markdown digest. Returns { body, inputTokens, outputTokens, costUsd, durationMs }.
-      // This is synchronous — we wait for Claude to finish before continuing.
-      let digestResult: DigestResult;
-      try {
-        digestResult = runClaudeDigest(manifestPath, interests, model);
-      } catch (err) {
-        log.error('Claude digest run failed', { err: String(err) });
-        // Fallback — show a minimal digest pointing at the data files so the user
-        // can inspect them manually if Claude can't be reached.
-        digestResult = {
-          body:
-            `*⚠️ Summarization failed — subscription data files are in \`${digestDataDir}\`*\n\n` +
-            manifestEntries
-              .map((e) => `### [${e.title}](${e.url})\n${e.itemCount} items — \`${e.filePath}\``)
-              .join('\n\n'),
-          inputTokens:  0,
-          outputTokens: 0,
-          costUsd:      0,
-          durationMs:   0,
-        };
-      }
-
-      // Append token usage stats footer to the digest body.
-      const tokenFooter = formatTokenUsage(digestResult);
-
-      // ---- 7. Write the digest file -----------------------
-
-      const markdown   = buildMarkdown(runStart, digestResult.body + '\n\n' + tokenFooter);
-      const digestPath = writeDigest(markdown, config.digest.outputDir, runStart);
-
-      log.info(`Digest complete → ${digestPath}`);
-      console.log(`\nDigest written to: ${digestPath}`);
-
-      // ---- 8. Email the digest (optional) -------------------
-      if (config.email) {
-        const subject = buildEmailSubject(runStart);
-        await sendDigestEmail(config.email, subject, markdown);
-      }
 
     } finally {
       // Close the browser regardless of success or failure.
@@ -551,6 +566,62 @@ async function main(): Promise<void> {
   }
 }
 
+// ---- runAgentAndWriteDigest ----------------------------------
+//
+// Shared between the normal digest flow and the --reuse-data fast path.
+// Runs the configured agent against the manifest, falls back to a stub
+// digest on agent failure, writes the markdown digest file, and (if
+// configured) emails it. Returns the path to the written digest.
+async function runAgentAndWriteDigest(
+  agent: AgentName,
+  model: string,
+  manifestPath: string,
+  interests: string,
+  entries: ManifestEntry[],
+  digestDataDir: string,
+  // Inline shape — only the fields we actually need from the full Config.
+  config: { digest: { outputDir: string }; email?: Parameters<typeof sendDigestEmail>[0] },
+  runStart: Date,
+): Promise<string> {
+  log.info(
+    `Running ${agent} (${model}) against ${entries.length} subscription(s) from ${digestDataDir}`,
+  );
+
+  let digestResult: DigestResult;
+  try {
+    digestResult = await runDigest(agent, manifestPath, interests, model);
+  } catch (err) {
+    log.error(`${agent} digest run failed`, { err: String(err) });
+    // Fallback — show a minimal digest pointing at the data files so the user
+    // can inspect them manually if the agent can't be reached.
+    digestResult = {
+      body:
+        `*⚠️ Summarization failed — subscription data files are in \`${digestDataDir}\`*\n\n` +
+        entries
+          .map((e) => `### [${e.title}](${e.url})\n${e.itemCount} items — \`${e.filePath}\``)
+          .join('\n\n'),
+      inputTokens:  0,
+      outputTokens: 0,
+      costUsd:      0,
+      durationMs:   0,
+    };
+  }
+
+  const tokenFooter = formatTokenUsage(digestResult, agent, model);
+  const markdown    = buildMarkdown(runStart, digestResult.body + '\n\n' + tokenFooter);
+  const digestPath  = writeDigest(markdown, config.digest.outputDir, runStart);
+
+  log.info(`Digest complete → ${digestPath}`);
+  console.log(`\nDigest written to: ${digestPath}`);
+
+  if (config.email) {
+    const subject = buildEmailSubject(runStart);
+    await sendDigestEmail(config.email, subject, markdown);
+  }
+
+  return digestPath;
+}
+
 // ---- formatTokenUsage ----------------------------------------
 //
 // Formats token usage stats from a DigestResult into a markdown footer
@@ -558,15 +629,18 @@ async function main(): Promise<void> {
 //
 // Example output:
 //   ---
-//   *Token usage: 43,924 input + 1,234 output (45,158 total) | Cost: ~$0.0463 | 45.2s*
+//   *Agent: tallow (qwen3-coder-next:cloud) | Token usage: 43,924 input + 1,234 output (45,158 total) | Cost: ~$0.0463 | 45.2s*
 //
 // PYTHON CONTEXT: `result.inputTokens.toLocaleString()` formats a number
 // with thousands separators — Python: f"{result.input_tokens:,}"
 // Template literals: `${expr}` — Python: f"{expr}"
-function formatTokenUsage(result: DigestResult): string {
-  // If both token counts are 0, JSON parsing failed — show a fallback.
+function formatTokenUsage(result: DigestResult, agent: AgentName, model: string): string {
+  const agentStr = `Agent: ${agent} (${model})`;
+
+  // If both token counts are 0, JSON parsing failed — show a fallback that
+  // still identifies the agent/model so a degenerate run is still labeled.
   if (result.inputTokens === 0 && result.outputTokens === 0) {
-    return '*Token usage: unavailable*';
+    return `---\n*${agentStr} | Token usage: unavailable*`;
   }
 
   // Ternary `condition ? value_if_true : value_if_false`
@@ -585,7 +659,8 @@ function formatTokenUsage(result: DigestResult): string {
   // Python: f"{n:,}"
   return (
     `---\n` +
-    `*Token usage: ${result.inputTokens.toLocaleString()} input + ` +
+    `*${agentStr} | ` +
+    `Token usage: ${result.inputTokens.toLocaleString()} input + ` +
     `${result.outputTokens.toLocaleString()} output ` +
     `(${total.toLocaleString()} total)${costStr}${durStr}*`
   );

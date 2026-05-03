@@ -1,5 +1,5 @@
 // ============================================================
-// claude.ts — write subscription data files and invoke Claude to produce the digest
+// agent.ts — write subscription data files and invoke an agent (claude or tallow) to produce the digest
 //
 // ARCHITECTURE (file-based, replaces the old single-prompt approach):
 //
@@ -8,11 +8,12 @@
 //
 //   2. Write a manifest.json listing all subscription files with metadata.
 //
-//   3. Launch `claude --model opus --dangerously-skip-permissions --print --output-format json`
-//      with a prompt that tells it to read the manifest then each file.
-//      Claude uses its built-in Read tool to read files selectively.
+//   3. Launch the configured agent with a prompt telling it to read the
+//      manifest then each subscription file via its Read tool:
+//        - Claude:  `claude --model <m> --dangerously-skip-permissions --print --output-format json`
+//        - Tallow:  `tallow --model <m> --yolo --mode json --print "<prompt>"`
 //
-//   4. Parse the JSON response to extract the digest body AND token usage stats.
+//   4. Parse the agent's response to extract the digest body AND token usage stats.
 //
 // WHY file-based instead of one big prompt:
 //   - High-volume subscriptions (e.g. SGOYT with 400+ items behind) get their
@@ -31,8 +32,10 @@
 // ============================================================
 
 // `spawnSync` runs a child process synchronously (blocks until it exits).
-// Python equivalent: subprocess.run(..., capture_output=True)
-import { spawnSync } from 'child_process';
+// `spawn` streams stdout/stderr — used for tallow whose JSONL output can
+// exceed the spawnSync buffer cap on large digests.
+// Python equivalent: subprocess.run(..., capture_output=True) vs Popen with streaming pipes.
+import { spawn, spawnSync } from 'child_process';
 
 // `os` module — provides os.tmpdir() for the system's temp directory.
 // Python: import tempfile; tempfile.gettempdir()
@@ -568,4 +571,246 @@ export function runClaudeDigest(manifestPath: string, interests: string, model =
     // Python: os.unlink(tmp_file)  (in finally block, synchronous)
     fs.unlink(tmpFile, () => undefined);
   }
+}
+
+// ============================================================
+// runTallowDigest — launch tallow with file access and parse JSONL events
+// ============================================================
+//
+// Tallow (https://github.com/dungle-scrubs/tallow) is an alternative coding
+// agent that speaks the same Read-tool dance as Claude Code but supports
+// arbitrary providers (ollama, anthropic, openai, etc.) via its config.
+//
+// CLI shape:
+//   tallow --model <model> --yolo --mode json --print "<prompt>"
+//     --yolo       : auto-approve all tool confirmations (parallel of --dangerously-skip-permissions)
+//     --mode json  : emit JSON Lines — one JSON event per line on stdout
+//     --print      : single-shot run; the prompt is passed as an argument (not via stdin)
+//
+// Provider selection is left to the user's ~/.tallow/settings.json
+// `defaultProvider` (typically "ollama"). Override per-invocation by editing
+// that file or by including `provider/model` in the model string if tallow
+// supports it for the chosen backend.
+//
+// JSONL event shape we care about (verified empirically against tallow 0.9.x):
+//   {"type":"session", ...}                      // first line, has session id
+//   {"type":"message_start", ...}
+//   {"type":"message_end", ...}
+//   {"type":"turn_end","message":{
+//      "role":"assistant",
+//      "content":[
+//        {"type":"thinking","thinking":"..."},   // present when the model has a reasoning step
+//        {"type":"tool_use", ...},               // when calling Read etc.
+//        {"type":"text","text":"...digest md..."}
+//      ],
+//      "usage":{
+//        "input":N, "output":N,
+//        "cacheRead":N, "cacheWrite":N,
+//        "totalTokens":N,
+//        "cost":{"input":..., "output":..., "total":...}
+//      }
+//   }, "toolResults":[...]}
+//
+// IMPORTANT: there are typically MANY turn_end events (one per tool round).
+// Tool-only turns may have empty/no `text` items — we walk back to the last
+// turn whose content contains a non-empty `text` chunk to grab the digest
+// body. Token usage is summed across every turn_end so the footer reflects
+// the full cost of the run.
+export async function runTallowDigest(
+  manifestPath: string,
+  interests: string,
+  model = 'qwen3-coder-next:cloud',
+): Promise<DigestResult> {
+  const prompt = buildDigestPrompt(manifestPath, interests);
+
+  // tallow accepts the prompt directly as a CLI argument — no temp file
+  // needed. spawn with args array bypasses shell quoting, so embedded
+  // quotes/backticks/newlines in the prompt are safe.
+  const home = process.env.HOME ?? '';
+  const extraPaths = [
+    `${home}/.bun/bin`,                         // bun-installed tallow (the typical install)
+    `${home}/.local/bin`,                       // npm global on Linux
+    `${home}/.npm-global/bin`,                  // npm with custom prefix
+    `${home}/.nvm/versions/node/current/bin`,   // nvm current
+    '/usr/local/bin',                           // homebrew / manual installs
+  ];
+  const augmentedPath = [...extraPaths, process.env.PATH ?? ''].join(':');
+
+  log.debug('Launching tallow with --yolo --mode json (streaming)', {
+    manifestPath,
+    model,
+    promptLength: prompt.length,
+  });
+
+  const args = [
+    '--yolo',
+    '--mode', 'json',
+    '--model', model,
+    '--print', prompt,
+  ];
+
+  // ---- Stream tallow's JSONL output ----
+  //
+  // We use streaming spawn instead of spawnSync because tallow's JSONL grows
+  // unboundedly with tool rounds (each Read tool call's full file contents
+  // get echoed back as a tool_result event). Long digests with chatty models
+  // were hitting ENOBUFS on the 50MB spawnSync cap. Streaming has no cap and
+  // also lowers peak memory because we keep only the parsed turn_end events
+  // (small) and discard everything else line-by-line.
+  type TallowUsage = {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    totalTokens?: number;
+    cost?: { input?: number; output?: number; total?: number };
+  };
+  type TallowContent = { type: string; text?: string };
+  type TallowEvent = {
+    type: string;
+    message?: { content?: TallowContent[]; usage?: TallowUsage };
+  };
+
+  // Wall-clock the run so we can populate durationMs (tallow's JSONL doesn't
+  // include a top-level duration like Claude's --output-format json does).
+  const start = Date.now();
+  const proc  = spawn('tallow', args, {
+    env:   { ...process.env, PATH: augmentedPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  // Hard timeout — kill tallow if it hangs (e.g. local model deadlock).
+  const TIMEOUT_MS = 30 * 60 * 1000;
+  const timeoutHandle = setTimeout(() => {
+    log.warn(`tallow exceeded ${TIMEOUT_MS}ms timeout — killing process`);
+    proc.kill('SIGKILL');
+  }, TIMEOUT_MS);
+
+  // Only retain turn_end events — every other event type is discarded as it
+  // streams in, keeping memory bounded regardless of digest size.
+  const turnEnds: TallowEvent[] = [];
+  let stdoutTail   = '';     // partial last line awaiting a newline
+  let stderrChunks = '';     // capped stderr for error diagnostics
+  let totalBytes   = 0;
+
+  proc.stdout.setEncoding('utf-8');
+  proc.stdout.on('data', (chunk: string) => {
+    totalBytes += chunk.length;
+    stdoutTail += chunk;
+    let nl: number;
+    while ((nl = stdoutTail.indexOf('\n')) !== -1) {
+      const line = stdoutTail.slice(0, nl).trim();
+      stdoutTail = stdoutTail.slice(nl + 1);
+      if (!line) continue;
+      try {
+        const ev = JSON.parse(line) as TallowEvent;
+        if (ev.type === 'turn_end') turnEnds.push(ev);
+      } catch {
+        // Skip un-parseable lines defensively.
+      }
+    }
+  });
+
+  proc.stderr.setEncoding('utf-8');
+  proc.stderr.on('data', (chunk: string) => {
+    if (stderrChunks.length < 4000) stderrChunks += chunk;
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    proc.on('error', (err) => {
+      clearTimeout(timeoutHandle);
+      reject(err);
+    });
+    proc.on('close', (code) => {
+      clearTimeout(timeoutHandle);
+      // Flush any trailing line that didn't end with \n.
+      const last = stdoutTail.trim();
+      if (last) {
+        try {
+          const ev = JSON.parse(last) as TallowEvent;
+          if (ev.type === 'turn_end') turnEnds.push(ev);
+        } catch { /* skip */ }
+      }
+      if (code !== 0) {
+        reject(new Error(
+          `tallow exited with code ${code}: ${stderrChunks.slice(0, 1000)}`,
+        ));
+        return;
+      }
+      resolve();
+    });
+  });
+  const durationMs = Date.now() - start;
+
+  log.debug('Tallow stream complete', {
+    bytesRead:  totalBytes,
+    turnEnds:   turnEnds.length,
+    durationMs,
+  });
+
+  if (turnEnds.length === 0) {
+    throw new Error(
+      `tallow produced no turn_end events (${totalBytes} bytes read). ` +
+      `stderr: ${stderrChunks.slice(0, 500)}`,
+    );
+  }
+
+  // ---- Pull the digest body ----
+  //
+  // Walk turn_ends from newest backward and grab the text from the first
+  // one that has a non-empty `type:'text'` item. Tool-only turns contribute
+  // no body text. The prompt instructs the agent to write the entire digest
+  // in a single final response, so the last turn with text SHOULD be the
+  // synthesis.
+  let body = '';
+  for (let i = turnEnds.length - 1; i >= 0; i--) {
+    const text = (turnEnds[i].message?.content ?? [])
+      .filter((c) => c.type === 'text' && typeof c.text === 'string' && c.text.trim().length > 0)
+      .map((c) => c.text as string)
+      .join('\n');
+    if (text) {
+      body = text;
+      break;
+    }
+  }
+  if (!body) {
+    throw new Error(
+      `tallow ran ${turnEnds.length} turn(s) but no turn produced assistant text. ` +
+      `Model may have looped on tool calls without ever synthesizing.`,
+    );
+  }
+
+  // ---- Sum usage across all turn_end events ----
+  let inputTokens  = 0;
+  let outputTokens = 0;
+  let costUsd      = 0;
+  for (const ev of turnEnds) {
+    const u = ev.message?.usage ?? {};
+    inputTokens  += (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+    outputTokens += u.output ?? 0;
+    costUsd      += u.cost?.total ?? 0;
+  }
+
+  return { body, inputTokens, outputTokens, costUsd, durationMs };
+}
+
+// ============================================================
+// runDigest — dispatch to claude or tallow based on agent name
+// ============================================================
+export type AgentName = 'claude' | 'tallow';
+
+export async function runDigest(
+  agent: AgentName,
+  manifestPath: string,
+  interests: string,
+  model?: string,
+): Promise<DigestResult> {
+  if (agent === 'tallow') {
+    return runTallowDigest(manifestPath, interests, model);
+  }
+  // runClaudeDigest is still spawnSync-based — Claude's --output-format json
+  // returns a single bounded JSON object (no risk of ENOBUFS on realistic
+  // digests). The async wrapper just promotes its sync return into a Promise
+  // so the dispatcher signature is uniform.
+  return runClaudeDigest(manifestPath, interests, model);
 }

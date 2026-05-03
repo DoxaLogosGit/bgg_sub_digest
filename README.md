@@ -36,9 +36,14 @@ Wingspan representation. Several members reporting campaign completions.
 ## Requirements
 
 - **Node.js** 18+ and **npm**
-- **Claude Code CLI** (`claude`) installed and authenticated
-  — this script uses `claude --print` as its AI engine, so it runs on your
-  existing Claude subscription rather than requiring a separate Anthropic API key
+- An AI agent — either:
+  - **Claude Code CLI** (`claude`), authenticated against your Claude subscription, **or**
+  - **Tallow** ([dungle-scrubs/tallow](https://github.com/dungle-scrubs/tallow)),
+    configured with a provider of your choice (Ollama local/cloud models,
+    Anthropic, OpenAI, etc.)
+
+  Both run as headless subprocesses with file-read access. Pick one with
+  `--agent claude` (default) or `--agent tallow` at runtime.
 - A **BGG account** with subscriptions
 - A **BGG XML API key** — request one at
   `https://boardgamegeek.com/xmlapi/apiv2/requesttoken`
@@ -174,11 +179,44 @@ npm start
 
 Output is written to `./digests/bgg-digest-YYYY-MM-DD.md`.
 
-To use a cheaper model (Sonnet costs ~5× less than Opus):
+### Choosing an agent and model
+
+Two CLI flags control which agent and which model produce the digest:
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--agent <name>` | `claude` | `claude` or `tallow` |
+| `--model <id>` | `opus` (claude), `qwen3-coder-next:cloud` (tallow) | Any model the agent can resolve |
+
+**Why Tallow + Ollama is supported.** A daily digest run on Claude Opus burns
+a meaningful chunk of the Claude Pro 5-hour usage window. Tallow lets you
+point the same digest pipeline at a much cheaper backend — an Ollama cloud
+model, or a fully local model running on your own hardware — so the daily
+script doesn't eat into your Claude usage that you'd rather save for
+interactive coding. Use Claude on demand when you want top-tier
+summarization; use Tallow + Ollama for the routine daily run.
+
+**Examples**
 
 ```bash
+# Cheaper Claude run (Sonnet costs ~5× less than Opus)
 npm start -- --model sonnet
+
+# Tallow with its default cloud model — keeps Claude usage free for other work
+npm start -- --agent tallow
+
+# Tallow against a local Ollama model registered in ~/.tallow/models.json
+# (zero cost, runs entirely on your machine)
+npm start -- --agent tallow --model omnicoder-oc
+
+# Tallow against another local model
+npm start -- --agent tallow --model qwen35-9b-pi
 ```
+
+For Tallow, model resolution flows through `~/.tallow/models.json` and the
+`defaultProvider` in `~/.tallow/settings.json`. To use a different provider
+(Anthropic, OpenAI, etc.) edit those files — this script doesn't pass
+`--provider` itself.
 
 ### Running on a schedule (cron)
 
@@ -191,10 +229,11 @@ The script uses a PID lock file (`./bgg-digest.pid`) to prevent overlapping
 runs if a previous one is still in progress.
 
 > **Note on PATH:** cron runs with a minimal `PATH` that typically does not
-> include `~/.local/bin` where the `claude` CLI is installed. The script
-> automatically prepends `~/.local/bin`, `~/.npm-global/bin`, and `/usr/local/bin`
-> to the subprocess PATH when calling Claude, so no extra cron PATH configuration
-> is needed.
+> include `~/.local/bin` (where `claude` is usually installed) or `~/.bun/bin`
+> (where `tallow` is usually installed). The script automatically prepends
+> `~/.bun/bin`, `~/.local/bin`, `~/.npm-global/bin`, and `/usr/local/bin`
+> to the subprocess PATH when calling either agent, so no extra cron PATH
+> configuration is needed.
 
 ## How it works
 
@@ -273,10 +312,11 @@ and inspect `./digest-data/manifest.json` to see what was fetched. The
 text; `itemCount` shows how many items were actually fetched. If `itemCount`
 is unexpectedly low, check the debug logs for the raw notification row text.
 
-**`claude: command not found` in cron** — the cron PATH does not include
-`~/.local/bin`. The script handles this automatically by augmenting the
-subprocess PATH. If you still see this error, find the full path to `claude`
-(`which claude`) and verify it matches one of the paths the script prepends.
+**`claude: command not found` (or `tallow: command not found`) in cron** —
+the cron PATH does not include `~/.local/bin` or `~/.bun/bin`. The script
+handles both automatically by augmenting the subprocess PATH. If you still
+see this error, find the full path to the binary (`which claude` or
+`which tallow`) and verify it matches one of the paths the script prepends.
 
 **Links 404** — should be fixed as of April 2026. Thread article links use
 `?article=ID` format. Geeklist item links use `#itemID` fragments (correct
@@ -292,7 +332,7 @@ bgg_sub_digest/
 │   │   ├── scraper.ts        # Notification page scraping
 │   │   ├── api.ts            # BGG XML API client (threads + geeklists)
 │   │   └── page-content.ts   # Playwright content fetch (blogs + file pages)
-│   ├── claude.ts             # File writing + Claude subprocess
+│   ├── agent.ts             # File writing + Claude subprocess
 │   ├── digest.ts             # Markdown assembly + file output
 │   ├── index.ts              # Main orchestrator
 │   ├── types.ts              # TypeScript interfaces
