@@ -158,22 +158,26 @@ async function main(): Promise<void> {
 
     // Parse --agent <name> and --model <name> from CLI args.
     //   `npm start -- --agent tallow --model omnicoder-oc`
+    //   `npm start -- --agent claude-ollama --model qwen3-coder-next:cloud`
     //   `npm start -- --model sonnet`                         (claude is the default agent)
     //
     // Default agent is `claude`. Default model varies by agent:
-    //   - claude → opus
-    //   - tallow → qwen3-coder-next:cloud (per ~/.tallow/settings.json)
+    //   - claude        → opus  (Anthropic API)
+    //   - claude-ollama → qwen3-coder-next:cloud  (claude → local Ollama)
+    //   - tallow        → qwen3-coder-next:cloud  (per ~/.tallow/settings.json)
     const agentArgIndex = process.argv.indexOf('--agent');
     const agentArg      = agentArgIndex !== -1 ? process.argv[agentArgIndex + 1] : 'claude';
-    if (agentArg !== 'claude' && agentArg !== 'tallow') {
-      throw new Error(`--agent must be "claude" or "tallow" (got "${agentArg}")`);
+    if (agentArg !== 'claude' && agentArg !== 'claude-ollama' && agentArg !== 'tallow') {
+      throw new Error(
+        `--agent must be "claude", "claude-ollama", or "tallow" (got "${agentArg}")`,
+      );
     }
     const agent: AgentName = agentArg;
 
     const modelArgIndex = process.argv.indexOf('--model');
     const model = modelArgIndex !== -1
       ? process.argv[modelArgIndex + 1]
-      : (agent === 'tallow' ? 'qwen3-coder-next:cloud' : 'opus');
+      : (agent === 'claude' ? 'opus' : 'qwen3-coder-next:cloud');
 
     // --reuse-data: skip the entire BGG download phase and run the agent
     // against whatever is already in ./digest-data/. Useful when iterating
@@ -607,15 +611,45 @@ async function runAgentAndWriteDigest(
     };
   }
 
+  // ---- Status banner & subject prefix ----
+  //
+  // The Ollama per-subscription orchestrator (runOllamaPerSubscriptionDigest)
+  // returns a `status` field on the DigestResult. Plain-claude runs leave it
+  // undefined → treated as 'complete'. We prefix the email subject and
+  // prepend a banner above the body for non-complete runs so the user sees
+  // the failure mode at a glance instead of having to read the digest.
+  const status   = digestResult.status ?? 'complete';
+  const skipped  = digestResult.skipped ?? [];
+  let bannerLine = '';
+  let subjectPrefix = '';
+
+  if (status === 'rate_limited') {
+    subjectPrefix = '[RATE LIMITED] ';
+    const completed = digestResult.completedCount ?? 0;
+    const total     = digestResult.totalCount ?? 0;
+    bannerLine = (
+      `> ⚠️ **Rate-limited** — run halted after a 429 from the model.\n` +
+      `> ${completed} of ${total} subscription(s) completed before the limit hit.\n` +
+      `> Quota typically resets weekly per Ollama's policy.\n\n`
+    );
+  } else if (status === 'partial' || skipped.length > 0) {
+    subjectPrefix = '[PARTIAL] ';
+    bannerLine = (
+      `> ⚠️ **Partial digest** — ${skipped.length} subscription(s) failed to summarize after retry and are linked below for manual review:\n` +
+      skipped.map((s) => `> - [${s.title}] — \`${s.filePath}\``).join('\n') +
+      `\n\n`
+    );
+  }
+
   const tokenFooter = formatTokenUsage(digestResult, agent, model);
-  const markdown    = buildMarkdown(runStart, digestResult.body + '\n\n' + tokenFooter);
+  const markdown    = buildMarkdown(runStart, bannerLine + digestResult.body + '\n\n' + tokenFooter);
   const digestPath  = writeDigest(markdown, config.digest.outputDir, runStart);
 
-  log.info(`Digest complete → ${digestPath}`);
+  log.info(`Digest complete → ${digestPath}`, { status, completed: digestResult.completedCount, skipped: skipped.length });
   console.log(`\nDigest written to: ${digestPath}`);
 
   if (config.email) {
-    const subject = buildEmailSubject(runStart);
+    const subject = subjectPrefix + buildEmailSubject(runStart);
     await sendDigestEmail(config.email, subject, markdown);
   }
 
