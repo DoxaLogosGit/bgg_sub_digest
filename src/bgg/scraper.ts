@@ -630,18 +630,18 @@ export async function scrapeSubscriptions(
 // invoke `.click()` directly on the DOM element via `evaluate` rather than
 // going through Playwright's mouse-based click which would respect visibility.
 //
-// debugClear (default true): log the action WITHOUT clicking.
+// clearSubs (default false): when false, log the action WITHOUT clicking.
 
 export async function clearSubscriptionShortcut(
   subPage: Page,
   sub: BggSubscription,
-  debugClear: boolean,
+  clearSubs: boolean,
 ): Promise<void> {
   // URL fragment that identifies this subscription on the page.
   // Matches the path segment in notice row links.
   const fragment = `/${sub.type}/${sub.id}`;
 
-  if (debugClear) {
+  if (!clearSubs) {
     // Match the row count we'd click in non-debug mode so the log is honest.
     const wouldClick = await subPage.evaluate(({ frag }: { frag: string }) => {
       const notices = Array.from(document.querySelectorAll('gg-notice'));

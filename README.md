@@ -36,14 +36,18 @@ Wingspan representation. Several members reporting campaign completions.
 ## Requirements
 
 - **Node.js** 18+ and **npm**
-- An AI agent — either:
-  - **Claude Code CLI** (`claude`), authenticated against your Claude subscription, **or**
-  - **Tallow** ([dungle-scrubs/tallow](https://github.com/dungle-scrubs/tallow)),
-    configured with a provider of your choice (Ollama local/cloud models,
-    Anthropic, OpenAI, etc.)
+- An AI agent — one of:
+  - **Claude Code CLI** (`claude`), authenticated against your Claude subscription
+    (`--agent claude`, default)
+  - **Claude Code CLI** redirected at a local **Ollama** server via
+    `ollama launch claude` (`--agent claude-ollama`). Lets you run any Ollama
+    model (local or cloud-served) through claude's tooling. See
+    [Ollama's claude-code integration docs](https://docs.ollama.com/integrations/claude-code).
+  - **Tallow** ([dungle-scrubs/tallow](https://github.com/dungle-scrubs/tallow))
+    with any provider it supports (`--agent tallow`)
 
-  Both run as headless subprocesses with file-read access. Pick one with
-  `--agent claude` (default) or `--agent tallow` at runtime.
+  All three run as headless subprocesses with file-read access. Pick one
+  with `--agent <name>` at runtime.
 - A **BGG account** with subscriptions
 - A **BGG XML API key** — request one at
   `https://boardgamegeek.com/xmlapi/apiv2/requesttoken`
@@ -83,7 +87,7 @@ Edit `config.json`:
     "maxNewItemsPerSubscription": 15,
     "headless":                   true,
     "interestsFile":              "./interests.md",
-    "debugClear":                 true
+    "clearSubs":                  false
   }
 }
 ```
@@ -97,10 +101,10 @@ Edit `config.json`:
 | `bgg.apiKey` | — | BGG XML API application token |
 | `digest.outputDir` | `./digests` | Where to write the daily `.md` files |
 | `digest.scheduleMode` | `daily` | `"daily"` or `"weekly"` (informational only) |
-| `digest.maxNewItemsPerSubscription` | `15` | Fallback cap when date-based filter isn't available |
+| `digest.maxNewItemsPerSubscription` | `15` | Hard cap on items per subscription file. Applied to every selection path (date-filter, notifiedIds, fallback) — keeps total digest context within the model's window so summarization stays clean. |
 | `digest.headless` | `true` | Set `false` on first run to watch Chromium and solve any Cloudflare challenge manually |
 | `digest.interestsFile` | `./interests.md` | Path to your interests file (see below) |
-| `digest.debugClear` | `true` | `true` = log what would be cleared but don't actually click; set `false` once you've verified targeting is correct |
+| `digest.clearSubs` | `false` | `false` = log what would be cleared but don't click (safe / debug). `true` = click BGG's mark-as-read button on each notification row after processing. Turn on once you've verified targeting is correct and the script is generating digests you trust. |
 | `email.resendApiKey` | — | Resend API key (omit entire `email` block to disable) |
 | `email.from` | — | Verified sender address, e.g. `BGG Digest <digest@yourdomain.com>` |
 | `email.to` | — | Recipient address |
@@ -185,16 +189,19 @@ Two CLI flags control which agent and which model produce the digest:
 
 | Flag | Default | Notes |
 |------|---------|-------|
-| `--agent <name>` | `claude` | `claude` or `tallow` |
-| `--model <id>` | `opus` (claude), `qwen3-coder-next:cloud` (tallow) | Any model the agent can resolve |
+| `--agent <name>` | `claude` | `claude`, `claude-ollama`, or `tallow` |
+| `--model <id>` | `opus` (claude), `qwen3-coder-next:cloud` (claude-ollama / tallow) | Any model the agent can resolve |
 
-**Why Tallow + Ollama is supported.** A daily digest run on Claude Opus burns
-a meaningful chunk of the Claude Pro 5-hour usage window. Tallow lets you
-point the same digest pipeline at a much cheaper backend — an Ollama cloud
-model, or a fully local model running on your own hardware — so the daily
-script doesn't eat into your Claude usage that you'd rather save for
-interactive coding. Use Claude on demand when you want top-tier
-summarization; use Tallow + Ollama for the routine daily run.
+**Why three options?** A daily digest run on Claude Opus burns a meaningful
+chunk of your Claude Pro usage window. The Ollama-routed paths let you point
+the same digest pipeline at a cheaper backend so the daily script doesn't
+eat into Claude usage you'd rather save for interactive coding.
+
+| Agent | When to pick it |
+|-------|-----------------|
+| `claude` | Daily runs against Anthropic. Highest quality, simplest. Uses prompt caching, so repeated daily runs amortize well. |
+| `claude-ollama` | Same `claude` binary but redirected at a local Ollama endpoint via [`ollama launch claude`](https://docs.ollama.com/integrations/claude-code). Lets you use Ollama models (free local or paid `:cloud`) while keeping Claude Code's tool-use protocol — usually more reliable than `tallow` because tooling is the same as Anthropic's. |
+| `tallow` | Tallow's own agent. Routes via `~/.tallow/settings.json`'s `defaultProvider`. |
 
 **Examples**
 
@@ -202,21 +209,30 @@ summarization; use Tallow + Ollama for the routine daily run.
 # Cheaper Claude run (Sonnet costs ~5× less than Opus)
 npm start -- --model sonnet
 
-# Tallow with its default cloud model — keeps Claude usage free for other work
+# claude-ollama with a cloud-served Ollama model
+npm start -- --agent claude-ollama --model nemotron-3-super:cloud
+
+# claude-ollama against a local Ollama model
+npm start -- --agent claude-ollama --model qwen35-pi
+
+# Tallow with its default model
 npm start -- --agent tallow
 
-# Tallow against a local Ollama model registered in ~/.tallow/models.json
-# (zero cost, runs entirely on your machine)
-npm start -- --agent tallow --model omnicoder-oc
-
-# Tallow against another local model
-npm start -- --agent tallow --model qwen35-9b-pi
+# --reuse-data: skip the BGG scrape and rerun the agent against the
+# existing ./digest-data/manifest.json. Fast iteration on agent/model choice.
+npm start -- --agent claude-ollama --model nemotron-3-super:cloud --reuse-data
 ```
 
 For Tallow, model resolution flows through `~/.tallow/models.json` and the
 `defaultProvider` in `~/.tallow/settings.json`. To use a different provider
 (Anthropic, OpenAI, etc.) edit those files — this script doesn't pass
 `--provider` itself.
+
+For `claude-ollama`, the model name is whatever Ollama recognises (run
+`ollama list` to see what's available locally; cloud models are listed at
+`https://ollama.com/cloud/library`). The integration sets the Anthropic
+env vars (`ANTHROPIC_BASE_URL=http://localhost:11434`, etc.) and exec's
+the `claude` binary against your local Ollama.
 
 ### Running on a schedule (cron)
 
@@ -258,15 +274,25 @@ The scraper captures:
 
 **Threads** use `minarticledate` — the BGG XML API accepts a date parameter so
 only articles from the relevant window are fetched, rather than the full thread
-history (long threads like "Dad Jokes" have thousands of archived posts). A
-30-day lookback before `notificationDate` is used to ensure all unread replies
-are captured even if they predate the notification.
+history (long threads like "Dad Jokes" have thousands of archived posts).
+`notificationDate` is the date of the **oldest** unread row for the
+subscription, so we pass that (with a 2-hour buffer for hour-precision
+boundary effects) to BGG and also filter client-side to drop anything older.
+That keeps the per-thread window matched to the actual unread activity — for
+a daily run, one day's worth of posts; for a 6-hour-old notification, ~8
+hours of posts.
 
 **Geeklists** use date-based filtering — `notificationDate` is the cutoff and
 `itemsNewerThan()` returns everything posted after it. This correctly handles
 high-volume geeklists like SGOYT where you may be hundreds of items behind.
 The BGG geeklist API has no date filter, so the full geeklist is fetched and
 filtered locally.
+
+After date/notifiedIds filtering, every subscription's results are also
+hard-capped at `maxNewItemsPerSubscription` (newest-first) so the total
+digest context stays comfortably within the model's window — preventing
+the over-summarization and repetition-collapse failures that happen when
+Ollama-served 200K-window models hit context pressure.
 
 Fallback chain for both types when the primary path returns nothing:
 1. `notifiedItemIds` — the specific item/article ID from the notice row URL

@@ -188,7 +188,7 @@ async function main(): Promise<void> {
       scheduleMode:  config.digest.scheduleMode,
       interestsFile: config.digest.interestsFile,
       hasInterests:  interests.length > 0,
-      debugClear:    config.digest.debugClear,
+      clearSubs:     config.digest.clearSubs,
       agent,
       model,
       reuseData,
@@ -332,14 +332,19 @@ async function main(): Promise<void> {
           // response is the OLDEST 1000 articles (chronologically from the
           // thread's beginning), so long threads miss every new reply.
           //
-          // We use a 30-day lookback BEFORE notificationDate, because BGG's
-          // /subscriptions page shows only ONE row per thread (the newest
-          // unread reply), not one per unread reply. notificationDate is
-          // the date of the *latest* unread reply — earlier unread replies
-          // are older. The 30-day window catches threads visited within the
-          // last month, which covers nearly all real-world cases.
+          // notificationDate (per the scraper) is the EARLIEST unread row
+          // date for this subscription — i.e. the oldest post we haven't
+          // seen yet. So the lookback IS that date, with a small buffer
+          // backwards to absorb any hour-precision boundary effects (BGG
+          // dates are minute-precision, server clocks differ slightly).
+          //
+          // The previous code subtracted 30 days as a "monthly visit"
+          // heuristic, which pulled in ~30 days of already-read posts every
+          // run. With clearSubs:true and daily/weekly cron, a tight window
+          // matches reality — only fetch posts since last visit.
+          const BUFFER_HOURS = 2;
           const lookback = sub.notificationDate
-            ? new Date(sub.notificationDate.getTime() - 30 * 24 * 3600 * 1000)
+            ? new Date(sub.notificationDate.getTime() - BUFFER_HOURS * 3600 * 1000)
             : null;
           const thread = await fetchThread(sub.id, config.bgg.apiKey, apiPage, lookback);
           if (!thread) {
@@ -349,17 +354,17 @@ async function main(): Promise<void> {
 
           // ---- Select articles to include ----
           //
-          // When we passed minarticledate to the API, thread.articles already
-          // contains only the post-cutoff window (typically last 30 days from
-          // notificationDate). Just sort oldest→newest and use them all.
+          // Belt-and-braces: even with the API-side minarticledate, also
+          // filter client-side to drop anything before the lookback. Catches
+          // BGG returning bonus articles or any timezone weirdness.
           //
-          // When we DIDN'T pass a cutoff (notificationDate was null), the API
-          // returned the oldest 1000 archived articles, so fall back to
-          // notifiedItemIds → recency.
+          // When notificationDate is null (we couldn't parse a date), fall
+          // back to the notifiedItemIds path or recency.
           let articles: BggThreadArticle[];
 
-          if (sub.notificationDate !== null) {
-            articles = [...thread.articles]
+          if (sub.notificationDate !== null && lookback !== null) {
+            articles = thread.articles
+              .filter((a) => a.postdate.getTime() >= lookback.getTime())
               .sort((a, b) => a.postdate.getTime() - b.postdate.getTime());
           } else {
             const notified = new Set(sub.notifiedItemIds);
@@ -368,6 +373,20 @@ async function main(): Promise<void> {
                   .filter((a) => notified.has(a.id))
                   .sort((a, b) => a.postdate.getTime() - b.postdate.getTime())
               : recentArticles(thread.articles, maxItems);
+          }
+
+          // Hard-cap at maxItems regardless of selection path. The date-filter
+          // path is unbounded (whatever fits in the 30-day lookback) and a
+          // single 100+ article thread blows up the total digest context,
+          // pushing the model into the 200K-window degenerate-output zone.
+          // Delegate to the same recentArticles helper used in the fallback
+          // path: sorts by latest activity DESCENDING (post or edit, whichever
+          // is later) and slices the top N — so the newest items are always
+          // preserved and the older ones are dropped. Output is newest-first.
+          if (articles.length > maxItems) {
+            const dropped = articles.length - maxItems;
+            articles = recentArticles(articles, maxItems);
+            log.info(`Capped thread ${sub.id} at ${maxItems} most-recent articles (dropped ${dropped} older)`);
           }
 
           log.info(`Thread "${thread.subject}": ${articles.length} articles selected`, {
@@ -444,6 +463,16 @@ async function main(): Promise<void> {
             items = recentItems(geeklist.items, maxItems);
           }
 
+          // Hard-cap at maxItems regardless of selection path (see thread
+          // path comment above for why). Delegate to recentItems — same
+          // sort-by-latest-activity-then-take-top-N logic used in the
+          // fallback path, so the newest items are always preserved.
+          if (items.length > maxItems) {
+            const dropped = items.length - maxItems;
+            items = recentItems(items, maxItems);
+            log.info(`Capped geeklist ${sub.id} at ${maxItems} most-recent items (dropped ${dropped} older)`);
+          }
+
           log.info(`Geeklist "${geeklist.title}": ${items.length} items selected`, {
             notifiedIds: sub.notifiedItemIds.length,
             hasDate:     sub.notificationDate !== null,
@@ -516,8 +545,8 @@ async function main(): Promise<void> {
         }
 
         // Tell BGG this subscription has been acknowledged.
-        // With debugClear: true (default), this just logs — no actual clicking.
-        await clearSubscriptionShortcut(subPage, sub, config.digest.debugClear);
+        // With clearSubs: false (default), this just logs — no actual clicking.
+        await clearSubscriptionShortcut(subPage, sub, config.digest.clearSubs);
 
         // Polite pause between API calls so we don't hammer BGG's servers.
         // 1 second between each subscription — with 57 subs, this adds ~1 minute.

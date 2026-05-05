@@ -10,7 +10,7 @@
     "maxNewItemsPerSubscription": 15,
     "headless":                   true,
     "interestsFile":              "./interests.md",
-    "debugClear":                 true
+    "clearSubs":                  false
   },
   "email": {
     "resendApiKey": "re_......",

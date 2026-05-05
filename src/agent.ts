@@ -33,8 +33,9 @@
 
 // `spawnSync` runs a child process synchronously (blocks until it exits).
 // `spawn` streams stdout/stderr — used for tallow whose JSONL output can
-// Python equivalent: subprocess.run(..., capture_output=True)
-import { spawnSync } from 'child_process';
+// `spawnSync` for claude (bounded JSON output); `spawn` streaming for tallow
+// (large JSONL output exceeds spawnSync's buffer cap).
+import { spawn, spawnSync } from 'child_process';
 
 // `os` module — provides os.tmpdir() for the system's temp directory.
 // Python: import tempfile; tempfile.gettempdir()
@@ -398,23 +399,80 @@ CRITICAL WORKFLOW — follow exactly:
 2. Read EVERY file listed in the manifest's "filePath" fields — all of them, in order
 3. Do NOT write any content while reading files — no progress narration, no partial sections
 4. ONLY AFTER reading ALL files: write the complete digest in a SINGLE response
-5. That single response MUST begin with "## ⭐ Highlights"
-6. The entire digest — every section — must be in that ONE final response
-7. Do NOT say "the digest is above" or reference earlier turns
+5. Write every subscription section FIRST (in the order described below)
+6. Write the "## ⭐ Highlights" block LAST, after all subscription sections — the digest tooling moves it to the top automatically
+7. Do NOT write a Highlights placeholder up front (e.g. "[To be populated...]"). The output is a one-shot stream — anything you write up front cannot be edited later
+8. The entire digest — every section + Highlights — must be in that ONE final response
+9. Do NOT say "the digest is above" or reference earlier turns
 
 Output rules:
-- Begin your output with "## ⭐ Highlights" — no preamble, no duplicate title (the digest already has a wrapper header)
-- After Highlights, render each subscription section in the format above
-- Order sections this way:
+- No preamble, no duplicate title — start the response directly with the first subscription's "### [Title](URL)" header
+- Order subscription sections this way (each subscription appears EXACTLY ONCE — if it matches multiple categories, place it in the FIRST matching one and do NOT list it again):
   1. Subscriptions matching my "Priority Subscriptions" interests FIRST
   2. Subscriptions whose parentName matches one of my "Games I'm Tracking"
   3. Other subscriptions whose parentName is set (game-related discussion not on my priority list)
   4. Everything else last
-- The Highlights section lists ⭐ items across ALL subscriptions before the individual sections
+- After ALL subscription sections, write the Highlights block. It must be a single "## ⭐ Highlights" header followed by bullets that span every section above — ⭐ items matching tracked games / priority interests, plus a bullet per major theme (solo, cooperative, crowdfunding, review, etc.).
 - For high-volume subscriptions (itemCount > 30), summarize overall activity by THEME — but still list individual ⭐ bullets for any items that match my tracked games or priority interests, even if there are dozens of them. Priority items always get the full bullet treatment; the rest of the volume gets the thematic summary.
 - INCLUDE every subscription in the manifest at least briefly — even pure trade/sale or off-topic threads. For low-relevance ones, a one-line summary with the link is fine. Do not silently omit a subscription.
 - When grouping multiple subscriptions with the same parentName, put them adjacent so the user can see all activity for one game together.
+- Do NOT use "[Already processed]" placeholders or any other cross-reference markers. Each subscription is written once, in full, in its category.
 - Read ONLY the files listed in the manifest — do not explore the rest of the filesystem`;
+}
+
+// ============================================================
+// liftHighlightsToTop — move "## ⭐ Highlights" block from end to top
+// ============================================================
+//
+// We instruct the model to write subscription sections first and the
+// "## ⭐ Highlights" block last (see buildDigestPrompt). Reasoning:
+//   - --print --output-format json is one-shot linear text. Models that put
+//     Highlights first sometimes write a "[To be populated...]" placeholder
+//     and never come back, because they can't edit their own output mid-run.
+//   - With Highlights at the END, the model writes it as the final act of
+//     generation, so it's either there in full or visibly missing.
+// This helper reshapes the linear output for the reader so Highlights still
+// appears at the top of the digest.
+//
+// Behaviour:
+//   - Finds the LAST occurrence of a "## ⭐ Highlights" header (or "##
+//     Highlights" without the star — some models drop it).
+//   - Moves everything from that header onward to the front of the body.
+//   - Strips any earlier (placeholder) Highlights blocks so we don't keep
+//     a dead "[To be populated...]" stub above the real one.
+//   - If no Highlights header is found at all, returns the body unchanged.
+function liftHighlightsToTop(body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return body;
+
+  const headerRe = /^[ \t]*##[ \t]+(?:⭐[ \t]+)?Highlights[ \t]*$/gim;
+  const matches: { start: number; end: number }[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = headerRe.exec(trimmed)) !== null) {
+    matches.push({ start: m.index, end: m.index + m[0].length });
+  }
+
+  if (matches.length === 0) return body;
+
+  const last       = matches[matches.length - 1];
+  const highlights = trimmed.slice(last.start).trim();
+  let sections     = trimmed.slice(0, last.start).trim();
+
+  // Remove earlier placeholder Highlights blocks (header + everything until
+  // the next "##" or "###" header).
+  if (matches.length > 1) {
+    for (let i = matches.length - 2; i >= 0; i--) {
+      const placeholder = matches[i];
+      const after       = sections.slice(placeholder.end);
+      const nextHeader  = /\n##+[ \t]+/.exec(after);
+      const elideEnd    = nextHeader
+        ? placeholder.end + nextHeader.index
+        : sections.length;
+      sections = (sections.slice(0, placeholder.start) + sections.slice(elideEnd)).trim();
+    }
+  }
+
+  return `${highlights}\n\n${sections}`.trim();
 }
 
 // ============================================================
@@ -460,6 +518,12 @@ export function runClaudeDigest(
   manifestPath: string,
   interests: string,
   model = 'opus',
+  // When true, route claude through `ollama launch claude --model <m> --yes`,
+  // which sets the Anthropic env vars and points claude at the local Ollama
+  // OpenAI-compatible endpoint. The `model` arg is then an Ollama model id
+  // (e.g. "nemotron-3-super:cloud"). See:
+  // https://docs.ollama.com/integrations/claude-code
+  useOllama = false,
 ): DigestResult {
   const prompt = buildDigestPrompt(manifestPath, interests);
 
@@ -497,7 +561,14 @@ export function runClaudeDigest(
     ].filter(Boolean);
     const augmentedPath = [...extraPaths, process.env.PATH ?? ''].join(':');
 
-    const cmd = `claude --model ${model} --dangerously-skip-permissions --print --output-format json < "${tmpFile}"`;
+    // ollama launch claude --model X --yes -- <claude-flags>
+    //   --yes : auto-answer any setup prompt non-interactively
+    //   --    : everything after this is passed to claude itself
+    // The `<` redirect feeds the prompt to claude's stdin through ollama.
+    const claudeFlags = `--dangerously-skip-permissions --print --output-format json`;
+    const cmd = useOllama
+      ? `ollama launch claude --model ${model} --yes -- ${claudeFlags} < "${tmpFile}"`
+      : `claude --model ${model} ${claudeFlags} < "${tmpFile}"`;
 
     const result = spawnSync(cmd, {
       shell:     true,
@@ -625,7 +696,7 @@ export function runClaudeDigest(
       (u.cache_read_input_tokens ?? 0);
 
     return {
-      body:         parsed.result ?? rawOutput,  // Fall back to raw if 'result' key missing
+      body:         liftHighlightsToTop(parsed.result ?? rawOutput),
       inputTokens,
       outputTokens: u.output_tokens ?? 0,
       costUsd:      parsed.total_cost_usd ?? 0,
@@ -641,480 +712,227 @@ export function runClaudeDigest(
 }
 
 // ============================================================
-// Per-subscription single-shot path (claude-ollama + tallow)
+// ============================================================
+// runTallowDigest — launch tallow with file access and parse JSONL events
 // ============================================================
 //
-// Why this exists: the original "one giant call, model uses Read tools to
-// pull each subscription file" pattern degrades on Ollama-served models with
-// 200K context windows. Two failure modes observed:
-//   - nemotron-3-super: claude's automatic context compaction works but the
-//     model degenerates (repetition collapse, multiple Highlights sections)
-//   - mistral-large-3:675b: hits the 200K ceiling and silently drops
-//     subscriptions, over-summarizing the rest
+// Tallow (https://github.com/dungle-scrubs/tallow) is an alternative coding
+// agent that speaks the same Read-tool dance as Claude Code but supports
+// arbitrary providers (ollama, anthropic, openai, etc.) via its config.
 //
-// Per-subscription single-shot calls keep each prompt small (one file's
-// content + interests, ~2-10K tokens), so neither failure mode triggers.
-// 41 subscriptions => 41 sequential model calls + 1 final highlights call.
+// CLI shape:
+//   tallow --model <model> --yolo --mode json --print "<prompt>"
+//     --yolo       : auto-approve all tool confirmations (parallel of --dangerously-skip-permissions)
+//     --mode json  : emit JSON Lines — one JSON event per line on stdout
+//     --print      : single-shot run; the prompt is passed as an argument (not via stdin)
 //
-// Runs serial because Ollama's free tier serializes a single model anyway.
-// The plain-claude path against Anthropic still uses the original tool-loop
-// approach (runClaudeDigest), which works fine there.
+// Provider selection is left to the user's ~/.tallow/settings.json
+// `defaultProvider` (typically "ollama"). Override per-invocation by editing
+// that file or by including `provider/model` in the model string if tallow
+// supports it for the chosen backend.
+//
+// JSONL event shape we care about (verified empirically against tallow 0.9.x):
+//   {"type":"session", ...}                      // first line, has session id
+//   {"type":"message_start", ...}
+//   {"type":"message_end", ...}
+//   {"type":"turn_end","message":{
+//      "role":"assistant",
+//      "content":[
+//        {"type":"thinking","thinking":"..."},   // present when the model has a reasoning step
+//        {"type":"tool_use", ...},               // when calling Read etc.
+//        {"type":"text","text":"...digest md..."}
+//      ],
+//      "usage":{
+//        "input":N, "output":N,
+//        "cacheRead":N, "cacheWrite":N,
+//        "totalTokens":N,
+//        "cost":{"input":..., "output":..., "total":...}
+//      }
+//   }, "toolResults":[...]}
+//
+// IMPORTANT: there are typically MANY turn_end events (one per tool round).
+// Tool-only turns may have empty/no `text` items — we walk back to the last
+// turn whose content contains a non-empty `text` chunk to grab the digest
+// body. Token usage is summed across every turn_end so the footer reflects
+// the full cost of the run.
+export async function runTallowDigest(
+  manifestPath: string,
+  interests: string,
+  model = 'qwen3-coder-next:cloud',
+): Promise<DigestResult> {
+  const prompt = buildDigestPrompt(manifestPath, interests);
 
-// ---- isRateLimitError ----------------------------------------
-//
-// Detect 429 / quota errors from either claude (api_error_status:429 in
-// JSON, or "[HTTP 429] ..." in our error wrapper) or tallow (errorMessage
-// like '429 "you (DoxaLogos) have reached your weekly usage limit..."').
-// On a hit the orchestrator halts immediately — no retry, no further work.
-function isRateLimitError(text: string): boolean {
-  if (!text) return false;
-  return /\b429\b/.test(text);
-}
-
-// ---- SingleCallResult ----------------------------------------
-//
-// Return shape of one single-shot agent call. errorKind is set only on
-// failure: 'rate_limit' for 429s (halt the whole orchestrator),
-// 'other' for everything else (timeout, model error, parse error → retry).
-interface SingleCallResult {
-  body:          string;
-  inputTokens:   number;
-  outputTokens:  number;
-  costUsd:       number;
-  errorKind?:    'rate_limit' | 'other';
-  errorMessage?: string;
-}
-
-// Per-call wall-clock cap. Single-shot prompts contain one subscription
-// file inline (largest seen ~44KB / 7K words), so each call is bounded —
-// but cloud-routed Ollama models can be slow on big inputs and have
-// occasional latency spikes. 240s gives generous headroom; total worst
-// case at 41 subs × 240s = ~2.7h, but typical per-call is 5-30s and
-// most digests should land in 15-30 min.
-const PER_CALL_TIMEOUT_MS = 240_000;
-
-// ---- runClaudeSingleCall -------------------------------------
-//
-// One claude invocation with a fully-inlined prompt (no tool loop, no Read
-// calls — content is in the prompt body). Routed via direct env vars
-// (ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL), NOT
-// `ollama launch claude` — the launch wrapper has heavy per-invocation
-// startup overhead (~60s+) which is fine for a single big tool-loop call
-// but fatal when we're making 41+ small calls in a row. Direct env-var
-// routing was empirically validated earlier in this codebase's history
-// against qwen35-pi at ~56s per call (vs 12 min through the wrapper).
-function runClaudeSingleCall(prompt: string, model: string): SingleCallResult {
-  const tmpFile = path.join(
-    os.tmpdir(),
-    `bgg-call-${Date.now()}-${Math.random().toString(36).slice(2, 9)}.txt`,
-  );
-  const home       = process.env.HOME ?? '';
+  // tallow accepts the prompt directly as a CLI argument — no temp file
+  // needed. spawn with args array bypasses shell quoting, so embedded
+  // quotes/backticks/newlines in the prompt are safe.
+  const home = process.env.HOME ?? '';
   const extraPaths = [
-    `${home}/.local/bin`,
-    `${home}/.npm-global/bin`,
-    `${home}/.nvm/versions/node/current/bin`,
-    '/usr/local/bin',
+    `${home}/.bun/bin`,                         // bun-installed tallow (the typical install)
+    `${home}/.local/bin`,                       // npm global on Linux
+    `${home}/.npm-global/bin`,                  // npm with custom prefix
+    `${home}/.nvm/versions/node/current/bin`,   // nvm current
+    '/usr/local/bin',                           // homebrew / manual installs
   ];
   const augmentedPath = [...extraPaths, process.env.PATH ?? ''].join(':');
 
-  try {
-    fs.writeFileSync(tmpFile, prompt, 'utf-8');
-
-    const cmd = `claude --model ${model} --dangerously-skip-permissions --print --output-format json < "${tmpFile}"`;
-
-    const result = spawnSync(cmd, {
-      shell:     true,
-      encoding:  'utf-8',
-      timeout:   PER_CALL_TIMEOUT_MS,
-      maxBuffer: 20 * 1024 * 1024,
-      env: {
-        ...process.env,
-        PATH: augmentedPath,
-        // Point claude at the local Ollama OpenAI-compatible endpoint.
-        // See: https://docs.ollama.com/integrations/claude-code
-        ANTHROPIC_AUTH_TOKEN: 'ollama',
-        ANTHROPIC_API_KEY:    '',
-        ANTHROPIC_BASE_URL:   'http://localhost:11434',
-      },
-    });
-
-    if (result.error) {
-      const msg = String(result.error);
-      return {
-        body: '', inputTokens: 0, outputTokens: 0, costUsd: 0,
-        errorKind:    isRateLimitError(msg) ? 'rate_limit' : 'other',
-        errorMessage: msg.slice(0, 500),
-      };
-    }
-
-    const rawOutput = result.stdout?.trim() ?? '';
-
-    // Parse JSON — claude returns JSON even on api errors (is_error:true).
-    let parsed: {
-      result?:           string;
-      is_error?:         boolean;
-      api_error_status?: number;
-      total_cost_usd?:   number;
-      usage?: {
-        input_tokens?:                number;
-        cache_creation_input_tokens?: number;
-        cache_read_input_tokens?:     number;
-        output_tokens?:               number;
-      };
-    };
-    try {
-      parsed = JSON.parse(rawOutput);
-    } catch {
-      const detail = rawOutput || result.stderr?.slice(0, 500) || '(no output)';
-      return {
-        body: '', inputTokens: 0, outputTokens: 0, costUsd: 0,
-        errorKind:    isRateLimitError(detail) ? 'rate_limit' : 'other',
-        errorMessage: detail.slice(0, 500),
-      };
-    }
-
-    const u            = parsed.usage ?? {};
-    const inputTokens  = (u.input_tokens ?? 0)
-                       + (u.cache_creation_input_tokens ?? 0)
-                       + (u.cache_read_input_tokens ?? 0);
-    const outputTokens = u.output_tokens ?? 0;
-    const costUsd      = parsed.total_cost_usd ?? 0;
-
-    if (parsed.is_error) {
-      const detail = `[HTTP ${parsed.api_error_status ?? '?'}] ${parsed.result ?? ''}`;
-      const kind   = (parsed.api_error_status === 429 || isRateLimitError(detail))
-        ? 'rate_limit' as const
-        : 'other' as const;
-      return {
-        body: '', inputTokens, outputTokens, costUsd,
-        errorKind:    kind,
-        errorMessage: detail.slice(0, 500),
-      };
-    }
-
-    return {
-      body: parsed.result ?? '',
-      inputTokens, outputTokens, costUsd,
-    };
-  } finally {
-    fs.unlink(tmpFile, () => undefined);
-  }
-}
-
-// ---- runTallowSingleCall -------------------------------------
-//
-// One tallow invocation with an inlined prompt. spawnSync (not stream) is
-// fine here because single-shot has no tool round-trips echoing files —
-// output is bounded. Parses the JSONL stream from stdout, walks events to
-// find the assistant text, and detects 429 errorMessages.
-function runTallowSingleCall(prompt: string, model: string): SingleCallResult {
-  const home       = process.env.HOME ?? '';
-  const extraPaths = [
-    `${home}/.bun/bin`,
-    `${home}/.local/bin`,
-    `${home}/.npm-global/bin`,
-    `${home}/.nvm/versions/node/current/bin`,
-    '/usr/local/bin',
-  ];
-  const augmentedPath = [...extraPaths, process.env.PATH ?? ''].join(':');
-
-  const args = ['--yolo', '--mode', 'json', '--model', model, '--print', prompt];
-
-  const result = spawnSync('tallow', args, {
-    encoding:  'utf-8',
-    timeout:   PER_CALL_TIMEOUT_MS,
-    maxBuffer: 20 * 1024 * 1024,
-    env:       { ...process.env, PATH: augmentedPath },
+  log.debug('Launching tallow with --yolo --mode json (streaming)', {
+    manifestPath,
+    model,
+    promptLength: prompt.length,
   });
 
-  if (result.error) {
-    const msg = String(result.error);
-    return {
-      body: '', inputTokens: 0, outputTokens: 0, costUsd: 0,
-      errorKind:    isRateLimitError(msg) ? 'rate_limit' : 'other',
-      errorMessage: msg.slice(0, 500),
-    };
-  }
+  const args = [
+    '--yolo',
+    '--mode', 'json',
+    '--model', model,
+    '--print', prompt,
+  ];
 
+  // ---- Stream tallow's JSONL output ----
+  //
+  // We use streaming spawn instead of spawnSync because tallow's JSONL grows
+  // unboundedly with tool rounds (each Read tool call's full file contents
+  // get echoed back as a tool_result event). Long digests with chatty models
+  // were hitting ENOBUFS on the 50MB spawnSync cap. Streaming has no cap and
+  // also lowers peak memory because we keep only the parsed turn_end events
+  // (small) and discard everything else line-by-line.
   type TallowUsage = {
-    input?:       number; output?: number;
-    cacheRead?:   number; cacheWrite?: number;
-    cost?:        { total?: number };
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    totalTokens?: number;
+    cost?: { input?: number; output?: number; total?: number };
   };
   type TallowContent = { type: string; text?: string };
   type TallowEvent = {
     type: string;
-    message?: {
-      content?:      TallowContent[];
-      usage?:        TallowUsage;
-      role?:         string;
-      errorMessage?: string;
-    };
+    message?: { content?: TallowContent[]; usage?: TallowUsage };
   };
 
-  const events: TallowEvent[] = [];
-  for (const line of (result.stdout ?? '').split('\n')) {
-    const t = line.trim();
-    if (!t) continue;
-    try { events.push(JSON.parse(t) as TallowEvent); } catch { /* skip */ }
+  // Wall-clock the run so we can populate durationMs (tallow's JSONL doesn't
+  // include a top-level duration like Claude's --output-format json does).
+  const start = Date.now();
+  const proc  = spawn('tallow', args, {
+    env:   { ...process.env, PATH: augmentedPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  // Hard timeout — kill tallow if it hangs (e.g. local model deadlock).
+  const TIMEOUT_MS = 30 * 60 * 1000;
+  const timeoutHandle = setTimeout(() => {
+    log.warn(`tallow exceeded ${TIMEOUT_MS}ms timeout — killing process`);
+    proc.kill('SIGKILL');
+  }, TIMEOUT_MS);
+
+  // Only retain turn_end events — every other event type is discarded as it
+  // streams in, keeping memory bounded regardless of digest size.
+  const turnEnds: TallowEvent[] = [];
+  let stdoutTail   = '';     // partial last line awaiting a newline
+  let stderrChunks = '';     // capped stderr for error diagnostics
+  let totalBytes   = 0;
+
+  proc.stdout.setEncoding('utf-8');
+  proc.stdout.on('data', (chunk: string) => {
+    totalBytes += chunk.length;
+    stdoutTail += chunk;
+    let nl: number;
+    while ((nl = stdoutTail.indexOf('\n')) !== -1) {
+      const line = stdoutTail.slice(0, nl).trim();
+      stdoutTail = stdoutTail.slice(nl + 1);
+      if (!line) continue;
+      try {
+        const ev = JSON.parse(line) as TallowEvent;
+        if (ev.type === 'turn_end') turnEnds.push(ev);
+      } catch {
+        // Skip un-parseable lines defensively.
+      }
+    }
+  });
+
+  proc.stderr.setEncoding('utf-8');
+  proc.stderr.on('data', (chunk: string) => {
+    if (stderrChunks.length < 4000) stderrChunks += chunk;
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    proc.on('error', (err) => {
+      clearTimeout(timeoutHandle);
+      reject(err);
+    });
+    proc.on('close', (code) => {
+      clearTimeout(timeoutHandle);
+      // Flush any trailing line that didn't end with \n.
+      const last = stdoutTail.trim();
+      if (last) {
+        try {
+          const ev = JSON.parse(last) as TallowEvent;
+          if (ev.type === 'turn_end') turnEnds.push(ev);
+        } catch { /* skip */ }
+      }
+      if (code !== 0) {
+        reject(new Error(
+          `tallow exited with code ${code}: ${stderrChunks.slice(0, 1000)}`,
+        ));
+        return;
+      }
+      resolve();
+    });
+  });
+  const durationMs = Date.now() - start;
+
+  log.debug('Tallow stream complete', {
+    bytesRead:  totalBytes,
+    turnEnds:   turnEnds.length,
+    durationMs,
+  });
+
+  if (turnEnds.length === 0) {
+    throw new Error(
+      `tallow produced no turn_end events (${totalBytes} bytes read). ` +
+      `stderr: ${stderrChunks.slice(0, 500)}`,
+    );
   }
 
-  // Check every event for an errorMessage. tallow emits these on assistant
-  // messages when the upstream model rejects the request (e.g. 429).
-  for (const ev of events) {
-    const errMsg = ev.message?.errorMessage;
-    if (errMsg) {
-      return {
-        body: '', inputTokens: 0, outputTokens: 0, costUsd: 0,
-        errorKind:    isRateLimitError(errMsg) ? 'rate_limit' : 'other',
-        errorMessage: errMsg.slice(0, 500),
-      };
+  // ---- Pull the digest body ----
+  //
+  // Walk turn_ends from newest backward and grab the text from the first
+  // one that has a non-empty `type:'text'` item. Tool-only turns contribute
+  // no body text. The prompt instructs the agent to write the entire digest
+  // in a single final response, so the last turn with text SHOULD be the
+  // synthesis.
+  let body = '';
+  for (let i = turnEnds.length - 1; i >= 0; i--) {
+    const text = (turnEnds[i].message?.content ?? [])
+      .filter((c) => c.type === 'text' && typeof c.text === 'string' && c.text.trim().length > 0)
+      .map((c) => c.text as string)
+      .join('\n');
+    if (text) {
+      body = text;
+      break;
     }
   }
+  if (!body) {
+    throw new Error(
+      `tallow ran ${turnEnds.length} turn(s) but no turn produced assistant text. ` +
+      `Model may have looped on tool calls without ever synthesizing.`,
+    );
+  }
 
-  // Pull the most recent non-empty text block.
-  let body = '';
+  // ---- Sum usage across all turn_end events ----
   let inputTokens  = 0;
   let outputTokens = 0;
   let costUsd      = 0;
-  for (const ev of events) {
-    if (ev.type !== 'turn_end' && ev.type !== 'message') continue;
+  for (const ev of turnEnds) {
     const u = ev.message?.usage ?? {};
     inputTokens  += (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
     outputTokens += u.output ?? 0;
     costUsd      += u.cost?.total ?? 0;
   }
-  // Walk backward for the last text-bearing event.
-  for (let i = events.length - 1; i >= 0; i--) {
-    const content = events[i].message?.content ?? [];
-    const text = content
-      .filter((c) => c.type === 'text' && typeof c.text === 'string' && c.text.trim().length > 0)
-      .map((c) => c.text as string)
-      .join('\n');
-    if (text) { body = text; break; }
-  }
-
-  if (!body) {
-    return {
-      body: '', inputTokens, outputTokens, costUsd,
-      errorKind:    'other',
-      errorMessage: `tallow produced no assistant text (${events.length} events)`,
-    };
-  }
-
-  return { body, inputTokens, outputTokens, costUsd };
-}
-
-// ---- buildPerSubscriptionPrompt ------------------------------
-//
-// Single-subscription prompt: content inlined, no tools needed. Asks the
-// model to render exactly one section in the digest's standard format.
-// Returns the section markdown directly — no Highlights, no surrounding
-// chrome.
-function buildPerSubscriptionPrompt(
-  entry: ManifestEntry,
-  content: string,
-  interests: string,
-): string {
-  const interestsBlock = interests
-    ? `Reader's interests (use to highlight relevant items with ⭐):\n\n${interests}\n\n`
-    : '';
-
-  const parentLine = entry.parentName
-    ? `*Parent: ${entry.parentName}*\n`
-    : '';
-
-  // For very long content, claude-ollama-served small-context models can
-  // still get jammed. We don't truncate here — let the model fail per-call
-  // and the orchestrator retry/skip.
-  const themeNote = entry.itemCount > 30
-    ? `This is a high-volume subscription (${entry.itemCount} items). Summarize overall activity by THEME in the Summary, but still call out individual ⭐ items matching the reader's tracked games or priority interests.`
-    : '';
-
-  return `${interestsBlock}You are summarizing ONE BGG (BoardGameGeek) subscription as a section of a larger digest.
-
-Subscription metadata:
-  - Title: ${entry.title}
-  - URL:   ${entry.url}
-  - Type:  ${entry.type}
-  - Items: ${entry.itemCount}${entry.parentName ? `\n  - Parent: ${entry.parentName}` : ''}
-
-Subscription content (between the fences):
-\`\`\`
-${content}
-\`\`\`
-
-Render exactly this markdown structure. Begin output with the "###" line; do not add any preamble or commentary before or after.
-
-### [${entry.title}](${entry.url})
-${parentLine}**Summary:** 2–4 sentences on what's new and the overall tone.
-
-**New Activity:**
-- Bullet per notable item (max 8). Include author, brief description, and link where available. Mark items matching the reader's interests with ⭐.
-
-**Topics Mentioned:** comma-separated list of matched interests, or "none"
-
-${themeNote}
-Do not invent items not present in the content above. Do not write planning sentences ("Now I'll..."). Output only the section.`;
-}
-
-// ---- buildHighlightsPrompt -----------------------------------
-//
-// Aggregation prompt: takes already-rendered subscription sections and
-// produces just the "## ⭐ Highlights" block. Run once at the end.
-function buildHighlightsPrompt(renderedSections: string, interests: string): string {
-  const interestsBlock = interests
-    ? `Reader's interests:\n\n${interests}\n\n`
-    : '';
-
-  return `${interestsBlock}Below are subscription sections that have already been rendered for a BGG digest. Produce ONLY the cross-subscription Highlights block that will appear at the top of the digest.
-
-Sections:
-
-${renderedSections}
-
-Output exactly this format. Begin with "## ⭐ Highlights"; no preamble, no rendering of subscription sections (they are already complete).
-
-## ⭐ Highlights
-- One bullet per cross-subscription standout matching the reader's tracked games or priority interests
-- One bullet for each major theme (solo/cooperative/crowdfunding/review) that appeared multiple times across sections
-
-Keep bullets concise. Do not duplicate the section content below — this block is the index, not the content.`;
-}
-
-// ---- runOllamaPerSubscriptionDigest --------------------------
-//
-// Orchestrator for the claude-ollama and tallow agents. Sequential
-// per-subscription calls, retries non-rate-limit failures once, halts
-// on rate-limit, runs a final Highlights call (skipped if rate-limited).
-async function runOllamaPerSubscriptionDigest(
-  agent:        'claude-ollama' | 'tallow',
-  manifestPath: string,
-  interests:    string,
-  model:        string,
-): Promise<DigestResult> {
-  const start = Date.now();
-
-  // Load the manifest and read each entry's data file.
-  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as ManifestEntry[];
-
-  const callOnce = (prompt: string): SingleCallResult => agent === 'tallow'
-    ? runTallowSingleCall(prompt, model)
-    : runClaudeSingleCall(prompt, model);
-
-  const sections: string[]              = [];
-  const skipped:  DigestSkippedEntry[]  = [];
-  let totalIn   = 0;
-  let totalOut  = 0;
-  let totalCost = 0;
-  let rateLimited = false;
-
-  log.info(`Per-subscription orchestrator starting (${manifest.length} entries, ${agent}/${model})`);
-
-  for (const [idx, entry] of manifest.entries()) {
-    const content = fs.readFileSync(entry.filePath, 'utf-8');
-    const prompt  = buildPerSubscriptionPrompt(entry, content, interests);
-
-    let result: SingleCallResult | undefined;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      result = callOnce(prompt);
-      if (!result.errorKind) break;
-      if (result.errorKind === 'rate_limit') {
-        rateLimited = true;
-        log.warn(
-          `[${idx + 1}/${manifest.length}] Rate-limit on "${entry.title}" — halting orchestrator. Detail: ${result.errorMessage}`,
-        );
-        break;
-      }
-      if (attempt === 1) {
-        log.warn(
-          `[${idx + 1}/${manifest.length}] Single-call failed on "${entry.title}" (attempt ${attempt}): ${result.errorMessage} — retrying`,
-        );
-      } else {
-        log.warn(
-          `[${idx + 1}/${manifest.length}] Single-call failed twice on "${entry.title}" — skipping`,
-        );
-      }
-    }
-
-    if (rateLimited) break;
-
-    // Accumulate usage even on errored attempts (we paid the tokens).
-    totalIn   += result!.inputTokens;
-    totalOut  += result!.outputTokens;
-    totalCost += result!.costUsd;
-
-    if (result!.errorKind) {
-      skipped.push({
-        title:    entry.title,
-        filePath: entry.filePath,
-        reason:   result!.errorMessage ?? 'unknown error',
-      });
-      sections.push(
-        `### [${entry.title}](${entry.url})\n` +
-        (entry.parentName ? `*Parent: ${entry.parentName}*\n` : '') +
-        `\n*⚠️ Summarization failed for this subscription (${result!.errorMessage ?? 'unknown'}) — read manually at \`${entry.filePath}\`*`,
-      );
-    } else {
-      sections.push(result!.body.trim());
-      log.debug(
-        `[${idx + 1}/${manifest.length}] Rendered "${entry.title}" — ${result!.outputTokens} output tokens`,
-      );
-    }
-  }
-
-  const renderedSections = sections.join('\n\n');
-
-  // ---- Highlights pass (skipped on rate-limit) ----
-  //
-  // Body is just the digest content — no banners here. The caller
-  // (index.ts/runAgentAndWriteDigest) reads `status` and prepends the
-  // appropriate banner (rate-limited / partial) so we don't double-banner.
-  let body:   string;
-  let status: DigestStatus;
-
-  if (rateLimited) {
-    body   = renderedSections;  // Highlights omitted; index.ts banners.
-    status = 'rate_limited';
-  } else {
-    log.info(`All ${manifest.length} subscription(s) processed (${skipped.length} skipped) — running highlights`);
-    const highlightsPrompt = buildHighlightsPrompt(renderedSections, interests);
-    const h = callOnce(highlightsPrompt);
-
-    totalIn   += h.inputTokens;
-    totalOut  += h.outputTokens;
-    totalCost += h.costUsd;
-
-    if (h.errorKind === 'rate_limit') {
-      // Edge case: per-subscription pass made it through, but the
-      // highlights call itself hit 429. Treat as rate-limited.
-      body   = renderedSections;
-      status = 'rate_limited';
-    } else if (h.errorKind || !h.body.trim()) {
-      // Highlights failed for non-rate-limit reasons — emit sections without
-      // a synthesized Highlights block. Inline note since this isn't the
-      // same as PARTIAL (no subscription content was lost).
-      body = (
-        `*⚠️ Highlights generation failed (${h.errorMessage ?? 'empty response'}) — sections below are complete.*\n\n` +
-        renderedSections
-      );
-      status = skipped.length > 0 ? 'partial' : 'complete';
-    } else {
-      body   = `${h.body.trim()}\n\n${renderedSections}`;
-      status = skipped.length > 0 ? 'partial' : 'complete';
-    }
-  }
 
   return {
-    body,
-    inputTokens:  totalIn,
-    outputTokens: totalOut,
-    costUsd:      totalCost,
-    durationMs:   Date.now() - start,
-    status,
-    completedCount: sections.length - skipped.length,
-    totalCount:     manifest.length,
-    skipped,
+    body: liftHighlightsToTop(body),
+    inputTokens, outputTokens, costUsd, durationMs,
   };
 }
 
@@ -1122,15 +940,14 @@ async function runOllamaPerSubscriptionDigest(
 // runDigest — dispatch to claude / claude-ollama / tallow based on agent name
 // ============================================================
 //
-// 'claude'        — claude CLI talking to Anthropic's API. Uses the original
-//                   one-call tool-loop pattern; effectively unbounded
-//                   context with prompt caching.
+// 'claude'        — claude CLI against Anthropic's API. Original tool-loop
+//                   pattern; effectively unbounded context with caching.
 // 'claude-ollama' — claude CLI redirected at local Ollama via
-//                   `ollama launch claude --model X --yes`. Uses the
-//                   per-subscription single-shot orchestrator since
-//                   Ollama-served models hit 200K-context failure modes.
-// 'tallow'        — tallow CLI. Same per-subscription orchestrator as
-//                   claude-ollama (small Ollama models, same constraints).
+//                   `ollama launch claude --model X --yes`. Same tool-loop
+//                   pattern as plain claude. Item-cap truncation in the
+//                   data-fetch phase keeps total context within the 200K
+//                   model window so degeneration doesn't trigger.
+// 'tallow'        — tallow CLI (its own provider routing).
 export type AgentName = 'claude' | 'claude-ollama' | 'tallow';
 
 export async function runDigest(
@@ -1139,14 +956,11 @@ export async function runDigest(
   interests: string,
   model?: string,
 ): Promise<DigestResult> {
-  if (agent === 'claude-ollama' || agent === 'tallow') {
-    return runOllamaPerSubscriptionDigest(
-      agent,
-      manifestPath,
-      interests,
-      model ?? 'qwen3-coder-next:cloud',
-    );
+  if (agent === 'tallow') {
+    return runTallowDigest(manifestPath, interests, model);
   }
-  // Plain claude (Anthropic) — original tool-loop path, unchanged.
-  return runClaudeDigest(manifestPath, interests, model);
+  // Both 'claude' and 'claude-ollama' share runClaudeDigest — the only
+  // difference is whether we route through `ollama launch claude` to point
+  // at the local Ollama endpoint (true) or talk to Anthropic directly (false).
+  return runClaudeDigest(manifestPath, interests, model, agent === 'claude-ollama');
 }

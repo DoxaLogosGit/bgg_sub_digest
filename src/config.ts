@@ -77,11 +77,11 @@ const ConfigSchema = z.object({
     // Relative paths are resolved from the project root (where `npm start` runs).
     interestsFile: z.string().default('./interests.md'),
 
-    // Safety switch for the "clear shortcut" feature.
-    // true  = log "[DEBUG] Would click..." instead of actually clicking.
-    // false = actually click BGG's remove button to clear each subscription.
-    // Leave true until you've verified the right shortcuts are being targeted.
-    debugClear: z.boolean().default(true),
+    // Whether to actually clear (mark-as-read) each processed subscription on BGG.
+    // true  = click BGG's remove button on each notification row after processing.
+    // false = log "[DEBUG] Would click..." but don't click — useful for testing.
+    // Default false (safe) — turn on once you've verified the right rows are targeted.
+    clearSubs: z.boolean().default(false),
   }),
 
   // Optional email delivery via Resend (https://resend.com).
