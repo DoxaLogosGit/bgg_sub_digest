@@ -173,7 +173,35 @@ Chromium will open and navigate to BGG. If Cloudflare shows a challenge
 page, complete it manually. Your session is saved to `./bgg-browser-profile/`
 and reused on future runs — you should only need to do this once.
 
-After a successful first run, set `headless: true` and `debugClear: false`.
+After a successful first run, set `headless: true` and `clearSubs: true`.
+
+### First-run setup for `--agent tallow`
+
+Tallow refuses to invoke its tools (Read, etc.) in directories that aren't
+explicitly trusted. The digest pipeline uses three directories that tallow
+needs to operate against:
+
+```bash
+cd /path/to/bgg_sub_digest && tallow   # opens interactive
+/trust-project                         # trusts project root
+exit
+cd ./digest-data && tallow
+/trust-project                         # trusts the workspace agent runs in
+exit
+cd ./digests && tallow
+/trust-project                         # trusts the digest output dir
+exit
+```
+
+Without these, tallow will read your trigger prompt, declare the task
+complete, and produce no digest content — because every tool call inside
+the run silently no-ops. Symptoms in the digest footer: very low input
+tokens (~100K instead of the expected ~600K-1M from real Read calls) and
+a 1-line response like *"Task completed."*
+
+`--agent claude` and `--agent claude-ollama` don't need this — Claude Code
+handles trust through `--dangerously-skip-permissions` which the script
+passes automatically.
 
 ## Subsequent runs
 
@@ -233,6 +261,24 @@ For `claude-ollama`, the model name is whatever Ollama recognises (run
 `https://ollama.com/cloud/library`). The integration sets the Anthropic
 env vars (`ANTHROPIC_BASE_URL=http://localhost:11434`, etc.) and exec's
 the `claude` binary against your local Ollama.
+
+> **⚠️ Ollama model compatibility caveat.** Not every Ollama model works
+> well through `--agent claude-ollama`. Claude Code sends tool-use messages
+> in Anthropic's format (`user` message containing `tool_result` blocks);
+> some Ollama-served models — especially those tuned for OpenAI-style
+> function calling like Mistral's `devstral-2` — return HTTP 400 errors
+> with messages like *"Unexpected role 'tool' after role 'user'"* because
+> the translation layer between Claude Code and Ollama doesn't reconcile
+> the two protocols. Other models (e.g. `glm-4.7:cloud`) are simply too
+> slow per-call for a 30+ tool-call workflow. And smaller free-tier models
+> (`nemotron-3-super:cloud`, `gemma4:31b-cloud`) tend to produce shallow
+> "extract and truncate" summaries rather than real paraphrases, with
+> occasional autoregressive repetition collapse. The defensive
+> post-processors in `agent.ts` (`fixHallucinatedHostnames`,
+> `elideRepetitionCollapse`, `elideDuplicateSections`,
+> `liftHighlightsToTop`) cap the worst of this, but don't make a small
+> model produce large-model-quality summaries. Test any new Ollama model
+> with `--reuse-data` before pointing your daily cron at it.
 
 ### Running on a schedule (cron)
 
