@@ -304,6 +304,65 @@ export function writeSubscriptionFile(
 }
 
 // ============================================================
+// installWorkspaceTemplate — copy CLAUDE.md + templates/ into digest-data
+// ============================================================
+//
+// The "workspace" pattern: digest-data/ contains everything the agent needs
+// to do its job — manifest.json, subscription files, INTERESTS.md, CLAUDE.md
+// (orchestration), and templates/ (format references). The agent runs with
+// cwd=digestDataDir so it picks up CLAUDE.md automatically (claude-code and
+// tallow both read CLAUDE.md from cwd).
+//
+// Source layout (in this repo): templates/workspace/
+//   ├── CLAUDE.md
+//   └── templates/
+//       ├── section.md
+//       └── highlights.md
+//
+// Destination (workspace): <digestDataDir>/
+//   ├── CLAUDE.md                     (copied)
+//   ├── templates/section.md          (copied)
+//   ├── templates/highlights.md       (copied)
+//   ├── INTERESTS.md                  (written from `interests` arg, if non-empty)
+//   ├── manifest.json                 (written separately by writeManifest)
+//   └── thread-*.md / geeklist-*.md   (written separately by writeSubscriptionFile)
+//
+// Called before EVERY agent invocation, including --reuse-data, so edits to
+// templates/workspace/* take effect immediately on the next run.
+export function installWorkspaceTemplate(
+  digestDataDir: string,
+  interests: string,
+): void {
+  // Source: templates/workspace/ relative to project root (where `npm start`
+  // runs). process.cwd() is the project root in normal usage.
+  const srcDir = path.join(process.cwd(), 'templates', 'workspace');
+  if (!fs.existsSync(srcDir)) {
+    log.warn(
+      `Workspace template dir not found at ${srcDir} — agent will only see ` +
+      `manifest.json and subscription data files (no CLAUDE.md / templates).`,
+    );
+    return;
+  }
+
+  // Recursive copy. Node 18+ supports fs.cpSync with { recursive: true }.
+  fs.cpSync(srcDir, digestDataDir, { recursive: true });
+
+  // Write the user's interests as INTERESTS.md inside the workspace, so
+  // CLAUDE.md can reference it via the relative path "INTERESTS.md".
+  // If interests is empty, write a stub so CLAUDE.md's reference still
+  // resolves to a readable file.
+  const interestsPath = path.join(digestDataDir, 'INTERESTS.md');
+  fs.writeFileSync(
+    interestsPath,
+    interests.trim() ||
+      '# Interests\n\nNo interests configured. Summarize all subscriptions equally; do not apply ⭐ prioritization.',
+    'utf-8',
+  );
+
+  log.debug('Workspace template installed', { digestDataDir });
+}
+
+// ============================================================
 // writeManifest — write manifest.json listing all subscription files
 // ============================================================
 //
@@ -348,76 +407,17 @@ export function writeManifest(entries: ManifestEntry[], digestDataDir: string): 
 // not to explore the filesystem — since it has full FS access via
 // --dangerously-skip-permissions.
 function buildDigestPrompt(
-  manifestPath: string,
-  interests: string,
+  _manifestPath: string,  // Unused — workspace's CLAUDE.md references manifest at ./manifest.json
+  _interests: string,     // Unused — written to workspace's INTERESTS.md by installWorkspaceTemplate
 ): string {
-  // If the user has an interests.md file, include it as personalization context.
-  // If not, Claude summarizes everything equally.
-  // Python: interests_section = f"..." if interests else "..."
-  const interestsSection = interests
-    ? `Here is what I care about — use this to prioritize, highlight, and order sections:\n\n${interests}`
-    : 'No specific interests configured — summarize all content equally.';
-
-  // Template literal (Python f-string) for the full prompt.
-  // Note: we pass the exact absolute path for the manifest so Claude can find it
-  // regardless of its working directory.
-  return `You are building a BGG (BoardGameGeek) subscription digest.
-
-${interestsSection}
-
-Read the manifest file at this exact path: ${manifestPath}
-
-The manifest is a JSON array where each entry describes one subscription:
-  - "title": subscription name
-  - "url": BGG URL for this subscription
-  - "type": "thread", "geeklist", "blog", "filepage", "boardgame", or "boardgameexpansion"
-  - "filePath": absolute path to the subscription's data file — read this with your Read tool
-  - "itemCount": how many items are in the data file
-  - "unreadCount": number of new-activity rows BGG showed for this subscription (1 per new article/item)
-  - "notificationDate": when this subscription was last visited (ISO timestamp or null)
-  - "parentName" (optional): when present, this thread/geeklist/page lives inside a specific game's
-    forum (e.g. "Nusfjord: Big Box", "Marvel Champions: The Card Game"). Use it to label and group.
-
-For EACH subscription in the manifest:
-1. Read the subscription's data file (use the "filePath" value from the manifest)
-2. Write a section in this markdown format:
-
-### [Subscription Title](URL)
-*Parent: <parentName>* — only include this line if parentName is set in the manifest entry
-
-**Summary:** 2–4 sentences on what's new and the overall tone.
-
-**New Activity:**
-- Bullet per notable item (max 8). Include author, brief description, and link where available. Mark items matching my interests with ⭐.
-
-**Topics Mentioned:** comma-separated list of matched interests, or "none"
-
----
-
-CRITICAL WORKFLOW — follow exactly:
-1. Read the manifest.json file first
-2. Read EVERY file listed in the manifest's "filePath" fields — all of them, in order
-3. Do NOT write any content while reading files — no progress narration, no partial sections
-4. ONLY AFTER reading ALL files: write the complete digest in a SINGLE response
-5. Write every subscription section FIRST (in the order described below)
-6. Write the "## ⭐ Highlights" block LAST, after all subscription sections — the digest tooling moves it to the top automatically
-7. Do NOT write a Highlights placeholder up front (e.g. "[To be populated...]"). The output is a one-shot stream — anything you write up front cannot be edited later
-8. The entire digest — every section + Highlights — must be in that ONE final response
-9. Do NOT say "the digest is above" or reference earlier turns
-
-Output rules:
-- No preamble, no duplicate title — start the response directly with the first subscription's "### [Title](URL)" header
-- Order subscription sections this way (each subscription appears EXACTLY ONCE — if it matches multiple categories, place it in the FIRST matching one and do NOT list it again):
-  1. Subscriptions matching my "Priority Subscriptions" interests FIRST
-  2. Subscriptions whose parentName matches one of my "Games I'm Tracking"
-  3. Other subscriptions whose parentName is set (game-related discussion not on my priority list)
-  4. Everything else last
-- After ALL subscription sections, write the Highlights block. It must be a single "## ⭐ Highlights" header followed by bullets that span every section above — ⭐ items matching tracked games / priority interests, plus a bullet per major theme (solo, cooperative, crowdfunding, review, etc.).
-- For high-volume subscriptions (itemCount > 30), summarize overall activity by THEME — but still list individual ⭐ bullets for any items that match my tracked games or priority interests, even if there are dozens of them. Priority items always get the full bullet treatment; the rest of the volume gets the thematic summary.
-- INCLUDE every subscription in the manifest at least briefly — even pure trade/sale or off-topic threads. For low-relevance ones, a one-line summary with the link is fine. Do not silently omit a subscription.
-- When grouping multiple subscriptions with the same parentName, put them adjacent so the user can see all activity for one game together.
-- Do NOT use "[Already processed]" placeholders or any other cross-reference markers. Each subscription is written once, in full, in its category.
-- Read ONLY the files listed in the manifest — do not explore the rest of the filesystem`;
+  // The full instruction set lives in the workspace's CLAUDE.md (copied
+  // there by installWorkspaceTemplate before each agent invocation).
+  // We just give the agent a short trigger directive — the agent picks up
+  // CLAUDE.md, INTERESTS.md, manifest.json, and templates/ from the cwd
+  // (which is set to digestDataDir on spawn).
+  //
+  // Both claude-code and tallow read CLAUDE.md from cwd automatically.
+  return `Build the BGG subscription digest. All instructions, ordering rules, and section/highlights format references are in this directory's CLAUDE.md and templates/. The reader's interests are in INTERESTS.md. The manifest of subscriptions to process is at ./manifest.json. Begin.`;
 }
 
 // ============================================================
@@ -473,6 +473,140 @@ function liftHighlightsToTop(body: string): string {
   }
 
   return `${highlights}\n\n${sections}`.trim();
+}
+
+// ============================================================
+// fixHallucinatedHostnames — repair model URL substitutions
+// ============================================================
+//
+// nemotron-3-super:cloud has been observed to drop "game" from
+// "boardgamegeek.com" mid-generation, producing URLs like
+// `https://boardgeek.com/thread/123` that 404 when the user clicks them.
+// Pure autoregressive substitution — not in source data.
+//
+// "boardgeek.com" is not a substring of "boardgamegeek.com" (different
+// 6th character), so unconditional global replace is safe.
+function fixHallucinatedHostnames(body: string): string {
+  const fixed = body.replace(/boardgeek\.com/g, 'boardgamegeek.com');
+  if (fixed !== body) {
+    const count = (body.match(/boardgeek\.com/g) ?? []).length;
+    log.warn(`Repaired ${count} hallucinated "boardgeek.com" → "boardgamegeek.com"`);
+  }
+  return fixed;
+}
+
+// ============================================================
+// elideDuplicateSections — drop sections rendered twice
+// ============================================================
+//
+// Models occasionally render the entire digest, then start over and
+// render it again — usually the second copy is partial / abbreviated.
+// Walk all "### [Title](URL)" headers; for any title that appears more
+// than once, keep the first occurrence and elide everything from the
+// duplicate header through the start of the next header (or end of body).
+function elideDuplicateSections(body: string): string {
+  // Match section headers: "### [Title](URL)" at start of line.
+  const headerRe = /^[ \t]*###[ \t]+\[([^\]]+)\]/gm;
+  type Match = { title: string; start: number };
+  const matches: Match[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = headerRe.exec(body)) !== null) {
+    matches.push({ title: m[1].trim(), start: m.index });
+  }
+
+  if (matches.length < 2) return body;
+
+  // Identify duplicate ranges (start of dup header → start of next header
+  // or end of body). Keep first occurrence of each title.
+  const seen:        Set<string> = new Set();
+  const elideRanges: { start: number; end: number }[] = [];
+  for (let i = 0; i < matches.length; i++) {
+    const t = matches[i].title;
+    if (seen.has(t)) {
+      const end = i + 1 < matches.length ? matches[i + 1].start : body.length;
+      elideRanges.push({ start: matches[i].start, end });
+    } else {
+      seen.add(t);
+    }
+  }
+
+  if (elideRanges.length === 0) return body;
+
+  // Apply elides in reverse so earlier offsets remain valid.
+  let out = body;
+  for (let i = elideRanges.length - 1; i >= 0; i--) {
+    out = out.slice(0, elideRanges[i].start) + out.slice(elideRanges[i].end);
+  }
+
+  log.warn(`Elided ${elideRanges.length} duplicate section(s) from agent output`);
+  return out;
+}
+
+// ============================================================
+// elideRepetitionCollapse — strip runaway autoregressive loops
+// ============================================================
+//
+// Some Ollama-served models (notably nemotron-3-super:cloud) hit
+// repetition collapse on long generations: the autoregressive sampler's
+// next-token entropy collapses and the model emits the same line over
+// and over until it hits the output cap. Output looks like:
+//
+//   [Post by mattrob77 on 5/4/2026] — Notes they have decided to ...
+//   [Post by mattrob77 on 5/4/2026] — Notes they have decided to ...
+//   [Post by mattrob77 on 5/4/2026] — Notes they have decided to ...
+//   ... (200 more copies) ...
+//
+// This burns the entire output budget on garbage AND clobbers the
+// Highlights block we asked the model to write last. Defensive
+// truncation: detect runs of 3+ trimmed-identical lines longer than
+// MIN_LINE_CHARS, keep the first occurrence, replace the tail with a
+// marker. Doesn't fix the model — just salvages the surrounding digest
+// so we get a usable output instead of pages of nothing.
+function elideRepetitionCollapse(body: string): string {
+  const MIN_RUN_LENGTH = 3;
+  const MIN_LINE_CHARS = 30;  // skip short separators like "---" or single-token bullets
+  const lines = body.split('\n');
+  const out:   string[] = [];
+  let totalElided = 0;
+
+  let i = 0;
+  while (i < lines.length) {
+    const line    = lines[i];
+    const trimmed = line.trim();
+
+    if (trimmed.length < MIN_LINE_CHARS) {
+      out.push(line);
+      i++;
+      continue;
+    }
+
+    // Count consecutive identical (trimmed) lines.
+    let runLength = 1;
+    while (i + runLength < lines.length && lines[i + runLength].trim() === trimmed) {
+      runLength++;
+    }
+
+    if (runLength >= MIN_RUN_LENGTH) {
+      // Keep the first occurrence, elide the rest.
+      out.push(line);
+      const elidedCount = runLength - 1;
+      totalElided += elidedCount;
+      out.push(
+        `\n*(⚠️ Model entered a repetition loop here — ${elidedCount} additional copies of the same line elided. ` +
+        `Likely cause: autoregressive degeneration on a high-volume section. The digest may be truncated or missing the Highlights block as a result.)*\n`,
+      );
+      i += runLength;
+    } else {
+      out.push(line);
+      i++;
+    }
+  }
+
+  if (totalElided > 0) {
+    log.warn(`Elided ${totalElided} repeated line(s) from agent output (repetition collapse)`);
+  }
+
+  return out.join('\n');
 }
 
 // ============================================================
@@ -573,6 +707,10 @@ export function runClaudeDigest(
     const result = spawnSync(cmd, {
       shell:     true,
       encoding:  'utf-8',
+      // cwd = digest-data so claude reads the workspace's CLAUDE.md and
+      // templates/ automatically. Both claude-code and tallow read
+      // CLAUDE.md from the cwd.
+      cwd:       path.dirname(manifestPath),
       // 45-minute hard cap. Anthropic-backed runs typically finish in 1–2 min,
       // but Ollama-backed runs (claude-ollama) routinely take 5–15 min and
       // have high variance day-to-day; cron hits the slow tail. Matches/exceeds
@@ -696,7 +834,7 @@ export function runClaudeDigest(
       (u.cache_read_input_tokens ?? 0);
 
     return {
-      body:         liftHighlightsToTop(parsed.result ?? rawOutput),
+      body:         liftHighlightsToTop(elideDuplicateSections(elideRepetitionCollapse(fixHallucinatedHostnames(parsed.result ?? rawOutput)))),
       inputTokens,
       outputTokens: u.output_tokens ?? 0,
       costUsd:      parsed.total_cost_usd ?? 0,
@@ -814,6 +952,10 @@ export async function runTallowDigest(
   // include a top-level duration like Claude's --output-format json does).
   const start = Date.now();
   const proc  = spawn('tallow', args, {
+    // cwd = digest-data so tallow picks up the workspace's CLAUDE.md and
+    // templates/ from there. Tallow scans both .claude/ and .tallow/ in cwd
+    // and reads CLAUDE.md natively.
+    cwd:   path.dirname(manifestPath),
     env:   { ...process.env, PATH: augmentedPath },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -931,7 +1073,7 @@ export async function runTallowDigest(
   }
 
   return {
-    body: liftHighlightsToTop(body),
+    body: liftHighlightsToTop(elideDuplicateSections(elideRepetitionCollapse(fixHallucinatedHostnames(body)))),
     inputTokens, outputTokens, costUsd, durationMs,
   };
 }

@@ -46,6 +46,7 @@ import {
   formatGeeklistContent,
   writeSubscriptionFile,
   writeManifest,
+  installWorkspaceTemplate,
   runDigest,
 } from './agent';
 import { fetchPageContent, formatPageContent } from './bgg/page-content';
@@ -619,6 +620,11 @@ async function runAgentAndWriteDigest(
   log.info(
     `Running ${agent} (${model}) against ${entries.length} subscription(s) from ${digestDataDir}`,
   );
+
+  // Install the workspace template (CLAUDE.md + templates/ + INTERESTS.md)
+  // into digest-data on every invocation, including --reuse-data, so edits
+  // to templates/workspace/* take effect immediately on the next run.
+  installWorkspaceTemplate(digestDataDir, interests);
 
   let digestResult: DigestResult;
   try {

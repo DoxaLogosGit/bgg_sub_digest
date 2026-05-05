@@ -301,18 +301,48 @@ Fallback chain for both types when the primary path returns nothing:
 Subscriptions whose filter chain returns zero matches are skipped entirely — no
 empty stub sections in the digest.
 
-### File-based Claude integration
+### Workspace-based agent invocation
 
-Each subscription's content is written to `./digest-data/[type]-[id].md`.
-A `manifest.json` is written listing all files with metadata including
-`unreadCount` (BGG's advertised total) and `itemCount` (what was fetched).
+The script splits cleanly: **scrape phase** writes data files; **agent phase**
+runs an analyst that drives itself off the workspace.
 
-Claude reads the manifest first, then reads each subscription file using its
-Read tool, and produces the full digest. This means:
+After scraping, `./digest-data/` looks like this:
 
-- No hard size limit — large geeklists get their own file
-- Claude can skim low-priority subscriptions and read high-priority ones fully
-- The digest prompt respects your `interests.md` for ordering and highlighting
+```
+digest-data/
+├── CLAUDE.md                  ← orchestration: copied from templates/workspace/
+├── INTERESTS.md               ← reader's interests, copied from config.digest.interestsFile
+├── manifest.json              ← list of subscriptions to process
+├── templates/
+│   ├── section.md             ← per-subscription markdown format reference
+│   └── highlights.md          ← cross-subscription Highlights format reference
+├── thread-3702528.md          ← scraped subscription data files
+├── geeklist-376148.md
+└── ...
+```
+
+The script then spawns the chosen agent (claude / claude-ollama / tallow)
+with `cwd=digest-data/` and a tiny trigger prompt: *"Build the BGG digest.
+All instructions are in CLAUDE.md."* The agent reads CLAUDE.md (both Claude
+Code and tallow do this natively from cwd), follows the workflow described
+there, reads each subscription file using its Read tool, and produces the
+digest.
+
+This means:
+
+- **No hard size limit** — each subscription has its own file; the agent reads
+  what it needs.
+- **Edit prompt rules without touching code** — change
+  `templates/workspace/CLAUDE.md` and the next run picks it up. The script
+  reinstalls the workspace template before every run, including `--reuse-data`.
+- **Same workspace for any agent** — claude (Anthropic), claude-ollama, and
+  tallow all read CLAUDE.md the same way. Switching agents does not require
+  prompt changes.
+- **Highlights post-processing**: CLAUDE.md tells the model to write the
+  `## ⭐ Highlights` block LAST (after every subscription section), then a
+  small post-processor lifts it to the top. Avoids the "model writes a
+  Highlights placeholder and runs out of output budget before filling it in"
+  failure mode.
 
 Claude runs with `--model opus` by default for best summarization quality.
 Pass `-- --model sonnet` (or `haiku`) to `npm start` to use a cheaper model.
