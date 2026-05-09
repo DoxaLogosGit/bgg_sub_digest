@@ -98,6 +98,9 @@ Within each category, group adjacent any subscriptions sharing the same
   clarifying questions. Do NOT wait for user input. The instructions
   here are complete — proceed immediately and make reasonable assumptions
   if anything is ambiguous.**
+- **Do NOT use the Write tool or any file-writing tool.** Your response
+  IS the digest. Output all digest content directly as text in your
+  response — do not write it to `digest-output.md` or any other file.
 - Read ONLY the files referenced in this workspace. Do not explore the
   rest of the filesystem.
 - Do not write planning sentences ("Now I'll process...", "Let me start
