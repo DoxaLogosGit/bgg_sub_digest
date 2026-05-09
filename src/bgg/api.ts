@@ -212,15 +212,21 @@ function parseBggDate(dateStr: string): Date {
 // Strip HTML and BGG's custom BBCode markup from text for cleaner Claude prompts.
 // BGG mixes HTML tags (<b>, <br>) with BBCode ([b]bold[/b], [url=...]).
 //
-// String.replace() with a RegExp: first arg is the pattern, second is the replacement.
-// The `g` flag = global (replace ALL occurrences, not just the first).
-// Python: re.sub(r'<[^>]+>', ' ', text)
+// We deliberately PRESERVE paragraph breaks (\n\n) so downstream formatters
+// can detect quote boundaries — BGG separates quoted text from the new
+// reply with line breaks that we used to flatten away with /\s+/g.
 function stripMarkup(text: string): string {
   return text
-    .replace(/<[^>]+>/g, ' ')          // Remove HTML tags: <b>, <br>, <div ...>
-    .replace(/\[\/?\w+[^\]]*\]/g, '')  // Remove BBCode: [b], [/b], [url=http://...]
-    .replace(/\s+/g, ' ')              // Collapse multiple whitespace to single space
-    .trim();                            // Python: .strip()
+    .replace(/<br\s*\/?>/gi, '\n')          // <br> / <br/> → newline
+    .replace(/<\/p>\s*<p[^>]*>/gi, '\n\n')  // </p><p> → paragraph break
+    .replace(/<\/?p[^>]*>/gi, '\n\n')       // standalone <p> / </p> → break
+    .replace(/<[^>]+>/g, ' ')               // other HTML tags: <b>, <div...>
+    .replace(/\[\/?\w+[^\]]*\]/g, '')       // BBCode: [b], [/b], [url=...]
+    .replace(/[ \t]+/g, ' ')                // collapse runs of spaces/tabs
+    .replace(/\n[ \t]+/g, '\n')             // trim leading spaces on each line
+    .replace(/[ \t]+\n/g, '\n')             // trim trailing spaces on each line
+    .replace(/\n{3,}/g, '\n\n')             // cap consecutive blank lines at 1
+    .trim();
 }
 
 // Truncate text that would blow up the Claude prompt.

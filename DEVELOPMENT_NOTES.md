@@ -666,6 +666,42 @@ mode (no error in either tallow output or our parser) that wasted ~7
 minutes of compute discovering. Worth checking the input-token count in
 the digest footer as a sanity signal that real tool calls happened.
 
+### 25. BGG quote-block rendering as markdown blockquotes
+
+User feedback: replies with quoted text rendered as a giant run-on
+paragraph because:
+
+1. BGG returns posts with `Author wrote:` followed by quoted content
+   then the new reply, separated only by paragraph breaks.
+2. `stripMarkup` was collapsing all whitespace (`\s+ → ' '`), flattening
+   those paragraph breaks into single spaces — so the quote/reply
+   boundary was invisible to humans AND to the model.
+
+Two-layer fix:
+
+**Layer 1 (`src/bgg/api.ts:stripMarkup`)** — preserve paragraph breaks:
+- `<br>` → `\n`
+- `</p>...<p>` → `\n\n`
+- Standalone `<p>` / `</p>` → `\n\n`
+- Collapse `[ \t]+` (spaces/tabs only, not newlines)
+- Cap consecutive newlines at 2 to avoid runaway whitespace
+
+**Layer 2 (`src/agent.ts:renderQuotesAsBlockquotes`)** — detect and rewrite:
+- Regex `(?<=^|\n)([\w'\`-]+) wrote:\s*\n([\s\S]+?)(?=\n\s*\n|$)` matches
+  `Author wrote:` at line start, captures the quoted block up to the next
+  blank line.
+- Rewrites as `> **Author wrote:**\n> <each quoted line>\n` — markdown
+  blockquote that renders visually distinct in the digest .md and the
+  email HTML.
+- Note: no `/m` flag, so `$` in the lookahead means end-of-string, not
+  end-of-line. The lookbehind `(?<=^|\n)` matches line starts without
+  consuming the preceding newline.
+
+Limitation: only handles 1-deep quotes. Nested `[quote]` chains (rare on
+BGG) will partially flatten. If we ever need that, switch to a state-
+machine pass that tracks `[quote=...]` / `[/quote]` pairs from the raw
+BBCode (currently stripped by stripMarkup).
+
 ## Known Limitations / Future Work
 
 - **Geeklist item links** — Built as `#item{id}` fragment. Not confirmed to

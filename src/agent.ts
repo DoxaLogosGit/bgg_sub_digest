@@ -78,12 +78,54 @@ export function formatThreadContent(
     lines.push(`[Post by ${a.username} on ${dateStr}]`);
     if (a.subject) lines.push(`Subject: ${a.subject}`);  // Only add if non-empty
     lines.push(`Link: ${a.link}`);
-    lines.push(a.body);
+    lines.push(renderQuotesAsBlockquotes(a.body));
     lines.push('');  // Blank line between articles for readability
   }
 
   // Array.join('\n') concatenates with newlines — Python: '\n'.join(lines)
   return lines.join('\n');
+}
+
+// ============================================================
+// renderQuotesAsBlockquotes — convert BGG "Author wrote:" patterns to markdown
+// ============================================================
+//
+// BGG renders quoted replies in its forum CSS as styled indented blocks; the
+// XML API returns them as inline text starting with "Author wrote:" followed
+// by the quoted content, then the new reply's text. After our stripMarkup
+// preserves paragraph breaks, the structure is typically:
+//
+//   Username wrote:
+//   <quoted text — possibly multi-paragraph>
+//
+//   <new reply text>
+//
+// We detect that pattern and rewrite the quote block as a markdown blockquote
+// (lines prefixed with `> `), so it renders visually distinct in the digest
+// markdown and in the email HTML.
+//
+// Heuristic: a "quote block" starts with a line matching `Author wrote:` and
+// extends until the next blank line — at which point the new reply begins.
+// Doesn't perfectly handle nested quotes (rare on BGG); single-level quotes
+// cover ~95% of cases and are the visual disaster the digest had before.
+function renderQuotesAsBlockquotes(body: string): string {
+  if (!body) return body;
+
+  // Regex matches `Author wrote:` at line start, captures author and the
+  // following content up to (but not including) the next blank line.
+  // - (?<=^|\n) — lookbehind for line start without consuming the newline.
+  // - [\w'`-]+   allows usernames with apostrophes, backticks, hyphens.
+  // - [\s\S]+?   non-greedy — stops at the first blank line or end of body.
+  // No /m flag, so $ in the lookahead only means end-of-string (not end-of-line).
+  const quoteRe = /(?<=^|\n)([\w'`-]+) wrote:\s*\n([\s\S]+?)(?=\n\s*\n|$)/g;
+
+  return body.replace(quoteRe, (_match, author: string, quoted: string) => {
+    const quotedLines = quoted
+      .split('\n')
+      .map((line) => `> ${line}`)
+      .join('\n');
+    return `> **${author} wrote:**\n${quotedLines}`;
+  });
 }
 
 // ============================================================
@@ -762,18 +804,38 @@ export function runClaudeDigest(
     if (!rawOutput) throw new Error('claude CLI returned empty output');
 
     // Save the raw JSON output to logs/ so we can post-mortem when the body
-    // comes back empty or malformed (e.g. the model looped on tool_use blocks
-    // without synthesizing a final text turn). The file path is logged so
-    // you can grep for it.
+    // comes back empty or malformed. Always save BEFORE any validation that
+    // might throw — this is the only copy of the response.
+    let rawPath = '';
     try {
       const logsDir = path.join(process.cwd(), 'logs');
       if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
-      const stamp   = new Date().toISOString().replace(/[:.]/g, '-');
-      const rawPath = path.join(logsDir, `claude-raw-${stamp}.json`);
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      rawPath = path.join(logsDir, `claude-raw-${stamp}.json`);
       fs.writeFileSync(rawPath, rawOutput, 'utf-8');
       log.debug('Claude raw JSON saved', { rawPath, bytes: rawOutput.length });
     } catch (writeErr) {
       log.warn('Could not save raw claude JSON', { err: String(writeErr) });
+    }
+
+    // Detect empty result — model completed but produced no text (hit max
+    // output tokens during synthesis, looped on tool calls, or stopped to
+    // ask a clarifying question). ?? won't catch empty string; check after saving.
+    {
+      let numTurns: number | undefined;
+      let hasEmptyResult = false;
+      try {
+        const quick = JSON.parse(rawOutput) as Record<string, unknown>;
+        numTurns = typeof quick['num_turns'] === 'number' ? quick['num_turns'] : undefined;
+        hasEmptyResult = 'result' in quick && !quick['result'];
+      } catch { /* fall through to the full parse below */ }
+      if (hasEmptyResult) {
+        throw new Error(
+          `claude CLI returned an empty result after ${numTurns ?? '?'} turn(s) — ` +
+          `model likely hit max_tokens during synthesis or looped on tool calls. ` +
+          `Raw response saved to ${rawPath || 'logs/claude-raw-*.json'}`,
+        );
+      }
     }
 
     log.debug('Claude file-based digest received', { outputLength: rawOutput.length });

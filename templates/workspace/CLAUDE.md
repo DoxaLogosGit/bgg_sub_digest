@@ -43,7 +43,8 @@ rows.
 2. **Read `manifest.json`** — get the full list of subscriptions to process.
 3. **Read every subscription file** referenced by `filePath` in the
    manifest. Read all of them, in order. Do NOT write any digest content
-   while reading — no progress narration, no partial sections.
+   while reading — no progress narration, no partial sections, no
+   clarifying questions. Just read.
 4. **After all files are read**, write the entire digest in a single
    response. The response is a one-shot stream — anything you write up
    front cannot be edited later, so do NOT write a Highlights placeholder
@@ -93,6 +94,10 @@ Within each category, group adjacent any subscriptions sharing the same
 
 ## Constraints
 
+- **This is a fully automated, non-interactive batch run. Do NOT ask
+  clarifying questions. Do NOT wait for user input. The instructions
+  here are complete — proceed immediately and make reasonable assumptions
+  if anything is ambiguous.**
 - Read ONLY the files referenced in this workspace. Do not explore the
   rest of the filesystem.
 - Do not write planning sentences ("Now I'll process...", "Let me start
