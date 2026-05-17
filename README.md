@@ -163,17 +163,22 @@ this file any time — it's re-read on every run.
 
 ## First run
 
-Set `headless: false` in `config.json` so you can see what's happening:
+Set `headless: false` in `config.json` so you can watch Chromium navigate BGG:
 
 ```bash
 npm start
 ```
 
-Chromium will open and navigate to BGG. If Cloudflare shows a challenge
-page, complete it manually. Your session is saved to `./bgg-browser-profile/`
-and reused on future runs — you should only need to do this once.
+Chromium will open and navigate to BGG. If Cloudflare shows a "Verify you are
+human" challenge, click through it. Your session and Cloudflare clearance cookie
+are saved to `./bgg-browser-profile/` and reused on future runs.
 
 After a successful first run, set `headless: true` and `clearSubs: true`.
+
+**If the Cloudflare clearance expires later** (typically after several days to a
+week), the script detects it, emails you an `[ACTION REQUIRED]` notification (if
+email is configured), and exits. Run `npm start -- --reauth` to fix it without
+changing `config.json` — `--reauth` opens Chromium visibly for just that one run.
 
 ### First-run setup for `--agent tallow`
 
@@ -219,6 +224,8 @@ Two CLI flags control which agent and which model produce the digest:
 |------|---------|-------|
 | `--agent <name>` | `claude` | `claude`, `claude-ollama`, or `tallow` |
 | `--model <id>` | `opus` (claude), `qwen3-coder-next:cloud` (claude-ollama / tallow) | Any model the agent can resolve |
+| `--reuse-data` | off | Skip the BGG scrape; rerun the agent against existing `./digest-data/` |
+| `--reauth` | off | Clear stale Cloudflare cookies and open Chromium visibly to solve the bot challenge |
 
 **Why three options?** A daily digest run on Claude Opus burns a meaningful
 chunk of your Claude Pro usage window. The Ollama-routed paths let you point
@@ -249,6 +256,10 @@ npm start -- --agent tallow
 # --reuse-data: skip the BGG scrape and rerun the agent against the
 # existing ./digest-data/manifest.json. Fast iteration on agent/model choice.
 npm start -- --agent claude-ollama --model nemotron-3-super:cloud --reuse-data
+
+# --reauth: fix a Cloudflare block — opens Chromium visibly so you can
+# solve the "Verify you are human" challenge and refresh the clearance cookie.
+npm start -- --reauth --agent tallow --model minimax-m2.5:cloud
 ```
 
 For Tallow, model resolution flows through `~/.tallow/models.json` and the
@@ -405,8 +416,21 @@ at `https://boardgamegeek.com/xmlapi/apiv2/requesttoken`.
 in progress (or crashed and left a stale lock). Delete `./bgg-digest.pid`
 and try again.
 
-**Cloudflare challenge on every run** — your browser profile cookies expired.
-Set `headless: false`, run once, and complete the challenge manually.
+**Cloudflare challenge blocking the digest** — BGG is behind Cloudflare, which
+issues a `cf_clearance` cookie that typically lasts days to a week. When it
+expires, the headless browser hits the challenge page and the script cannot
+proceed.
+
+If email is configured, you'll receive a `[ACTION REQUIRED] BGG Digest blocked
+by Cloudflare` notification automatically. To fix it, run with `--reauth`:
+
+```bash
+npm start -- --reauth --agent tallow --model minimax-m2.5:cloud
+```
+
+`--reauth` clears the stale clearance cookie and opens Chromium visibly so you
+can click "Verify you are human". After solving the challenge, the fresh cookie
+is saved to `./bgg-browser-profile/` and future headless cron runs work again.
 
 **Digest looks empty or missing subscriptions** — check `./logs/` for errors
 and inspect `./digest-data/manifest.json` to see what was fetched. The

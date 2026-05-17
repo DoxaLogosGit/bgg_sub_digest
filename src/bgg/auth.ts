@@ -214,6 +214,18 @@ export async function ensureLoggedIn(context: BrowserContext, config: AppConfig)
   }
 }
 
+// ---- clearCloudflareCookies ----------------------------------
+//
+// Deletes the cf_clearance cookie from the browser context so that
+// the next navigation triggers a fresh Cloudflare challenge. Used by
+// the --reauth flow: the browser opens visibly so the user can click
+// through the challenge, after which a fresh clearance cookie is saved
+// to the persistent profile and future headless runs work again.
+export async function clearCloudflareCookies(context: BrowserContext): Promise<void> {
+  await context.clearCookies({ name: 'cf_clearance' });
+  log.info('--reauth: cleared cf_clearance cookie — Cloudflare challenge will appear on next navigation');
+}
+
 // ---- saveDebugScreenshot (private helper) --------------------
 //
 // Saves a full-page screenshot to ./logs/ with a timestamp in the filename.

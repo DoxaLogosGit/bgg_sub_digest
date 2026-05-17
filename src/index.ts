@@ -32,7 +32,7 @@ import * as path from 'path';
 // `import { ... }` imports the actual runtime value.
 import { loadConfig, loadInterests } from './config';
 import { log } from './logger';
-import { createBrowserContext, ensureLoggedIn } from './bgg/auth';
+import { createBrowserContext, ensureLoggedIn, clearCloudflareCookies } from './bgg/auth';
 import { scrapeSubscriptions, clearSubscriptionShortcut } from './bgg/scraper';
 import {
   fetchThread,
@@ -185,6 +185,17 @@ async function main(): Promise<void> {
     // on agent/model choice — no need to re-scrape BGG between runs.
     const reuseData = process.argv.includes('--reuse-data');
 
+    // --reauth: clears saved BGG/Cloudflare cookies and forces headless:false
+    // so you can solve the Cloudflare bot challenge interactively. Use this
+    // when headless runs start failing with the Cloudflare block error.
+    // The fresh clearance cookie is saved to the browser profile automatically,
+    // so subsequent headless runs work again without --reauth.
+    const reauth = process.argv.includes('--reauth');
+    if (reauth) {
+      config.digest.headless = false;
+      log.info('--reauth: browser will open visibly so you can solve the Cloudflare challenge');
+    }
+
     log.info('Config loaded', {
       scheduleMode:  config.digest.scheduleMode,
       interestsFile: config.digest.interestsFile,
@@ -193,6 +204,7 @@ async function main(): Promise<void> {
       agent,
       model,
       reuseData,
+      reauth,
     });
 
     if (!interests) {
@@ -254,6 +266,12 @@ async function main(): Promise<void> {
     //     finally:
     //         await browser.close()
     try {
+      // When --reauth is set, clear the stale Cloudflare clearance cookie so
+      // the challenge fires in the now-visible browser window for the user to solve.
+      if (reauth) {
+        await clearCloudflareCookies(browser);
+      }
+
       await ensureLoggedIn(browser, config);
 
       // ---- 3. Scrape outstanding subscriptions ------------
@@ -593,6 +611,29 @@ async function main(): Promise<void> {
     // If the error is an Error object (not a plain thrown value), also log its stack trace.
     // `instanceof Error` checks the prototype chain — like Python's isinstance(err, Exception).
     if (err instanceof Error && err.stack) log.error(err.stack);
+
+    // Cloudflare bot-challenge block — send a notification email so the user
+    // knows to run `npm start -- --reauth` to refresh the clearance cookie.
+    const isCloudflareBlock =
+      err instanceof Error && err.message.includes('Cloudflare bot challenge');
+    if (isCloudflareBlock) {
+      const config = loadConfig();
+      if (config.email) {
+        const subject = '[ACTION REQUIRED] BGG Digest blocked by Cloudflare';
+        const body = `BGG's Cloudflare bot protection has blocked the headless browser.
+Your digest was **not** generated today.
+
+**To fix:** run the following command and solve the "Verify you are human" checkbox that appears:
+
+\`\`\`
+npm start -- --reauth --agent tallow --model minimax-m2.5:cloud
+\`\`\`
+
+After clicking through the challenge, the browser profile will be updated and future scheduled runs will work again.`;
+        await sendDigestEmail(config.email, subject, body).catch(() => undefined);
+        log.info('Cloudflare block notification email sent');
+      }
+    }
 
     // process.exit(1) exits immediately with code 1 (failure).
     // Python: sys.exit(1)

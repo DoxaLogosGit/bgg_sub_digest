@@ -365,6 +365,23 @@ export async function scrapeSubscriptions(
     try {
       await page.waitForSelector('gg-item-link-ui', { timeout: 30_000 });
     } catch {
+      // Before treating a timeout as "caught up", check whether Cloudflare's
+      // bot-verification challenge intercepted the page. If it did, the selector
+      // never appears but there are real notifications — silently returning empty
+      // would be wrong.
+      const bodyText = await page.evaluate(() => document.body?.innerText ?? '');
+      if (
+        bodyText.includes('Verify you are human') ||
+        bodyText.includes('security verification') ||
+        bodyText.includes('Cloudflare')
+      ) {
+        throw new Error(
+          'BGG subscriptions page was intercepted by a Cloudflare bot challenge. ' +
+          'The browser profile may need a fresh interactive login to establish a valid session. ' +
+          'Try running with a visible browser (headless:false) or deleting bgg-browser-profile/ and re-running.',
+        );
+      }
+
       // No notifications found within 30 seconds — assume we're caught up.
       hasNotifications = false;
 
