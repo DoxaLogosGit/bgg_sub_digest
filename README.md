@@ -102,7 +102,7 @@ Edit `config.json`:
 | `digest.outputDir` | `./digests` | Where to write the daily `.md` files |
 | `digest.scheduleMode` | `daily` | `"daily"` or `"weekly"` (informational only) |
 | `digest.maxNewItemsPerSubscription` | `15` | Hard cap on items per subscription file. Applied to every selection path (date-filter, notifiedIds, fallback) — keeps total digest context within the model's window so summarization stays clean. |
-| `digest.headless` | `true` | Set `false` on first run to watch Chromium and solve any Cloudflare challenge manually |
+| `digest.headless` | `true` | Leave `true`. The digest reaches BGG through its JSON API (no page navigation), so the browser only carries login cookies. `--reauth` flips this to `false` for a one-off interactive login when cookies expire. |
 | `digest.interestsFile` | `./interests.md` | Path to your interests file (see below) |
 | `digest.clearSubs` | `false` | `false` = log what would be cleared but don't click (safe / debug). `true` = click BGG's mark-as-read button on each notification row after processing. Turn on once you've verified targeting is correct and the script is generating digests you trust. |
 | `email.resendApiKey` | — | Resend API key (omit entire `email` block to disable) |
@@ -163,22 +163,26 @@ this file any time — it's re-read on every run.
 
 ## First run
 
-Set `headless: false` in `config.json` so you can watch Chromium navigate BGG:
+The digest authenticates to BGG with the login cookies saved in
+`./bgg-browser-profile/`. On a fresh setup that profile has no cookies yet, so
+do an interactive login once:
 
 ```bash
-npm start
+npm start -- --reauth
 ```
 
-Chromium will open and navigate to BGG. If Cloudflare shows a "Verify you are
-human" challenge, click through it. Your session and Cloudflare clearance cookie
-are saved to `./bgg-browser-profile/` and reused on future runs.
+`--reauth` opens Chromium visibly and logs into BGG with your `config.json`
+credentials, saving the session ("remember me") cookies to the profile. After
+that, normal headless runs (`npm start`) reach BGG entirely through its JSON
+API — no browser navigation, no Cloudflare challenge.
 
-After a successful first run, set `headless: true` and `clearSubs: true`.
+Once you've confirmed a run produces a digest you trust, set `clearSubs: true`
+so processed notifications are marked read on BGG.
 
-**If the Cloudflare clearance expires later** (typically after several days to a
-week), the script detects it, emails you an `[ACTION REQUIRED]` notification (if
-email is configured), and exits. Run `npm start -- --reauth` to fix it without
-changing `config.json` — `--reauth` opens Chromium visibly for just that one run.
+**If the login cookies expire later** (the remember-me cookies last ~30 days and
+refresh on use, so this is rare), `getAuthToken` fails, the script emails you an
+`[ACTION REQUIRED] session expired` notification (if email is configured), and
+exits. Run `npm start -- --reauth` again to refresh them.
 
 ### First-run setup for `--agent tallow`
 
@@ -224,8 +228,8 @@ Two CLI flags control which agent and which model produce the digest:
 |------|---------|-------|
 | `--agent <name>` | `claude` | `claude`, `claude-ollama`, or `tallow` |
 | `--model <id>` | `opus` (claude), `qwen3-coder-next:cloud` (claude-ollama / tallow) | Any model the agent can resolve |
-| `--reuse-data` | off | Skip the BGG scrape; rerun the agent against existing `./digest-data/` |
-| `--reauth` | off | Clear stale Cloudflare cookies and open Chromium visibly to solve the bot challenge |
+| `--reuse-data` | off | Skip the BGG fetch; rerun the agent against existing `./digest-data/` |
+| `--reauth` | off | Open Chromium visibly and log into BGG to refresh expired session cookies |
 
 **Why three options?** A daily digest run on Claude Opus burns a meaningful
 chunk of your Claude Pro usage window. The Ollama-routed paths let you point
@@ -253,13 +257,13 @@ npm start -- --agent claude-ollama --model qwen35-pi
 # Tallow with its default model
 npm start -- --agent tallow
 
-# --reuse-data: skip the BGG scrape and rerun the agent against the
+# --reuse-data: skip the BGG fetch and rerun the agent against the
 # existing ./digest-data/manifest.json. Fast iteration on agent/model choice.
 npm start -- --agent claude-ollama --model nemotron-3-super:cloud --reuse-data
 
-# --reauth: fix a Cloudflare block — opens Chromium visibly so you can
-# solve the "Verify you are human" challenge and refresh the clearance cookie.
-npm start -- --reauth --agent tallow --model minimax-m2.5:cloud
+# --reauth: refresh expired BGG login cookies — opens Chromium visibly and
+# logs in, so future headless API runs authenticate again.
+npm start -- --reauth
 ```
 
 For Tallow, model resolution flows through `~/.tallow/models.json` and the
@@ -310,22 +314,32 @@ runs if a previous one is still in progress.
 
 ## How it works
 
-### BGG notification page
+### BGG notification feed
 
-BGG's `/subscriptions` page shows **one `gg-notice` row per subscription** with
-outstanding activity. Rows are grouped under date headings ("Today", "Yesterday",
-"Apr 21, 2026") — the heading is the date of the oldest unread item, which becomes
-the cutoff for "show me everything newer than this."
+BGG's human-facing `/subscriptions` HTML page is behind a Cloudflare
+"verify you are human" challenge that a headless cron can't pass. So instead of
+scraping that page, the digest reads the same data BGG's own frontend uses — a
+JSON notification feed in an API zone that is *not* behind the challenge:
 
-Each row embeds the unread count in its text:
-- Threads: `"3 replies"` or `"1 Thread"` (brand-new, never read)
-- Geeklists: `"436 GeekList Items"` and/or `"1378 Comments"`
-- Blogs / file pages: `"3 replies"` (same as threads)
+1. `GET boardgamegeek.com/api/accounts/current` — authenticated by the saved
+   login cookies — returns a short-lived `authToken`.
+2. `GET api.geekdo.com/api/notice?sort=newest` — with `Authorization: GeekAuth
+   <authToken>` — returns the notice list plus `essentialItems` (resolved titles
+   and parent-game context for each item).
 
-The scraper captures:
-- The oldest-unread date from the section heading (`notificationDate`)
-- The unread count parsed from the row text (`unreadCount`)
-- The specific article/item ID encoded in the row's link URL (`notifiedItemIds`)
+These calls go through Playwright's `ctx.request` HTTP client, which shares the
+profile's cookie jar but performs **no page navigation** — so Cloudflare's
+HTML-page challenge is never triggered. See `DEVELOPMENT_NOTES.md` for the full
+discovery story.
+
+Each notice carries a `group` (the thread/geeklist it belongs to), the new
+`item`, a `trackingItem` (what to mark read to clear it), and a date.
+`transformNotices()` groups notices by `group` into one subscription each and
+captures:
+- The earliest notice date in the group (`notificationDate`)
+- The number of notices in the group (`unreadCount`)
+- The specific new article/item IDs (`notifiedItemIds`)
+- The title and parent-game context from `essentialItems`
 
 ### "What's new" detection
 
@@ -352,18 +366,22 @@ the over-summarization and repetition-collapse failures that happen when
 Ollama-served 200K-window models hit context pressure.
 
 Fallback chain for both types when the primary path returns nothing:
-1. `notifiedItemIds` — the specific item/article ID from the notice row URL
+1. `notifiedItemIds` — the specific item/article ID from the notice
 2. `recentItems(maxItems)` / `recentArticles(maxItems)` — most-recent N by date
 
-Subscriptions whose filter chain returns zero matches are skipped entirely — no
-empty stub sections in the digest.
+**Types we don't deep-fetch** (blog posts, file pages, videos, stand-alone
+boardgame/comment notices) and **content we can't fetch** (e.g. a 1000+ post
+thread whose new replies are past BGG's XML API window) are emitted as a
+lightweight stub — title, parent context, and link — so the reader still knows
+there's new activity. Because every processed notice is cleared on BGG after the
+digest sends, a stub ensures nothing the feed reported is silently dropped.
 
 ### Workspace-based agent invocation
 
-The script splits cleanly: **scrape phase** writes data files; **agent phase**
+The script splits cleanly: **fetch phase** writes data files; **agent phase**
 runs an analyst that drives itself off the workspace.
 
-After scraping, `./digest-data/` looks like this:
+After fetching, `./digest-data/` looks like this:
 
 ```
 digest-data/
@@ -373,7 +391,7 @@ digest-data/
 ├── templates/
 │   ├── section.md             ← per-subscription markdown format reference
 │   └── highlights.md          ← cross-subscription Highlights format reference
-├── thread-3702528.md          ← scraped subscription data files
+├── thread-3702528.md          ← per-subscription data files
 ├── geeklist-376148.md
 └── ...
 ```
@@ -416,21 +434,21 @@ at `https://boardgamegeek.com/xmlapi/apiv2/requesttoken`.
 in progress (or crashed and left a stale lock). Delete `./bgg-digest.pid`
 and try again.
 
-**Cloudflare challenge blocking the digest** — BGG is behind Cloudflare, which
-issues a `cf_clearance` cookie that typically lasts days to a week. When it
-expires, the headless browser hits the challenge page and the script cannot
-proceed.
-
-If email is configured, you'll receive a `[ACTION REQUIRED] BGG Digest blocked
-by Cloudflare` notification automatically. To fix it, run with `--reauth`:
+**Session expired / `[ACTION REQUIRED] session expired` email** — the digest
+authenticates to BGG's API with the login cookies in `./bgg-browser-profile/`.
+Those remember-me cookies last ~30 days and refresh on use, but if they lapse
+(or you've never logged in), `getAuthToken` fails and the run exits. Refresh
+them with an interactive login:
 
 ```bash
-npm start -- --reauth --agent tallow --model minimax-m2.5:cloud
+npm start -- --reauth
 ```
 
-`--reauth` clears the stale clearance cookie and opens Chromium visibly so you
-can click "Verify you are human". After solving the challenge, the fresh cookie
-is saved to `./bgg-browser-profile/` and future headless cron runs work again.
+This opens Chromium visibly, logs into BGG with your `config.json` credentials,
+and saves fresh cookies to `./bgg-browser-profile/` so future headless cron
+runs authenticate again. (Note: the digest itself never touches BGG's
+Cloudflare-gated HTML pages — it uses the JSON API — so the old "solve the bot
+challenge" step no longer applies.)
 
 **Digest looks empty or missing subscriptions** — check `./logs/` for errors
 and inspect `./digest-data/manifest.json` to see what was fetched. The
@@ -454,10 +472,11 @@ page, may not scroll to exact item depending on browser).
 bgg_sub_digest/
 ├── src/
 │   ├── bgg/
-│   │   ├── auth.ts           # Playwright login + browser profile
-│   │   ├── scraper.ts        # Notification page scraping
-│   │   ├── api.ts            # BGG XML API client (threads + geeklists)
-│   │   └── page-content.ts   # Playwright content fetch (blogs + file pages)
+│   │   ├── notifications.ts  # Notification feed API client + transform + clear
+│   │   ├── api.ts            # BGG XML API client (threads + geeklists) via ctx.request
+│   │   ├── auth.ts           # Browser profile + interactive --reauth login
+│   │   ├── scraper.ts        # (legacy) HTML /subscriptions scraping — kept dormant
+│   │   └── page-content.ts   # (legacy) Playwright DOM fetch — kept dormant
 │   ├── agent.ts             # File writing + Claude subprocess
 │   ├── digest.ts             # Markdown assembly + file output
 │   ├── index.ts              # Main orchestrator

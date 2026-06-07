@@ -1,6 +1,6 @@
 # BGG Subscription Digest — Development Notes
 
-*Last updated: 2026-04-30*
+*Last updated: 2026-06-07*
 
 ---
 
@@ -14,10 +14,16 @@ you still have to click into each subscription individually. This script
 fetches everything outstanding, writes it to structured files, and uses
 Claude to produce a single prioritized digest ordered by your interests.
 
-**Key constraint:** BGG is behind Cloudflare TLS fingerprinting. Plain
-Node.js `fetch()` gets rejected even with valid cookies. All HTTP to BGG
-must go through Playwright's Chromium renderer (`page.evaluate()`) so the
-TLS handshake comes from a real browser.
+**Key constraint:** BGG's human-facing HTML pages (e.g. `/subscriptions`) are
+behind a Cloudflare *interactive* "verify you are human" challenge that a
+headless cron can't pass. The fix (2026-06-07): don't touch those pages at all.
+BGG's own frontend reads notifications from a JSON API zone (`accounts/current`
++ `api.geekdo.com/api/notice`) and content from the XML API — neither is behind
+the challenge. All HTTP goes through Playwright's `ctx.request` client, which
+shares the persistent profile's cookie jar but makes **no page navigation**, so
+Cloudflare's HTML-page challenge is never triggered. See the
+"Cloudflare → notification API migration" change-log entry below for the full
+discovery story.
 
 ---
 
@@ -26,32 +32,40 @@ TLS handshake comes from a real browser.
 ### Flow
 
 ```
-1.  Playwright logs into BGG (persistent profile in ./bgg-browser-profile/)
-2.  Scraper reads /subscriptions — collects outstanding subscriptions,
-    notification dates, and unread counts from notification row text
-3.  For each subscription: BGG XML API fetches full content
+1.  Launch a Chromium persistent context (./bgg-browser-profile/) for its
+    cookie jar only — no page is navigated. (--reauth does an interactive
+    login here to refresh cookies; the normal path skips it.)
+2.  getAuthToken: GET boardgamegeek.com/api/accounts/current (cookie-authed)
+    -> authToken. Then fetchNoticeFeed: GET api.geekdo.com/api/notice?sort=newest
+    (Authorization: GeekAuth <authToken>) -> notices + essentialItems.
+3.  transformNotices: group notices by their `group` ref into BggSubscriptions
+    (titles from essentialItems) + a flat clearItems list.
+4.  For each subscription: content via the XML API (through ctx.request)
     - Threads:    XML API v2  /xmlapi2/thread?id=N&minarticledate=...
     - Geeklists:  XML API v1  /xmlapi/geeklist/N?comments=1 (filtered locally)
-    - Blogs/files: Playwright renders the page and extracts DOM content
-4.  Items filtered to "new since last visit" using notificationDate cutoff
-5.  Each subscription written to ./digest-data/[type]-[id].md
-6.  manifest.json written with metadata (title, url, itemCount, unreadCount, etc.)
-7.  claude --model <model> --dangerously-skip-permissions --print --output-format json
-    reads the manifest, reads each file with its Read tool, produces digest
-    (model defaults to opus; override with `npm start -- --model sonnet`)
+    - Other types / unfetchable content: a lightweight stub (title + link)
+5.  Items filtered to "new since last visit" using notificationDate cutoff
+6.  Each subscription written to ./digest-data/[type]-[id].md + manifest.json
+7.  Agent (claude / claude-ollama / tallow) reads the manifest + files,
+    produces the digest (model defaults to opus; override with --model)
 8.  Token usage stats appended to digest footer
 9.  Final markdown written to ./digests/bgg-digest-YYYY-MM-DD.md
 10. Digest emailed via Resend (optional — only if email config is present)
+11. ONLY after a successful digest+email: clearViewdates PATCHes
+    api.geekdo.com/api/viewdate to mark the processed notices read on BGG
+    (skipped when clearSubs:false). Clearing after send means a crash
+    re-reports rather than loses data.
 ```
 
 ### Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/bgg/auth.ts` | Playwright login + persistent browser profile |
-| `src/bgg/scraper.ts` | Scrapes /subscriptions; parses notification dates + unread counts |
-| `src/bgg/api.ts` | BGG XML API client; date-based item/article filters |
-| `src/bgg/page-content.ts` | Playwright DOM fetch for blogs + file pages (no XML API) |
+| `src/bgg/notifications.ts` | Notification feed API client (getAuthToken, fetchNoticeFeed, clearViewdates) + `transformNotices` (notices → BggSubscriptions) |
+| `src/bgg/api.ts` | BGG XML API client (via `ctx.request`); date-based item/article filters |
+| `src/bgg/auth.ts` | Persistent browser profile; interactive `--reauth` login |
+| `src/bgg/scraper.ts` | *(legacy)* HTML `/subscriptions` scraping — Cloudflare-blocked, kept dormant for rollback |
+| `src/bgg/page-content.ts` | *(legacy)* Playwright DOM fetch for blogs/files — kept dormant |
 | `src/agent.ts` | Writes digest-data files; invokes Claude; parses JSON response |
 | `src/digest.ts` | Wraps Claude's output with header; writes final .md file |
 | `src/email.ts` | Converts digest to HTML; sends via Resend API |
@@ -71,28 +85,31 @@ read (via `clearSubscriptionShortcut`), it won't appear next run.
 
 ## How "What's New" Detection Works
 
-BGG's notification page shows **one row per subscription** — a link to the
-**oldest unread** entry plus summary text like "3 more replies" or
-"12 new items, 5 new comments." It does NOT give you a complete list of every
-new item.
+The notice feed returns one entry per *event* (a new reply, a new geeklist item,
+etc.), each carrying a `group` (the thread/geeklist it belongs to), the new
+`item`, a `date`, and an `eventid`. `transformNotices` groups these by `group`
+into one subscription per thread/geeklist, then derives two signals.
 
-### Two signals extracted from each row
+### Two signals derived per subscription group
 
-**`notificationDate`** — the timestamp shown in the row text ("Apr 20",
-"2 hours ago", etc.). This is the date of the oldest unread entry, which
-makes it the right cutoff for "show me everything newer than this."
+**`notificationDate`** — the **earliest** notice date in the group. That's the
+oldest unseen entry, which makes it the right cutoff for "show me everything
+newer than this."
 
-**`unreadCount`** — BGG's advertised total of unread posts/items/comments,
-parsed from the row summary text. Included in the manifest so Claude knows
-the true scale. Still being tuned — check debug logs on first runs.
+**`unreadCount`** — the number of notices in the group (a real count of new
+events, not parsed from summary text as the old scraper did). Included in the
+manifest so the agent knows the true scale.
+
+**`notifiedItemIds`** — the specific new `item` ids in the group (article ids for
+threads, listitem ids for geeklists). More precise than the old single-row link.
 
 ### Filtering strategy — threads vs. geeklists differ
 
 **Threads** — IDs first, date as fallback:
 1. `notifiedItemIds` — BGG shows one row per thread WITH a specific article ID.
    Threads have many rows (one per new reply), so IDs are precise.
-2. `notificationDate` (30-day lookback via `minarticledate`) — catches brand-new
-   threads where the URL has no `/article/N` fragment yet.
+2. `notificationDate` (lookback via `minarticledate`, with a 2h buffer) — catches
+   brand-new threads with no specific new-reply id yet.
 3. Most-recent N by recency (last resort).
 
 **Geeklists** — date first, IDs as fallback:
@@ -702,7 +719,75 @@ BGG) will partially flatten. If we ever need that, switch to a state-
 machine pass that tracks `[quote=...]` / `[/quote]` pairs from the raw
 BBCode (currently stripped by stripMarkup).
 
+## Session 8 (June 2026) — Cloudflare → notification API migration
+
+### 26. Replaced the HTML scrape with BGG's JSON notification API
+
+**Problem:** BGG's Cloudflare protection escalated to an *interactive* "verify
+you are human" challenge on the `/subscriptions` HTML page. A headless cron
+can't solve it, so daily runs began failing at `scrapeSubscriptions`. The old
+`--reauth` recovery didn't help: it only worked headful (no human to click at
+3am), and was built around a `cf_clearance` cookie that BGG never durably sets
+(the profile only ever holds `bggusername` / `bggpassword` / `cc_cookie`).
+
+**Discovery (the key finding):** the Cloudflare interactive gate is **only** on
+the human-facing HTML pages. BGG's own Angular frontend reads notifications from
+a JSON API zone that is *not* gated — confirmed by capturing the frontend's
+XHRs during one interactive solve, and by curl (xmlapi returns a plain app-level
+401, api.geekdo.com a plain 404; only the HTML page returns the "Just a moment"
+interstitial).
+
+**The endpoints (all via `ctx.request`, sharing the profile cookie jar, no page
+navigation):**
+1. `GET boardgamegeek.com/api/accounts/current` (cookie-authed) → `authToken`.
+   Verified to work with only the long-lived remember-me cookies (no live
+   `SessionID`) — i.e. the real unattended cron state.
+2. `GET api.geekdo.com/api/notice?sort=newest` (`Authorization: GeekAuth
+   <authToken>`) → `notices` + `essentialItems` (resolved titles/breadcrumbs).
+3. `xmlapi`/`xmlapi2` for thread/geeklist content (`Authorization: Bearer
+   <apiKey>`) — also reachable via `ctx.request`, so the browser page is gone.
+4. `PATCH api.geekdo.com/api/viewdate` `{"<type>":["<id>"...]}` (GeekAuth) →
+   marks notices read. Batched multi-type in one call. Replaces the old
+   `clearSubscriptionShortcut` DOM click.
+
+**Feed quirks worth knowing:**
+- No server-side paging — `notice?sort=newest` returns the current notices
+  (~24–35); every offset/cursor/date param is ignored. A `viewdate` clear DOES
+  remove an item from the feed, so the drain model is fetch → process → clear →
+  refetch, but for a daily cron a single pull is plenty.
+- No per-notice read/unread flag; only a global `numunread` count. Feed mixes a
+  few already-read items in. Grouping + clearing-after-send handles dedup.
+- `group` is the grouping/fetch unit (thread for replies, geeklist for items);
+  `trackingItem` is what to PATCH to clear (e.g. an article's trackingItem is
+  its parent thread). `transformNotices` keys off these.
+
+**Behavior changes:**
+- `clearViewdates` runs ONLY after a successful digest+email (was per-sub inside
+  the loop). Crash → re-report next run rather than lose data.
+- Unfetchable content (1000+ post threads past the XML API window) and
+  no-deep-fetch types (blog/file/video/comment) now emit a stub entry instead
+  of being dropped — important because everything in the feed gets cleared.
+- `--reauth` is now an interactive **login** refresh (for ~30-day remember-me
+  cookie expiry), not a Cloudflare-cookie reset.
+- Old `scraper.ts` / `page-content.ts` / `auth.ts:clearCloudflareCookies` left
+  dormant for rollback. New code in `src/bgg/notifications.ts` (+ unit test
+  `notifications.transform.test.ts`).
+
+**Abandoned approach:** running the cron headful under `xvfb` was tried first,
+but the challenge is interactive — a virtual display still has no human to click
+it, so it can't work unattended. The API route sidesteps the gate entirely.
+
 ## Known Limitations / Future Work
+
+- **Notice feed is not paginated** — `notice?sort=newest` returns only the
+  current window (~24–35 items), no working page/cursor param. Fine for a daily
+  cron (≪ one day of activity), but a long-idle gap could exceed the window. The
+  clear-and-refetch drain loop would cover it if ever needed.
+
+- **Huge threads (1000+ posts)** — new replies can fall past BGG's XML API
+  window (`minarticledate` returns nothing); these surface as stubs ("new
+  activity, go look") rather than summarized content. Pre-existing BGG API
+  limit, not specific to the API migration.
 
 - **Geeklist item links** — Built as `#item{id}` fragment. Not confirmed to
   scroll to the right item on all browsers. Does not cause 404s.
