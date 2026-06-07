@@ -32,8 +32,13 @@ import * as path from 'path';
 // `import { ... }` imports the actual runtime value.
 import { loadConfig, loadInterests } from './config';
 import { log } from './logger';
-import { createBrowserContext, ensureLoggedIn, clearCloudflareCookies } from './bgg/auth';
-import { scrapeSubscriptions, clearSubscriptionShortcut } from './bgg/scraper';
+import { createBrowserContext, ensureLoggedIn } from './bgg/auth';
+import {
+  getAuthToken,
+  fetchNoticeFeed,
+  transformNotices,
+  clearViewdates,
+} from './bgg/notifications';
 import {
   fetchThread,
   fetchGeeklist,
@@ -49,11 +54,10 @@ import {
   installWorkspaceTemplate,
   runDigest,
 } from './agent';
-import { fetchPageContent, formatPageContent } from './bgg/page-content';
 // `import type` imports only the TypeScript type, not runtime code — erased at compile time.
 // Python: from ./agent import ManifestEntry
 import type { ManifestEntry, DigestResult, AgentName } from './agent';
-import type { BggGeeklistItem, BggThreadArticle } from './types';
+import type { BggGeeklistItem, BggThreadArticle, BggSubscription } from './types';
 import { buildMarkdown, writeDigest } from './digest';
 import { sendDigestEmail, buildEmailSubject } from './email';
 
@@ -185,15 +189,17 @@ async function main(): Promise<void> {
     // on agent/model choice — no need to re-scrape BGG between runs.
     const reuseData = process.argv.includes('--reuse-data');
 
-    // --reauth: clears saved BGG/Cloudflare cookies and forces headless:false
-    // so you can solve the Cloudflare bot challenge interactively. Use this
-    // when headless runs start failing with the Cloudflare block error.
-    // The fresh clearance cookie is saved to the browser profile automatically,
-    // so subsequent headless runs work again without --reauth.
+    // --reauth: recovery path for when the persisted BGG login cookies expire.
+    // The digest reaches BGG entirely through the API zone using the remember-me
+    // cookies in the browser profile (no Cloudflare, no browser navigation). Those
+    // cookies last ~30 days and refresh on use, but if they ever lapse,
+    // getAuthToken() fails. Running with --reauth opens a visible browser and
+    // performs an interactive login to mint fresh cookies into the profile, after
+    // which normal headless cron runs work again.
     const reauth = process.argv.includes('--reauth');
     if (reauth) {
       config.digest.headless = false;
-      log.info('--reauth: browser will open visibly so you can solve the Cloudflare challenge');
+      log.info('--reauth: opening a visible browser to refresh the BGG login cookies');
     }
 
     log.info('Config loaded', {
@@ -249,72 +255,46 @@ async function main(): Promise<void> {
       return;
     }
 
-    // ---- 2. Launch browser and log into BGG ---------------
-
-    // createBrowserContext() opens Chromium with the persistent profile.
-    // `await` pauses this function until the Promise resolves (browser is ready).
-    // Python: browser = await create_browser_context(config)
+    // ---- 2. Launch a (browserless) BGG session ------------
+    //
+    // We still launch a Chromium persistent context, but ONLY for its cookie
+    // jar — every BGG call below goes through browser.request (Playwright's HTTP
+    // client) against BGG's API zone, which is NOT behind Cloudflare's HTML-page
+    // challenge. No page is ever navigated, so there's nothing for Cloudflare to
+    // gate and no display/xvfb needed.
     const browser = await createBrowserContext(config);
 
-    // `try { ... } finally { ... }`:
-    //   The finally block runs whether we succeed, error, or return early.
-    //   Here it ensures we always call browser.close() — like a context manager.
-    //
-    //   Python equivalent:
-    //     try:
-    //         ...
-    //     finally:
-    //         await browser.close()
+    // `try { ... } finally { ... }` guarantees browser.close() runs (Python:
+    // try/finally). The finally is at the very bottom of this block.
     try {
-      // When --reauth is set, clear the stale Cloudflare clearance cookie so
-      // the challenge fires in the now-visible browser window for the user to solve.
+      // --reauth recovery: if the persisted login cookies have expired, open a
+      // visible browser and log in interactively to refresh them. Skipped on the
+      // normal headless path — the API session below uses the existing cookies.
       if (reauth) {
-        await clearCloudflareCookies(browser);
+        await ensureLoggedIn(browser, config);
       }
 
-      await ensureLoggedIn(browser, config);
-
-      // ---- 3. Scrape outstanding subscriptions ------------
-
-      // Destructuring assignment: unpack the object returned by scrapeSubscriptions().
-      // Python: result = await scrape_subscriptions(browser, config)
-      //         subscriptions = result['subscriptions']
-      //         sub_page = result['sub_page']
-      const { subscriptions, subPage } = await scrapeSubscriptions(browser, config);
+      // ---- 3. Fetch the notification feed via the API -----
+      //
+      // getAuthToken trades the profile's BGG cookies for a GeekAuth token;
+      // fetchNoticeFeed pulls the notice list; transformNotices groups it into
+      // the same BggSubscription shape the rest of the pipeline already expects,
+      // plus the flat clearItems list we PATCH *after* the digest is sent.
+      const apiRequest = browser.request;
+      const authToken  = await getAuthToken(apiRequest);
+      const feed       = await fetchNoticeFeed(apiRequest, authToken);
+      const { subscriptions, clearItems } = transformNotices(feed);
+      log.info(`Fetched ${feed.notices.length} notice(s) → ${subscriptions.length} subscription(s)`);
 
       // If BGG shows no outstanding notifications, there's nothing to do.
       if (subscriptions.length === 0) {
         log.info('No outstanding subscriptions — nothing to process.');
-        // Close the pages and browser before exiting
-        await subPage.close();
         await browser.close();
         releaseLock();
         return;  // `return` in an async void function = normal exit (no digest written)
       }
 
-      // ---- 4. Open a separate tab for BGG API requests ----
-      //
-      // We need a Chromium page that's already on boardgamegeek.com so that
-      // fetch() calls inside page.evaluate() go out as same-origin requests with
-      // BGG's cookies automatically included.
-      //
-      // Using a separate tab from the subscriptions page so we don't disrupt
-      // the shortcut-clearing navigation that happens on subPage later.
-      const apiPage = await browser.newPage();
-      try {
-        // Navigate to BGG's homepage — just needs to be the same origin.
-        // 'domcontentloaded' = don't wait for all assets, just the HTML.
-        await apiPage.goto('https://boardgamegeek.com', {
-          waitUntil: 'domcontentloaded',
-          timeout: 30_000,
-        });
-      } catch (err) {
-        // Navigation failure is non-fatal — the API fetches might still work
-        // if the browser already has valid cookies from the profile.
-        log.warn('API page navigation failed — API calls may fail', { err: String(err) });
-      }
-
-      // ---- 5. Fetch content for each outstanding subscription
+      // ---- 4. Fetch content for each outstanding subscription
 
       // The directory where each subscription's data is written as its own file.
       // Cleared and recreated each run so stale files from prior runs never linger.
@@ -336,6 +316,33 @@ async function main(): Promise<void> {
       // Stored in a local variable for convenience — avoids repeating
       // `config.digest.maxNewItemsPerSubscription` everywhere.
       const maxItems = config.digest.maxNewItemsPerSubscription;
+
+      // writeStub — emit a lightweight "there's new activity here" entry.
+      // Used for (a) types we don't deep-fetch (blog/filepage/video/…) and
+      // (b) thread/geeklist whose content we couldn't fetch (e.g. a 1000+ post
+      // thread whose new replies are past BGG's XML API window). Because we
+      // clear EVERY feed item after the digest, a stub guarantees nothing the
+      // notice feed reported silently disappears — matches the no-data-loss goal.
+      // `BggSubscription` is the type of `sub`; `reason` annotates why it's a stub.
+      const writeStub = (sub: BggSubscription, reason?: string): void => {
+        const stubMarkdown =
+          `# ${sub.title}\n\n` +
+          `New activity on a BGG ${sub.type} you subscribe to${reason ? ` (${reason})` : ''}.\n\n` +
+          (sub.parentName ? `**Context:** ${sub.parentName}\n\n` : '') +
+          `**Link:** ${sub.url}\n`;
+        const filePath = writeSubscriptionFile(sub, stubMarkdown, digestDataDir);
+        manifestEntries.push({
+          subscriptionId:   sub.id,
+          type:             sub.type,
+          title:            sub.title,
+          url:              sub.url,
+          filePath,
+          itemCount:        sub.unreadCount || 1,
+          unreadCount:      sub.unreadCount,
+          notificationDate: sub.notificationDate?.toISOString() ?? null,
+          parentName:       sub.parentName,
+        });
+      };
 
       // `for...of` over the subscriptions array — same as Python's for loop.
       for (const sub of subscriptions) {
@@ -365,9 +372,11 @@ async function main(): Promise<void> {
           const lookback = sub.notificationDate
             ? new Date(sub.notificationDate.getTime() - BUFFER_HOURS * 3600 * 1000)
             : null;
-          const thread = await fetchThread(sub.id, config.bgg.apiKey, apiPage, lookback);
+          const thread = await fetchThread(sub.id, config.bgg.apiKey, apiRequest, lookback);
           if (!thread) {
-            log.warn(`Could not fetch thread ${sub.id} — skipping`);
+            log.warn(`Could not fetch thread ${sub.id} — emitting stub so it isn't lost`);
+            writeStub(sub, 'content fetch failed');
+            await sleep(1_000);
             continue;  // `continue` skips the rest of this loop iteration — same as Python
           }
 
@@ -433,14 +442,21 @@ async function main(): Promise<void> {
               parentName:       sub.parentName,
             });
           } else {
-            log.info(`Skipping ${sub.type} ${sub.id} "${thread.subject}" — no new articles matched`);
+            // The notice feed says there's new activity but the XML API window
+            // returned nothing (e.g. a 1000+ post thread whose new replies are
+            // past the API's reach). Stub it rather than drop it — we're about
+            // to clear it on BGG, so a stub keeps the reader informed.
+            log.info(`Thread ${sub.id} "${thread.subject}" — no fetchable new articles; emitting stub`);
+            writeStub({ ...sub, title: thread.subject || sub.title }, 'new replies beyond API window');
           }
 
         // ---- Geeklist subscriptions ----
         } else if (sub.type === 'geeklist') {
-          const geeklist = await fetchGeeklist(sub.id, config.bgg.apiKey, apiPage);
+          const geeklist = await fetchGeeklist(sub.id, config.bgg.apiKey, apiRequest);
           if (!geeklist) {
-            log.warn(`Could not fetch geeklist ${sub.id} — skipping`);
+            log.warn(`Could not fetch geeklist ${sub.id} — emitting stub so it isn't lost`);
+            writeStub(sub, 'content fetch failed');
+            await sleep(1_000);
             continue;
           }
 
@@ -514,67 +530,30 @@ async function main(): Promise<void> {
               parentName:       sub.parentName,
             });
           } else {
-            log.info(`Skipping ${sub.type} ${sub.id} "${geeklist.title}" — no new items matched`);
+            log.info(`Geeklist ${sub.id} "${geeklist.title}" — no fetchable new items; emitting stub`);
+            writeStub({ ...sub, title: geeklist.title }, 'new items beyond API window');
           }
 
-        // ---- Blog post / file page subscriptions ----
+        // ---- Stub subscriptions (everything else) ----
         //
-        // BGG XML API has no endpoint for these, so we render the page in
-        // Playwright and pull the post body + comments straight out of the
-        // DOM. apiPage is already on boardgamegeek.com so navigation reuses
-        // the same authenticated session. A failure leaves the digest with
-        // one fewer section but doesn't kill the run.
-        } else if (sub.type === 'blog' || sub.type === 'filepage') {
-          const kind = sub.type === 'blog' ? 'Blog Post' : 'File Page';
-          const fetched = await fetchPageContent(sub.url, apiPage);
-          if (!fetched) {
-            log.warn(`Could not fetch ${kind.toLowerCase()} content`, { url: sub.url });
-          } else {
-            const pageMarkdown = formatPageContent(kind, sub.url, fetched);
-            const filePath     = writeSubscriptionFile(sub, pageMarkdown, digestDataDir);
-            const itemCount    = (fetched.body ? 1 : 0) + fetched.comments.length;
-            manifestEntries.push({
-              subscriptionId:   sub.id,
-              type:             sub.type,
-              title:            fetched.title || sub.title,
-              url:              sub.url,
-              filePath,
-              itemCount,
-              unreadCount:      sub.unreadCount,
-              notificationDate: sub.notificationDate?.toISOString() ?? null,
-              parentName:       sub.parentName,
-            });
-            log.info(`${kind} "${fetched.title || sub.title}" — ${fetched.comments.length} comment(s) captured`);
-          }
-
-        // ---- Boardgame / boardgameexpansion stand-alone subscriptions ----
+        // blog / filepage / video / boardgame / comment-on-thing / unknown:
+        // types with no clean XML API for the body. The notice feed already
+        // gave us the title, URL, and parent context (via essentialItems), so
+        // we emit a lightweight "there's new activity here" stub. The digest
+        // still surfaces it so the reader knows to check it manually — we just
+        // don't fetch and summarize the full content.
         //
-        // These are rare in practice — most game-related notifications come
-        // paired with a /thread URL which we capture via the thread branch.
-        // A pure /boardgame notification means BGG flagged something on the
-        // game's main page (description edit, new file, etc.) without a
-        // specific entry to summarize. We still log so the user knows.
-        } else if (sub.type === 'boardgame' || sub.type === 'boardgameexpansion') {
-          log.info(`Stand-alone ${sub.type} subscription — no specific content URL`, {
-            id: sub.id,
-            title: sub.title,
-            url: sub.url,
-            unreadCount: sub.unreadCount,
-          });
+        // (Previously blog/filepage were scraped from the rendered DOM via
+        // Playwright. That required navigating the Cloudflare-gated HTML site,
+        // which the API-only flow deliberately avoids.)
+        } else {
+          writeStub(sub);
+          log.info(`Stub ${sub.type} subscription "${sub.rowText ?? sub.title}" — new activity, no deep fetch`);
         }
 
-        // Tell BGG this subscription has been acknowledged.
-        // With clearSubs: false (default), this just logs — no actual clicking.
-        await clearSubscriptionShortcut(subPage, sub, config.digest.clearSubs);
-
         // Polite pause between API calls so we don't hammer BGG's servers.
-        // 1 second between each subscription — with 57 subs, this adds ~1 minute.
         await sleep(1_000);
       }
-
-      // Close both browser tabs now that we're done fetching
-      await apiPage.close();
-      await subPage.close();
 
       // ---- 6. Write manifest and run agent with file access ----------
 
@@ -590,6 +569,18 @@ async function main(): Promise<void> {
         agent, model, manifestPath, interests, manifestEntries, digestDataDir,
         config, runStart,
       );
+
+      // ---- 7. Clear the processed notices on BGG --------------
+      //
+      // ONLY reached if the digest above was built and emailed without throwing,
+      // so a crash mid-run never clears un-reported items (we'd rather re-report
+      // a duplicate next run than lose data). With clearSubs:false this is a
+      // no-op. We clear ALL items from this feed pull (one batched PATCH).
+      if (config.digest.clearSubs) {
+        await clearViewdates(apiRequest, authToken, clearItems);
+      } else {
+        log.info(`[clearSubs:false] Would clear ${clearItems.length} notice item(s) — skipping`);
+      }
 
     } finally {
       // Close the browser regardless of success or failure.
@@ -612,26 +603,32 @@ async function main(): Promise<void> {
     // `instanceof Error` checks the prototype chain — like Python's isinstance(err, Exception).
     if (err instanceof Error && err.stack) log.error(err.stack);
 
-    // Cloudflare bot-challenge block — send a notification email so the user
-    // knows to run `npm start -- --reauth` to refresh the clearance cookie.
-    const isCloudflareBlock =
-      err instanceof Error && err.message.includes('Cloudflare bot challenge');
-    if (isCloudflareBlock) {
+    // Expired-session block — the digest reaches BGG via the API zone using the
+    // persisted remember-me cookies. Those last ~30 days and refresh on use, but
+    // if they ever lapse, getAuthToken() / the notice feed returns an auth error.
+    // Email the user so they know to run `--reauth` (interactive login refresh).
+    const isAuthExpired =
+      err instanceof Error &&
+      (err.message.includes('accounts/current') ||
+       err.message.includes('authToken') ||
+       err.message.includes('notice feed returned 401') ||
+       err.message.includes('notice feed returned 403'));
+    if (isAuthExpired) {
       const config = loadConfig();
       if (config.email) {
-        const subject = '[ACTION REQUIRED] BGG Digest blocked by Cloudflare';
-        const body = `BGG's Cloudflare bot protection has blocked the headless browser.
-Your digest was **not** generated today.
+        const subject = '[ACTION REQUIRED] BGG Digest — session expired';
+        const body = `The BGG digest could not authenticate to BGG's API.
+Your saved login cookies have likely expired, so no digest was generated today.
 
-**To fix:** run the following command and solve the "Verify you are human" checkbox that appears:
+**To fix:** run the following once to refresh the login (a browser opens for you to sign in):
 
 \`\`\`
-npm start -- --reauth --agent tallow --model minimax-m2.5:cloud
+npm start -- --reauth
 \`\`\`
 
-After clicking through the challenge, the browser profile will be updated and future scheduled runs will work again.`;
+After signing in, the browser profile is updated and future scheduled runs work again.`;
         await sendDigestEmail(config.email, subject, body).catch(() => undefined);
-        log.info('Cloudflare block notification email sent');
+        log.info('Session-expired notification email sent');
       }
     }
 

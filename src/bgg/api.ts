@@ -42,7 +42,13 @@
 import * as xml2js from 'xml2js';
 
 // `type Page` from playwright — a browser tab. We use it only for page.evaluate().
-import type { Page } from 'playwright';
+// APIRequestContext is Playwright's HTTP client (think requests.Session). We
+// use ctx.request — it shares the persistent profile's cookie jar but makes no
+// page navigation, so BGG's API zone is reached without tripping Cloudflare's
+// HTML-page challenge. (Previously these fetches ran inside page.evaluate() to
+// borrow Chromium's TLS fingerprint; ctx.request reaches the API zone cleanly,
+// so the browser page is no longer needed.)
+import type { APIRequestContext } from 'playwright';
 import { log } from '../logger';
 
 // Import our shared type definitions (interfaces defined in types.ts)
@@ -67,45 +73,27 @@ const RETRY_DELAYS_MS = [2_000, 4_000, 8_000, 16_000, 30_000];
 // fetchXml — low-level HTTP fetch that handles BGG's 202 behavior
 // ============================================================
 //
-// Runs fetch() inside Chromium (via page.evaluate()) to bypass
-// Cloudflare TLS fingerprinting. Returns the raw XML string on success.
+// Uses ctx.request (Playwright's HTTP client, sharing the profile's cookie jar)
+// to reach BGG's XML API zone — which is NOT behind Cloudflare's HTML-page
+// challenge. Returns the raw XML string on success.
 //
 // `for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++)`
 // is a C-style for loop. Python equivalent: for attempt in range(6):
-async function fetchXml(url: string, page: Page, apiKey: string): Promise<string> {
+async function fetchXml(url: string, request: APIRequestContext, apiKey: string): Promise<string> {
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
 
-    // page.evaluate() runs a callback INSIDE Chromium's renderer process.
-    // The callback cannot access variables from the outer Node.js scope
-    // directly — data must be passed via the second argument (serialized to JSON).
-    //
-    // Python Playwright equivalent:
-    //   result = page.evaluate("""async (args) => {
-    //     r = await fetch(args['fetchUrl'], {...})
-    //     return {'status': r.status, 'text': await r.text()}
-    //   }""", {'fetchUrl': url, 'token': api_key})
-    //
-    // The TypeScript arrow function syntax `async (args: { ... }) => { ... }`
-    // is an anonymous async function — same as Python's async lambda (if it existed).
-    const result = await page.evaluate(async (args: { fetchUrl: string; token: string }) => {
-      // Everything inside here runs in the BROWSER, not in Node.js.
-      // `fetch` here is the browser's built-in Fetch API (not Node's).
-      const r = await fetch(args.fetchUrl, {
-        headers: {
-          'Accept': 'application/xml, text/xml, */*',
-          // BGG's XML API requires Authorization: Bearer, NOT a ?key= query param.
-          // Sending the key as ?key= returns 401.
-          'Authorization': `Bearer ${args.token}`,
-        },
-        // `credentials: 'include'` means "send all cookies for this origin".
-        // Since the page is on boardgamegeek.com, the browser sends
-        // cf_clearance and SessionID automatically.
-        credentials: 'include',
-      });
-      // Return a plain serializable object (not a Response — that can't cross
-      // the browser↔Node boundary). page.evaluate() serializes this to JSON.
-      return { status: r.status, text: await r.text() };
-    }, { fetchUrl: url, token: apiKey });
+    // request.get() is a plain HTTP GET from Node (no browser page involved).
+    // The cookie jar comes from the persistent context this request belongs to.
+    // Python equivalent: session.get(url, headers={...})
+    const res = await request.get(url, {
+      headers: {
+        'Accept': 'application/xml, text/xml, */*',
+        // BGG's XML API requires Authorization: Bearer, NOT a ?key= query param.
+        // Sending the key as ?key= returns 401.
+        'Authorization': `Bearer ${apiKey}`,
+      },
+    });
+    const result = { status: res.status(), text: await res.text() };
 
     if (result.status === 200) {
       return result.text;  // Success — return the XML string
@@ -252,7 +240,7 @@ function truncate(text: string, max = 1000): string {
 export async function fetchThread(
   threadId: number,
   apiKey: string,
-  page: Page,
+  request: APIRequestContext,
   // Optional date cutoff. When provided, BGG's XML API returns only articles
   // posted on or after this date — which is what we actually want for digest
   // purposes. Long threads (Dad Jokes, 13K+ posts since 2018) otherwise return
@@ -273,7 +261,7 @@ export async function fetchThread(
   // Fetch the XML string, returning null on network/HTTP errors
   let xmlStr: string;
   try {
-    xmlStr = await fetchXml(url, page, apiKey);
+    xmlStr = await fetchXml(url, request, apiKey);
   } catch (err) {
     log.error('Failed to fetch thread', { threadId, err: String(err) });
     return null;
@@ -389,7 +377,7 @@ export async function fetchThread(
 //
 // Returns null if the geeklist can't be fetched or parsed.
 
-export async function fetchGeeklist(geeklistId: number, apiKey: string, page: Page): Promise<BggGeeklist | null> {
+export async function fetchGeeklist(geeklistId: number, apiKey: string, request: APIRequestContext): Promise<BggGeeklist | null> {
   // `?comments=1` tells the API to include comment data for each item.
   // Without it, comments are omitted from the response.
   const url = `${BGG_V1}/geeklist/${geeklistId}?comments=1`;
@@ -397,7 +385,7 @@ export async function fetchGeeklist(geeklistId: number, apiKey: string, page: Pa
 
   let xmlStr: string;
   try {
-    xmlStr = await fetchXml(url, page, apiKey);
+    xmlStr = await fetchXml(url, request, apiKey);
   } catch (err) {
     log.error('Failed to fetch geeklist', { geeklistId, err: String(err) });
     return null;
