@@ -742,7 +742,14 @@ async function runAgentAndWriteDigest(
 // with thousands separators — Python: f"{result.input_tokens:,}"
 // Template literals: `${expr}` — Python: f"{expr}"
 function formatTokenUsage(result: DigestResult, agent: AgentName, model: string): string {
-  const agentStr = `Agent: ${agent} (${model})`;
+  // Prefer the model the agent ACTUALLY used (reported in its output) over the
+  // one we requested — tallow can silently fall back to its default. If they
+  // differ (compared on the bare model name, ignoring any provider/ prefix),
+  // show both so the fallback is visible in the digest itself.
+  const bare = (m: string) => m.split('/').pop();
+  const agentStr = result.actualModel && bare(result.actualModel) !== bare(model)
+    ? `Agent: ${agent} (${result.actualModel}, requested ${model})`
+    : `Agent: ${agent} (${result.actualModel ?? model})`;
 
   // If both token counts are 0, JSON parsing failed — show a fallback that
   // still identifies the agent/model so a degenerate run is still labeled.

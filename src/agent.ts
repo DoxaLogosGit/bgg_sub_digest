@@ -302,6 +302,13 @@ export interface DigestResult {
   completedCount?: number;             // sections successfully rendered
   totalCount?:     number;             // total subscriptions in manifest
   skipped?:        DigestSkippedEntry[];
+
+  // The model the agent ACTUALLY used, as reported in its own output — not the
+  // `--model` we asked for. tallow can silently fall back to its default when
+  // the requested model is unavailable, so the footer should report what really
+  // ran. Format: "provider/model" (e.g. "ollama/minimax-m3:cloud") when the
+  // provider is known. Undefined when the agent doesn't report it (plain claude).
+  actualModel?: string;
 }
 
 // ============================================================
@@ -1109,7 +1116,10 @@ export async function runTallowDigest(
   type TallowContent = { type: string; text?: string };
   type TallowEvent = {
     type: string;
-    message?: { content?: TallowContent[]; usage?: TallowUsage };
+    // `model` / `provider` are what tallow ACTUALLY routed to for this turn —
+    // the source of truth for the footer, since tallow may silently fall back
+    // to its default when the requested model can't be resolved.
+    message?: { content?: TallowContent[]; usage?: TallowUsage; model?: string; provider?: string };
   };
 
   // Wall-clock the run so we can populate durationMs (tallow's JSONL doesn't
@@ -1208,6 +1218,8 @@ export async function runTallowDigest(
   // in a single final response, so the last turn with text SHOULD be the
   // synthesis.
   let body = '';
+  let synthesisModel: string | undefined;     // model of the turn that wrote the digest
+  let synthesisProvider: string | undefined;
   for (let i = turnEnds.length - 1; i >= 0; i--) {
     const text = (turnEnds[i].message?.content ?? [])
       .filter((c) => c.type === 'text' && typeof c.text === 'string' && c.text.trim().length > 0)
@@ -1215,6 +1227,8 @@ export async function runTallowDigest(
       .join('\n');
     if (text) {
       body = text;
+      synthesisModel    = turnEnds[i].message?.model;
+      synthesisProvider = turnEnds[i].message?.provider;
       break;
     }
   }
@@ -1236,9 +1250,40 @@ export async function runTallowDigest(
     costUsd      += u.cost?.total ?? 0;
   }
 
+  // ---- Determine the model tallow ACTUALLY used ----
+  // Prefer the synthesis turn (the one that wrote the digest); fall back to the
+  // last turn that reported a model. Combine with provider so it's comparable to
+  // the requested id (e.g. "ollama/minimax-m3:cloud").
+  let reportedModel    = synthesisModel;
+  let reportedProvider = synthesisProvider;
+  if (!reportedModel) {
+    for (let i = turnEnds.length - 1; i >= 0; i--) {
+      if (turnEnds[i].message?.model) {
+        reportedModel    = turnEnds[i].message?.model;
+        reportedProvider = turnEnds[i].message?.provider;
+        break;
+      }
+    }
+  }
+  const actualModel = reportedModel
+    ? (reportedProvider ? `${reportedProvider}/${reportedModel}` : reportedModel)
+    : undefined;
+
+  // Warn loudly if tallow silently routed to a different model than requested —
+  // compare on the bare model name (after the last '/') so provider prefixes
+  // don't cause false mismatches.
+  const bare = (m: string) => m.split('/').pop();
+  if (actualModel && bare(actualModel) !== bare(model)) {
+    log.warn(`tallow used a DIFFERENT model than requested — fell back?`, {
+      requested: model,
+      actual:    actualModel,
+    });
+  }
+
   return {
     body: postProcessDigestBody(body),
     inputTokens, outputTokens, costUsd, durationMs,
+    actualModel,
   };
 }
 
