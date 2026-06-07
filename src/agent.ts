@@ -538,6 +538,108 @@ function fixHallucinatedHostnames(body: string): string {
 }
 
 // ============================================================
+// stripPreamble — drop model "thinking out loud" before the digest body
+// ============================================================
+//
+// CLAUDE.md tells the agent to begin its response DIRECTLY with the first
+// subscription's "### [Title](URL)" header — no preamble, no plan. Strongly
+// instruction-following models (claude, minimax-m2.5:cloud) obey. Others do
+// not: minimax-m3:cloud (observed in the 2026-06-04 cron run) ignored it and
+// emitted a block of planning narration BEFORE the digest:
+//
+//   Good, I've scanned the entire GMT P500 list. ...
+//   Now I have all the information I need. Let me build the digest.
+//   ### Plan
+//   1. Priority Subscriptions ...
+//   Now writing the digest. The output is the entire response ...
+//   ### [1 Player Guild / SGOYT ...](https://...)   <-- real digest starts HERE
+//
+// That narration is "bad form" in the reader's morning email, and prompt-only
+// hardening doesn't hold (the model ignores the existing "no planning
+// sentences" rule). It's a one-shot stream we can't ask the model to edit, so
+// we strip it here, post-hoc.
+//
+// ANCHOR: the first real content marker — whichever comes FIRST of:
+//   - a section header   "### [Title](URL)"  (/^[ \t]*###[ \t]+\[/m)
+//   - the Highlights block "## (⭐ )?Highlights"
+// Everything before that anchor is preamble and gets dropped.
+//
+// Why anchor on "### [" (with the bracket) and not a bare "###": the plan
+// itself uses sub-headers like "### Plan". Bracket-anchoring lets "### Plan"
+// fall INTO the stripped region while the real first section ("### [..](..)")
+// survives as the anchor.
+//
+// Why ALSO consider the Highlights header: a model could legitimately put
+// "## ⭐ Highlights" first (liftHighlightsToTop supports that layout). We must
+// not mistake a leading Highlights block for preamble and delete it.
+//
+// Safety valve: if NEITHER anchor is found (totally malformed output), return
+// the body unchanged rather than nuke everything.
+//
+// ORDERING: this MUST run before elideDuplicateSections and liftHighlightsToTop
+// (see postProcessDigestBody). If a stray plan line ever looked like a real
+// "### [Title]" header, dedup would keep the plan's copy and drop the real
+// section; stripping the preamble first removes that hazard entirely.
+function stripPreamble(body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return body;
+
+  // First bracketed section header, e.g. "### [Earthborne Rangers](https://...)".
+  // /m makes ^ match at the start of any line, not just the whole string.
+  const sectionRe   = /^[ \t]*###[ \t]+\[/m;
+  // First Highlights header, with or without the leading star. /i = case-insensitive.
+  const highlightRe = /^[ \t]*##[ \t]+(?:⭐[ \t]+)?Highlights[ \t]*$/im;
+
+  const sectionMatch   = sectionRe.exec(trimmed);
+  const highlightMatch = highlightRe.exec(trimmed);
+
+  // Keep only the anchors that actually matched, then take the earliest offset.
+  // The `.filter((i): i is number => ...)` is a TypeScript type guard — it tells
+  // the compiler the surviving values are definitely numbers (not undefined).
+  // Python: offsets = [i for i in (a, b) if i is not None]
+  const offsets = [sectionMatch?.index, highlightMatch?.index]
+    .filter((i): i is number => typeof i === 'number');
+  if (offsets.length === 0) return body;   // no anchor at all → leave untouched
+  const anchor = Math.min(...offsets);
+
+  if (anchor === 0) return trimmed;        // already starts cleanly, nothing to strip
+
+  const stripped = trimmed.slice(anchor).trim();
+  log.warn(`Stripped ${anchor} chars of model preamble before the digest body`);
+  return stripped;
+}
+
+// ============================================================
+// postProcessDigestBody — the full output-cleanup pipeline
+// ============================================================
+//
+// Both the claude and tallow paths produce a raw markdown body that needs the
+// same defensive cleanup before it becomes the digest. Composing the steps in
+// ONE place keeps the two call sites in sync and makes the pipeline testable
+// in isolation (see agent.preamble.test.ts).
+//
+// Order matters, read inside-out (the innermost call runs first):
+//   1. stripPreamble            — drop model planning narration up front
+//   2. fixHallucinatedHostnames — repair "boardgeek.com" → "boardgamegeek.com"
+//   3. elideRepetitionCollapse  — cut runaway autoregressive line loops
+//   4. elideDuplicateSections   — drop a section rendered twice (keep first)
+//   5. liftHighlightsToTop      — move the trailing Highlights block to the top
+//
+// stripPreamble is innermost so the preamble is gone before dedup (which keys
+// off "### [Title]" headers) and before the Highlights lift reshuffles things.
+export function postProcessDigestBody(body: string): string {
+  return liftHighlightsToTop(
+    elideDuplicateSections(
+      elideRepetitionCollapse(
+        fixHallucinatedHostnames(
+          stripPreamble(body),
+        ),
+      ),
+    ),
+  );
+}
+
+// ============================================================
 // elideDuplicateSections — drop sections rendered twice
 // ============================================================
 //
@@ -896,7 +998,7 @@ export function runClaudeDigest(
       (u.cache_read_input_tokens ?? 0);
 
     return {
-      body:         liftHighlightsToTop(elideDuplicateSections(elideRepetitionCollapse(fixHallucinatedHostnames(parsed.result ?? rawOutput)))),
+      body:         postProcessDigestBody(parsed.result ?? rawOutput),
       inputTokens,
       outputTokens: u.output_tokens ?? 0,
       costUsd:      parsed.total_cost_usd ?? 0,
@@ -1135,7 +1237,7 @@ export async function runTallowDigest(
   }
 
   return {
-    body: liftHighlightsToTop(elideDuplicateSections(elideRepetitionCollapse(fixHallucinatedHostnames(body)))),
+    body: postProcessDigestBody(body),
     inputTokens, outputTokens, costUsd, durationMs,
   };
 }
