@@ -593,3 +593,60 @@ export function itemsNewerThan(items: BggGeeklistItem[], cutoffDate: Date): BggG
       return db.getTime() - da.getTime();  // newest first
     });
 }
+
+// ============================================================
+// lastActivityDate — the true "most recent activity" timestamp for an item
+// ============================================================
+//
+// CRITICAL CORRECTION to a wrong assumption baked into itemsNewerThan above:
+//
+//   BGG's v1 geeklist API does NOT bump an item's editdate when someone posts a
+//   COMMENT on that item. Verified against geeklist 366471 ("2025 People's
+//   Choice Top Solo Games"): items that received fresh comments in June 2026
+//   still report postdate == editdate back in Nov/Dec 2025. So a filter that
+//   looks only at postdate/editdate (itemsNewerThan) is BLIND to comment
+//   activity — which, on an established ranking geeklist, is the ONLY activity.
+//
+// The real signal lives in the per-item <comment date="..."> elements. The
+// "last activity" for an item is therefore the latest of:
+//   - postdate (item first added to the list)
+//   - editdate (item body edited)
+//   - max(comment.date)  ← the piece itemsNewerThan misses
+//
+// Python: max([item.postdate, item.editdate, *[c.date for c in item.comments]])
+function lastActivityDate(item: BggGeeklistItem): Date {
+  let latest = item.editdate > item.postdate ? item.editdate : item.postdate;
+  for (const c of item.comments) {
+    if (c.date > latest) latest = c.date;
+  }
+  return latest;
+}
+
+// ============================================================
+// itemsWithActivityNewerThan — comment-AWARE "what's new" filter for geeklists
+// ============================================================
+//
+// The selection itemsNewerThan SHOULD have been. An item is "new activity"
+// since the last visit if EITHER:
+//   - the item itself was added after the cutoff (item.postdate > cutoff), OR
+//   - it received a comment after the cutoff (some comment.date > cutoff).
+//
+// This is what actually matches BGG's notification: on a long-lived ranking
+// geeklist the notices are almost always "new comment on item X", which the old
+// postdate/editdate filter could never detect — so the pipeline fell through to
+// recentItems() and dumped N arbitrary stale entries with no new discussion,
+// burying (and usually omitting) the one item that was actually commented on.
+//
+// Returns items sorted newest-first by lastActivityDate(), so callers can cap
+// with a plain .slice(0, n) and keep the freshest items. No cap applied here.
+export function itemsWithActivityNewerThan(items: BggGeeklistItem[], cutoffDate: Date): BggGeeklistItem[] {
+  return [...items]
+    .filter((item) =>
+      // Strict superset of the old postdate/editdate filter (so no geeklist can
+      // regress) PLUS the comment-date term that postdate/editdate misses.
+      item.postdate > cutoffDate ||
+      item.editdate > cutoffDate ||
+      item.comments.some((c) => c.date > cutoffDate),
+    )
+    .sort((a, b) => lastActivityDate(b).getTime() - lastActivityDate(a).getTime());  // newest first
+}

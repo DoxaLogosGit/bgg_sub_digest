@@ -44,7 +44,7 @@ import {
   fetchGeeklist,
   recentArticles,
   recentItems,
-  itemsNewerThan,
+  itemsWithActivityNewerThan,
 } from './bgg/api';
 import {
   formatThreadContent,
@@ -463,48 +463,49 @@ async function main(): Promise<void> {
           // ---- Filter to items with new activity since the last visit ----
           //
           // BGG shows ONE gg-notice row for the entire geeklist subscription
-          // (not one row per new item, unlike threads). This means notifiedItemIds
-          // only has 1 ID — the oldest unread item BGG chose to link to.
-          // Using IDs-first would return just that single item regardless of how
-          // many items are actually new (e.g. SGOYT with 200+ items behind).
+          // (not one row per new item, unlike threads), and the linked item id
+          // is a COMMENT id, not a listitem id — so notifiedItemIds never lines
+          // up with geeklist.items and is useless here. The reliable signal is
+          // the notification DATE.
           //
-          // PRIMARY: notificationDate from the section header. This tells us when
-          // the oldest unread item was posted — everything newer is "new".
+          // The catch (verified on geeklist 366471): BGG's v1 API does NOT bump
+          // an item's editdate when a COMMENT is posted on it. On an established
+          // ranking geeklist every notification is "new comment on item X", so a
+          // postdate/editdate filter (itemsNewerThan) sees ZERO new items and the
+          // pipeline used to fall through to recentItems() — dumping 50 arbitrary
+          // stale entries with no new discussion while omitting the one item that
+          // was actually commented on. itemsWithActivityNewerThan looks at the
+          // per-item comment dates too, which is what actually fired the notice.
           //
-          // FALLBACK 1: notifiedItemIds. Catches edge cases where date parsing
-          // failed but BGG gave us an explicit item link.
-          //
-          // FALLBACK 2: recentItems(maxItems). Last resort.
+          // BUFFER: like the thread path, look back a couple hours from the
+          // earliest unread notice to absorb minute-precision/clock-skew boundary
+          // effects. The SAME cutoff is handed to formatGeeklistContent so the
+          // items we select and the comments it shows can never disagree (a
+          // mismatch would re-create the "nothing at the highlighted item" bug).
+          const GEEKLIST_BUFFER_HOURS = 2;
+          const cutoff = sub.notificationDate
+            ? new Date(sub.notificationDate.getTime() - GEEKLIST_BUFFER_HOURS * 3600 * 1000)
+            : null;
+
           let items: BggGeeklistItem[] = [];
 
-          if (sub.notificationDate !== null) {
-            items = itemsNewerThan(geeklist.items, sub.notificationDate);
-          }
-
-          if (items.length === 0) {
-            const notified = new Set(sub.notifiedItemIds);
-            if (notified.size > 0) {
-              items = geeklist.items
-                .filter((item) => notified.has(item.id))
-                .sort((a, b) => {
-                  const da = a.editdate > a.postdate ? a.editdate : a.postdate;
-                  const db = b.editdate > b.postdate ? b.editdate : b.postdate;
-                  return db.getTime() - da.getTime();
-                });
-            }
-          }
-
-          if (items.length === 0) {
+          if (cutoff !== null) {
+            // PRIMARY (and only, when we have a date): comment-aware new-activity
+            // filter. If this is empty, there is genuinely nothing new in the
+            // fetched window — we emit a stub below rather than dumping recents.
+            items = itemsWithActivityNewerThan(geeklist.items, cutoff);
+          } else {
+            // No parseable date — best-effort fall back to recency so the
+            // subscription still surfaces something for manual review.
             items = recentItems(geeklist.items, maxItems);
           }
 
-          // Hard-cap at maxItems regardless of selection path (see thread
-          // path comment above for why). Delegate to recentItems — same
-          // sort-by-latest-activity-then-take-top-N logic used in the
-          // fallback path, so the newest items are always preserved.
+          // Hard-cap at maxItems. itemsWithActivityNewerThan already returns
+          // items sorted newest-first by true last-activity (incl. comments), so
+          // a plain slice keeps the freshest ones. (recentItems already caps.)
           if (items.length > maxItems) {
             const dropped = items.length - maxItems;
-            items = recentItems(items, maxItems);
+            items = items.slice(0, maxItems);
             log.info(`Capped geeklist ${sub.id} at ${maxItems} most-recent items (dropped ${dropped} older)`);
           }
 
@@ -516,7 +517,7 @@ async function main(): Promise<void> {
           });
 
           if (items.length > 0) {
-            const geeklistContent  = formatGeeklistContent(geeklist.title, items, sub.notificationDate);
+            const geeklistContent  = formatGeeklistContent(geeklist.title, items, cutoff);
             const geeklistFilePath = writeSubscriptionFile(sub, geeklistContent, digestDataDir);
             manifestEntries.push({
               subscriptionId:   sub.id,
