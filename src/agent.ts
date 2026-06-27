@@ -280,7 +280,68 @@ export interface ManifestEntry {
 // 'complete'     — every subscription rendered, Highlights produced
 // 'partial'      — some subscriptions skipped after retries (model/timeout errors)
 // 'rate_limited' — halted mid-digest after a 429; Highlights skipped
-export type DigestStatus = 'complete' | 'partial' | 'rate_limited';
+export type DigestStatus = 'complete' | 'partial' | 'rate_limited' | 'invalid' | 'error';
+
+// ============================================================
+// isTemplateEcho — detect a digest that is just the unfilled template
+// ============================================================
+//
+// Failure mode (observed 2026-06-26 with ollama/minimax-m2.5:cloud): instead of
+// FILLING IN the per-section / highlights template, the model copies the format
+// EXAMPLES out of digest-data/templates/{highlights,section}.md verbatim into
+// its output. The result is structurally valid markdown — so nothing downstream
+// notices — but every section is placeholder boilerplate ("2–4 sentences on
+// what's new…", "Bullet per notable item (max 8)…", "<Tracked game>"). It then
+// gets emailed AND the subscriptions get cleared, losing the real activity.
+//
+// These sentinel strings are copied straight from the template files and would
+// never occur in a genuinely-written digest (verified: 0 occurrences in a good
+// run, 25+ in the bad one). We require >= 2 distinct hits so that a digest which
+// happens to quote one phrase in prose can't trip the guard.
+const TEMPLATE_SENTINELS = [
+  'Bullet per notable item (max 8)',
+  'comma-separated list of matched interests',
+  'one-line summary of where it appeared',
+  'only include this line if',
+  '<Tracked game>',
+  '<Subscription Title>',
+  '<one-line summary',
+];
+
+export function isTemplateEcho(body: string): boolean {
+  let hits = 0;
+  for (const sentinel of TEMPLATE_SENTINELS) {
+    if (body.includes(sentinel)) hits += 1;
+    if (hits >= 2) return true;
+  }
+  return false;
+}
+
+// ============================================================
+// generateGuardedDigest — run a digest with a template-echo retry guard
+// ============================================================
+//
+// `run` is a thunk that performs ONE digest generation (so this stays testable
+// without a live model — the caller passes () => runDigest(...)). If the first
+// result is an unfilled template, we retry ONCE; if it's STILL a template after
+// the retry, we stamp status='invalid' so the caller can refuse to clear the BGG
+// notices (otherwise the unread activity would be marked viewed and lost).
+//
+// We do NOT throw on an invalid result — the caller still emails a clearly
+// labeled alert. Throwing is reserved for the run itself failing (network, etc.),
+// which the caller's try/catch turns into a status='error' fallback.
+export async function generateGuardedDigest(run: () => Promise<DigestResult>): Promise<DigestResult> {
+  let result = await run();
+  if (!isTemplateEcho(result.body)) return result;
+
+  log.warn('Agent returned an unfilled template — retrying once');
+  result = await run();
+  if (isTemplateEcho(result.body)) {
+    log.error('Agent returned an unfilled template again after retry — marking digest invalid');
+    result.status = 'invalid';
+  }
+  return result;
+}
 
 export interface DigestSkippedEntry {
   title:    string;

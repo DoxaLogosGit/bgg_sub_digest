@@ -53,6 +53,7 @@ import {
   writeManifest,
   installWorkspaceTemplate,
   runDigest,
+  generateGuardedDigest,
 } from './agent';
 // `import type` imports only the TypeScript type, not runtime code — erased at compile time.
 // Python: from ./agent import ManifestEntry
@@ -251,7 +252,7 @@ async function main(): Promise<void> {
 
       const reusedElapsed = Date.now() - runStart.getTime();
       log.info(`=== Reuse-data digest complete in ${(reusedElapsed / 1000).toFixed(1)}s ===`);
-      console.log(`\nDigest written to: ${reusedDigest}`);
+      console.log(`\nDigest written to: ${reusedDigest.digestPath}`);
       return;
     }
 
@@ -566,7 +567,7 @@ async function main(): Promise<void> {
       // Write manifest.json — the agent's index of all subscription data files.
       const manifestPath = writeManifest(manifestEntries, digestDataDir);
 
-      await runAgentAndWriteDigest(
+      const digestOutcome = await runAgentAndWriteDigest(
         agent, model, manifestPath, interests, manifestEntries, digestDataDir,
         config, runStart,
       );
@@ -577,7 +578,13 @@ async function main(): Promise<void> {
       // so a crash mid-run never clears un-reported items (we'd rather re-report
       // a duplicate next run than lose data). With clearSubs:false this is a
       // no-op. We clear ALL items from this feed pull (one batched PATCH).
-      if (config.digest.clearSubs) {
+      //
+      // clearSafe is false when the digest was INVALID (the model echoed the
+      // template even after a retry) — clearing then would mark unread activity
+      // as viewed and lose it, so we skip clearing and let the next run retry.
+      if (!digestOutcome.clearSafe) {
+        log.warn(`Digest invalid — skipping clearViewdates so ${clearItems.length} notice item(s) survive to the next run`);
+      } else if (config.digest.clearSubs) {
         await clearViewdates(apiRequest, authToken, clearItems);
       } else {
         log.info(`[clearSubs:false] Would clear ${clearItems.length} notice item(s) — skipping`);
@@ -655,7 +662,7 @@ async function runAgentAndWriteDigest(
   // Inline shape — only the fields we actually need from the full Config.
   config: { digest: { outputDir: string }; email?: Parameters<typeof sendDigestEmail>[0] },
   runStart: Date,
-): Promise<string> {
+): Promise<{ digestPath: string; clearSafe: boolean }> {
   log.info(
     `Running ${agent} (${model}) against ${entries.length} subscription(s) from ${digestDataDir}`,
   );
@@ -667,17 +674,25 @@ async function runAgentAndWriteDigest(
 
   let digestResult: DigestResult;
   try {
-    digestResult = await runDigest(agent, manifestPath, interests, model);
+    // Generate with a template-echo retry guard: if the model returns the
+    // unfilled template, retry once, and if it's still a template stamp
+    // status='invalid' so we don't clear the BGG notices below.
+    digestResult = await generateGuardedDigest(
+      () => runDigest(agent, manifestPath, interests, model),
+    );
   } catch (err) {
     log.error(`${agent} digest run failed`, { err: String(err) });
     // Fallback — show a minimal digest pointing at the data files so the user
-    // can inspect them manually if the agent can't be reached.
+    // can inspect them manually if the agent can't be reached. status='error'
+    // makes this clearSafe=false too: a crashed run must NOT clear notices, or
+    // the unread activity is lost just like an invalid (template-echo) run.
     digestResult = {
       body:
         `*⚠️ Summarization failed — subscription data files are in \`${digestDataDir}\`*\n\n` +
         entries
           .map((e) => `### [${e.title}](${e.url})\n${e.itemCount} items — \`${e.filePath}\``)
           .join('\n\n'),
+      status:       'error',
       inputTokens:  0,
       outputTokens: 0,
       costUsd:      0,
@@ -697,7 +712,22 @@ async function runAgentAndWriteDigest(
   let bannerLine = '';
   let subjectPrefix = '';
 
-  if (status === 'rate_limited') {
+  if (status === 'invalid') {
+    subjectPrefix = '[GENERATION FAILED] ';
+    bannerLine = (
+      `> ⚠️ **Generation failed** — the model returned the unfilled template ` +
+      `instead of a digest (twice, including a retry).\n` +
+      `> BGG notices were **NOT** cleared, so this activity will be retried on the ` +
+      `next run. The raw subscription data is in \`${digestDataDir}\`.\n\n`
+    );
+  } else if (status === 'error') {
+    subjectPrefix = '[GENERATION FAILED] ';
+    bannerLine = (
+      `> ⚠️ **Summarization failed** — the agent could not be reached or crashed.\n` +
+      `> BGG notices were **NOT** cleared, so this activity will be retried on the ` +
+      `next run. The raw subscription data is in \`${digestDataDir}\`.\n\n`
+    );
+  } else if (status === 'rate_limited') {
     subjectPrefix = '[RATE LIMITED] ';
     const completed = digestResult.completedCount ?? 0;
     const total     = digestResult.totalCount ?? 0;
@@ -727,7 +757,10 @@ async function runAgentAndWriteDigest(
     await sendDigestEmail(config.email, subject, markdown);
   }
 
-  return digestPath;
+  // clearSafe=false on a failed run (template-echo 'invalid' OR a crashed
+  // 'error' fallback) tells the caller to skip clearViewdates so the unread BGG
+  // notices survive to the next run instead of being silently lost.
+  return { digestPath, clearSafe: status !== 'invalid' && status !== 'error' };
 }
 
 // ---- formatTokenUsage ----------------------------------------
