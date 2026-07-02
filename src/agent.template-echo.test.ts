@@ -11,7 +11,13 @@
 // isTemplateEcho must flag that output and pass a genuinely-filled digest.
 
 import assert from 'node:assert/strict';
-import { isTemplateEcho, generateGuardedDigest, type DigestResult } from './agent';
+import {
+  isTemplateEcho,
+  isMissingHighlights,
+  stripReasoningTags,
+  generateGuardedDigest,
+  type DigestResult,
+} from './agent';
 
 // A genuinely-filled digest — must NOT be flagged.
 const good = `## ⭐ Highlights
@@ -53,6 +59,59 @@ assert.equal(isTemplateEcho(bad), true, 'the unfilled-template echo must be flag
 const oneQuote = good + '\nSomeone joked the bot just prints "comma-separated list of matched interests" lol\n';
 assert.equal(isTemplateEcho(oneQuote), false, 'a single incidental sentinel must not trip the guard');
 
+// ---- isMissingHighlights: the 2026-07-02 failure mode ----
+//
+// minimax-m3 degenerated (re-rendered sections, leaked reasoning) and never
+// emitted the "## ⭐ Highlights" block, yet the pipeline shipped it as
+// status=complete AND cleared 42 notices. A digest with no Highlights header
+// must be flagged.
+const noHighlights = `### [Some Thread](https://boardgamegeek.com/thread/1)
+
+**Summary:** Two new replies.
+
+**New Activity:**
+- somebody said a thing.
+
+**Topics Mentioned:** solo
+`;
+assert.equal(isMissingHighlights(good), false, 'a digest WITH a Highlights header must not be flagged');
+assert.equal(isMissingHighlights(noHighlights), true, 'a digest with no Highlights header must be flagged');
+// The lifter accepts a star-less "## Highlights" too, so the guard must as well
+// (else we would invalidate a digest the lifter would happily place at the top).
+assert.equal(
+  isMissingHighlights(good.replace('## ⭐ Highlights', '## Highlights')),
+  false,
+  'a star-less "## Highlights" header still counts as present',
+);
+
+// ---- stripReasoningTags: clean leaked minimax reasoning ----
+//
+// When tallow's provider adapter fails to route a model's reasoning into the
+// JSONL `thinking` channel, the raw <mm:think>…</mm:think> tokens land in the
+// `text` body. Strip them defensively.
+const paired = '<mm:think>plan the digest</mm:think>## ⭐ Highlights\n- ⭐ a thing';
+assert.equal(
+  stripReasoningTags(paired),
+  '## ⭐ Highlights\n- ⭐ a thing',
+  'a well-formed <mm:think> block must be removed entirely',
+);
+
+// The observed 07-02 leak: the opener was already stripped as preamble, leaving
+// an orphan close tag glued to real content mid-body.
+const orphan = 'Now the Highlights block:</mm:think>## ⭐ Highlights\n- ⭐ a thing';
+const orphanStripped = stripReasoningTags(orphan);
+assert.ok(!orphanStripped.includes('mm:think'), 'an orphan </mm:think> tag must be removed');
+assert.ok(orphanStripped.includes('## ⭐ Highlights'), 'stripping an orphan tag must keep the real content');
+
+// Safety valve: if the ENTIRE body is inside one reasoning block, stripping it
+// would leave nothing — hand the original back rather than ship an empty digest
+// (the highlights guard then flags it instead of silently emptying it).
+const allThink = '<mm:think>the whole digest was accidentally written in here and nothing else exists outside the tags</mm:think>';
+assert.equal(stripReasoningTags(allThink), allThink, 'stripping must not empty the body — return original as a safety valve');
+
+// A clean digest with no reasoning tags must pass through untouched.
+assert.equal(stripReasoningTags(good), good, 'a tag-free body must be returned unchanged');
+
 // ---- generateGuardedDigest: the data-loss protection wiring ----
 //
 // This is the load-bearing part: a persistently-echoing model must produce a
@@ -83,6 +142,29 @@ const mk = (body: string): DigestResult => ({
   res = await generateGuardedDigest(async () => { calls += 1; return mk(good); });
   assert.equal(calls, 1, 'a good first result must not be retried');
   assert.notEqual(res.status, 'invalid', 'a good result must not be marked invalid');
+
+  // (d) Missing Highlights persists → retried once → status 'invalid'
+  //     (the 2026-07-02 data-loss path: must NOT clear notices).
+  calls = 0;
+  res = await generateGuardedDigest(async () => { calls += 1; return mk(noHighlights); });
+  assert.equal(calls, 2, 'a missing-Highlights digest must trigger exactly one retry');
+  assert.equal(res.status, 'invalid', 'a persistently missing Highlights block must yield status=invalid');
+
+  // (e) Missing Highlights, then a good digest on retry → recovered.
+  calls = 0;
+  res = await generateGuardedDigest(async () => { calls += 1; return mk(calls === 1 ? noHighlights : good); });
+  assert.equal(calls, 2, 'a recovered missing-Highlights run still makes 2 calls');
+  assert.notEqual(res.status, 'invalid', 'a successful retry must NOT be marked invalid');
+
+  // (f) A run ALREADY flagged degraded (partial/rate_limited) may legitimately
+  //     lack Highlights — the guard must NOT retry it or override its status.
+  calls = 0;
+  res = await generateGuardedDigest(async () => {
+    calls += 1;
+    return { ...mk(noHighlights), status: 'rate_limited' as const };
+  });
+  assert.equal(calls, 1, 'an already-degraded run must not be retried by the highlights guard');
+  assert.equal(res.status, 'rate_limited', 'the guard must not override a pre-existing degraded status');
 
   console.log('agent.template-echo.test.ts: all assertions passed ✓');
 })();

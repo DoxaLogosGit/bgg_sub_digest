@@ -318,6 +318,54 @@ export function isTemplateEcho(body: string): boolean {
 }
 
 // ============================================================
+// isMissingHighlights — detect a digest with no Highlights block
+// ============================================================
+//
+// Failure mode (observed 2026-07-02 with ollama/minimax-m3:cloud): the model
+// degenerated mid-run (re-rendering 25 duplicate sections, leaking reasoning)
+// and never emitted the "## ⭐ Highlights" block at all. liftHighlightsToTop
+// silently passes such a body through unchanged, so the pipeline shipped a
+// header-less digest AND cleared 42 BGG notices — the same data-loss class as
+// the template echo, through a different door.
+//
+// We accept a star-less "## Highlights" too, because liftHighlightsToTop does:
+// if the lifter would happily place it at the top, the guard must not call it
+// missing. The regex mirrors the lifter's (a fresh literal each call, so the
+// non-global test has no lastIndex state to leak).
+export function isMissingHighlights(body: string): boolean {
+  return !/^[ \t]*##[ \t]+(?:⭐[ \t]+)?Highlights[ \t]*$/im.test(body);
+}
+
+// ============================================================
+// stripReasoningTags — remove leaked model reasoning from the body
+// ============================================================
+//
+// tallow's JSONL separates a turn's reasoning ({"type":"thinking"}) from its
+// output ({"type":"text"}), and runTallowDigest reads only the text items — so
+// cleanly-routed reasoning never reaches the digest. But when tallow's provider
+// adapter does NOT recognize a model's reasoning delimiter (minimax-m3 emits
+// <mm:think>…</mm:think>, which the 0.9.x adapter left un-parsed on 2026-07-02),
+// the raw tags land inside the `text` channel and leak into the digest.
+//
+// This is a defensive workaround for that harness+model gap, not a correctness
+// guarantee — the isMissingHighlights guard is the real safety net. We remove
+// well-formed <think>/<mm:think> blocks, then any orphan tags (the opener is
+// often already gone, stripped as preamble, leaving a lone </mm:think> glued to
+// real content mid-body). A safety valve returns the ORIGINAL if stripping would
+// erase almost everything — that means the whole digest was written inside a
+// reasoning block, and an empty body is worse than a tagged one (the highlights
+// guard will flag it either way).
+export function stripReasoningTags(body: string): string {
+  if (!/<\/?(?:mm:)?think\b/i.test(body)) return body; // no tags → untouched
+  const stripped = body
+    .replace(/<(?:mm:)?think\b[^>]*>[\s\S]*?<\/(?:mm:)?think>/gi, '')
+    .replace(/<\/?(?:mm:)?think\b[^>]*>/gi, '')
+    .trim();
+  if (stripped.length < body.trim().length * 0.2) return body;
+  return stripped;
+}
+
+// ============================================================
 // generateGuardedDigest — run a digest with a template-echo retry guard
 // ============================================================
 //
@@ -330,14 +378,27 @@ export function isTemplateEcho(body: string): boolean {
 // We do NOT throw on an invalid result — the caller still emails a clearly
 // labeled alert. Throwing is reserved for the run itself failing (network, etc.),
 // which the caller's try/catch turns into a status='error' fallback.
+// digestDefect — name the reason a completed digest is unshippable, or null.
+// A run ALREADY flagged degraded (partial after skips, rate_limited after a 429,
+// or a prior error/invalid) may legitimately lack a Highlights block — the
+// caller already banners those — so we never second-guess or override it here.
+function digestDefect(result: DigestResult): string | null {
+  if (result.status && result.status !== 'complete') return null;
+  if (isTemplateEcho(result.body))     return 'unfilled template';
+  if (isMissingHighlights(result.body)) return 'missing Highlights block';
+  return null;
+}
+
 export async function generateGuardedDigest(run: () => Promise<DigestResult>): Promise<DigestResult> {
   let result = await run();
-  if (!isTemplateEcho(result.body)) return result;
+  let defect = digestDefect(result);
+  if (!defect) return result;
 
-  log.warn('Agent returned an unfilled template — retrying once');
+  log.warn(`Agent produced a defective digest (${defect}) — retrying once`);
   result = await run();
-  if (isTemplateEcho(result.body)) {
-    log.error('Agent returned an unfilled template again after retry — marking digest invalid');
+  defect = digestDefect(result);
+  if (defect) {
+    log.error(`Agent digest still defective (${defect}) after retry — marking invalid`);
     result.status = 'invalid';
   }
   return result;
@@ -687,20 +748,24 @@ function stripPreamble(body: string): string {
 // in isolation (see agent.preamble.test.ts).
 //
 // Order matters, read inside-out (the innermost call runs first):
-//   1. stripPreamble            — drop model planning narration up front
-//   2. fixHallucinatedHostnames — repair "boardgeek.com" → "boardgamegeek.com"
-//   3. elideRepetitionCollapse  — cut runaway autoregressive line loops
-//   4. elideDuplicateSections   — drop a section rendered twice (keep first)
-//   5. liftHighlightsToTop      — move the trailing Highlights block to the top
+//   1. stripReasoningTags       — remove leaked <mm:think> reasoning tokens
+//   2. stripPreamble            — drop model planning narration up front
+//   3. fixHallucinatedHostnames — repair "boardgeek.com" → "boardgamegeek.com"
+//   4. elideRepetitionCollapse  — cut runaway autoregressive line loops
+//   5. elideDuplicateSections   — drop a section rendered twice (keep first)
+//   6. liftHighlightsToTop      — move the trailing Highlights block to the top
 //
-// stripPreamble is innermost so the preamble is gone before dedup (which keys
-// off "### [Title]" headers) and before the Highlights lift reshuffles things.
+// stripReasoningTags is innermost so leaked reasoning is gone before stripPreamble
+// measures the "preamble", before dedup (which keys off "### [Title]" headers),
+// and before the Highlights lift reshuffles things.
 export function postProcessDigestBody(body: string): string {
   return liftHighlightsToTop(
     elideDuplicateSections(
       elideRepetitionCollapse(
         fixHallucinatedHostnames(
-          stripPreamble(body),
+          stripPreamble(
+            stripReasoningTags(body),
+          ),
         ),
       ),
     ),

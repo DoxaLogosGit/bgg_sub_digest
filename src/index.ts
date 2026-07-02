@@ -580,8 +580,9 @@ async function main(): Promise<void> {
       // no-op. We clear ALL items from this feed pull (one batched PATCH).
       //
       // clearSafe is false when the digest was INVALID (the model echoed the
-      // template even after a retry) — clearing then would mark unread activity
-      // as viewed and lose it, so we skip clearing and let the next run retry.
+      // template, or omitted the Highlights block, even after a retry) or the run
+      // crashed — clearing then would mark unread activity as viewed and lose it,
+      // so we skip clearing and let the next run retry.
       if (!digestOutcome.clearSafe) {
         log.warn(`Digest invalid — skipping clearViewdates so ${clearItems.length} notice item(s) survive to the next run`);
       } else if (config.digest.clearSubs) {
@@ -715,8 +716,8 @@ async function runAgentAndWriteDigest(
   if (status === 'invalid') {
     subjectPrefix = '[GENERATION FAILED] ';
     bannerLine = (
-      `> ⚠️ **Generation failed** — the model returned the unfilled template ` +
-      `instead of a digest (twice, including a retry).\n` +
+      `> ⚠️ **Generation failed** — the model produced an unusable digest ` +
+      `(unfilled template, or no Highlights block) twice, including a retry.\n` +
       `> BGG notices were **NOT** cleared, so this activity will be retried on the ` +
       `next run. The raw subscription data is in \`${digestDataDir}\`.\n\n`
     );
