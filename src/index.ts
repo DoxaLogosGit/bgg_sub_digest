@@ -54,6 +54,7 @@ import {
   installWorkspaceTemplate,
   runDigest,
   generateGuardedDigest,
+  DEFAULT_AGENT_MODEL,
 } from './agent';
 // `import type` imports only the TypeScript type, not runtime code — erased at compile time.
 // Python: from ./agent import ManifestEntry
@@ -163,27 +164,36 @@ async function main(): Promise<void> {
     const interests = loadInterests(config.digest.interestsFile);
 
     // Parse --agent <name> and --model <name> from CLI args.
+    //   `npm start -- --agent pi     --model ollama/nemotron-3-super:cloud`
     //   `npm start -- --agent tallow --model omnicoder-oc`
     //   `npm start -- --agent claude-ollama --model qwen3-coder-next:cloud`
     //   `npm start -- --model sonnet`                         (claude is the default agent)
     //
+    // For `pi`, a "provider/model" string is split into --provider/--model;
+    // a bare model id lets pi use defaultProvider from its settings.json.
+    //
     // Default agent is `claude`. Default model varies by agent:
-    //   - claude        → opus  (Anthropic API)
-    //   - claude-ollama → qwen3-coder-next:cloud  (claude → local Ollama)
-    //   - tallow        → qwen3-coder-next:cloud  (per ~/.tallow/settings.json)
+    //   - claude              → opus  (Anthropic API)
+    //   - claude-ollama/tallow/pi → DEFAULT_AGENT_MODEL
+    //
+    // WARNING (2026-08-30): DEFAULT_AGENT_MODEL is `qwen3-coder-next:cloud`,
+    // which is RETIRED on ollama. Any non-claude run without an explicit
+    // --model will fail. The crontab passes --model, so this is latent.
     const agentArgIndex = process.argv.indexOf('--agent');
     const agentArg      = agentArgIndex !== -1 ? process.argv[agentArgIndex + 1] : 'claude';
-    if (agentArg !== 'claude' && agentArg !== 'claude-ollama' && agentArg !== 'tallow') {
+    const VALID_AGENTS: readonly AgentName[] = ['claude', 'claude-ollama', 'tallow', 'pi'];
+    if (!VALID_AGENTS.includes(agentArg as AgentName)) {
       throw new Error(
-        `--agent must be "claude", "claude-ollama", or "tallow" (got "${agentArg}")`,
+        `--agent must be one of ${VALID_AGENTS.map((a) => `"${a}"`).join(', ')} ` +
+        `(got "${agentArg}")`,
       );
     }
-    const agent: AgentName = agentArg;
+    const agent: AgentName = agentArg as AgentName;
 
     const modelArgIndex = process.argv.indexOf('--model');
     const model = modelArgIndex !== -1
       ? process.argv[modelArgIndex + 1]
-      : (agent === 'claude' ? 'opus' : 'qwen3-coder-next:cloud');
+      : (agent === 'claude' ? 'opus' : DEFAULT_AGENT_MODEL);
 
     // --reuse-data: skip the entire BGG download phase and run the agent
     // against whatever is already in ./digest-data/. Useful when iterating

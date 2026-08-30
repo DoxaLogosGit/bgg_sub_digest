@@ -1190,19 +1190,188 @@ export function runClaudeDigest(
 // turn whose content contains a non-empty `text` chunk to grab the digest
 // body. Token usage is summed across every turn_end so the footer reflects
 // the full cost of the run.
+type TallowUsage = {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  totalTokens?: number;
+  cost?: { input?: number; output?: number; total?: number };
+};
+// `name` / `arguments` are populated for `type:'toolCall'` items — we only
+// care about the `write` tool's `arguments.content` (see selectDigestBody).
+type TallowContent = {
+  type: string;
+  text?: string;
+  name?: string;
+  arguments?: { content?: string; path?: string };
+};
+type TallowEvent = {
+  type: string;
+  // `model` / `provider` are what tallow ACTUALLY routed to for this turn —
+  // the source of truth for the footer, since tallow may silently fall back
+  // to its default when the requested model can't be resolved.
+  message?: { content?: TallowContent[]; usage?: TallowUsage; model?: string; provider?: string };
+};
+
+// ============================================================
+// selectDigestBody — recover the digest text from a tallow run
+// ============================================================
+//
+// Failure mode (observed 2026-08-07 with ollama/minimax-m3:cloud, a 49-
+// subscription run): the model's synthesis text turn ran long and was cut
+// off mid-sentence at "Now the Highlights block. Let me identify the
+// cross-subscription themes:" — never finishing. In the NEXT turn, the
+// model — in violation of the explicit "do NOT use the Write tool"
+// CLAUDE.md instruction — called its `write` tool and saved the complete,
+// correctly-formatted digest (real Highlights block included) to
+// digest-output.md, then closed with an unrelated short wrap-up text turn
+// ("The digest is written to digest-data/digest-output.md. Here's a quick
+// summary of what was built..." — no Highlights block).
+//
+// The old backward-walk only ever looked at `type:'text'` content items
+// and returned the newest non-empty one — the short wrap-up — discarding
+// the real digest that was sitting one turn earlier in the `write`
+// toolCall's `arguments.content`. isMissingHighlights correctly flagged
+// the wrap-up as defective, but the retry this triggered ran the model
+// again from scratch instead of recovering content that was already on
+// the stream — and in this incident, the retry's output was considerably
+// worse (garbled links, wrong words, encoding artifacts).
+//
+// Fix: walk turn_ends newest-to-oldest. At each turn, gather every
+// candidate string — the turn's joined `text` items (exactly the old
+// behavior) AND any `write` toolCall's `arguments.content`. If a turn has
+// a candidate that actually contains a Highlights block, use it — that's
+// almost certainly the real synthesis, wherever it landed. Only if NO
+// turn has such a candidate do we fall back to the original behavior (the
+// newest non-empty `text` item), so a genuinely defective run still
+// surfaces as defective and the existing retry/invalid guard still
+// applies.
+export function selectDigestBody(turnEnds: TallowEvent[]): { body: string; turnIndex: number } {
+  let fallbackBody  = '';
+  let fallbackIndex = -1;
+
+  for (let i = turnEnds.length - 1; i >= 0; i--) {
+    const content = turnEnds[i].message?.content ?? [];
+
+    const textJoined = content
+      .filter((c) => c.type === 'text' && typeof c.text === 'string' && c.text.trim().length > 0)
+      .map((c) => c.text as string)
+      .join('\n');
+
+    // Preserve the ORIGINAL behavior exactly as the fallback: the newest
+    // turn with non-empty text, regardless of content.
+    if (fallbackIndex === -1 && textJoined) {
+      fallbackBody  = textJoined;
+      fallbackIndex = i;
+    }
+
+    const writeCandidates = content
+      .filter((c) =>
+        c.type === 'toolCall' && c.name === 'write' &&
+        typeof c.arguments?.content === 'string' && c.arguments.content.trim().length > 0,
+      )
+      .map((c) => c.arguments!.content as string);
+
+    const candidates = [textJoined, ...writeCandidates].filter((s) => s.length > 0);
+    for (const candidate of candidates) {
+      if (!isMissingHighlights(candidate)) {
+        return { body: candidate, turnIndex: i };
+      }
+    }
+  }
+
+  return { body: fallbackBody, turnIndex: fallbackIndex };
+}
+
+// ============================================================
+// Default model — single source of truth
+// ============================================================
+//
+// NOTE (2026-08-30): `qwen3-coder-next:cloud` is RETIRED on ollama, so this
+// default is currently a dead fallback. It only bites when no --model is
+// passed (the crontab always passes one). Deliberately left as-is pending the
+// model decision; when that lands, changing this ONE constant fixes every
+// caller. See also ~/.tallow/settings.json defaultModel, which points at the
+// now-paywalled minimax-m3:cloud.
+export const DEFAULT_AGENT_MODEL = 'qwen3-coder-next:cloud';
+
+// ============================================================
+// buildAgentCliArgs — flag shapes for the pi-protocol CLIs
+// ============================================================
+//
+// tallow and pi speak the SAME JSONL event protocol (tallow is built on pi),
+// verified 2026-08-30: both emit `turn_end` events whose `message.content`
+// carries `{type:'toolCall', name:'write', arguments:{content,path}}` items
+// and a `usage` object with input/output/cacheRead/cacheWrite/cost.total.
+// That is exactly what selectDigestBody() and the usage loop below consume,
+// so the ONLY thing that differs between them is the command line:
+//
+//   tallow --yolo               --mode json --model ollama/nemotron-3-super:cloud --print <prompt>
+//   pi     --approve --print    --mode json --provider ollama --model nemotron-3-super:cloud <prompt>
+//
+// tallow takes one combined `provider/model` string; pi wants them as two
+// separate flags. `--yolo` and `--approve` are the respective
+// "don't stop to ask about tool use" switches, which an unattended cron run
+// must have or the process blocks forever on a prompt nobody can answer.
+export function buildAgentCliArgs(
+  bin: 'tallow' | 'pi',
+  model: string,
+  prompt: string,
+): string[] {
+  if (bin === 'tallow') {
+    return ['--yolo', '--mode', 'json', '--model', model, '--print', prompt];
+  }
+
+  // pi: split a leading "provider/" prefix off the model id. Split on the
+  // FIRST '/' only — model ids legitimately contain ':' (gpt-oss:20b-cloud)
+  // and must not be mangled. With no prefix we omit --provider entirely and
+  // let pi fall back to defaultProvider from its settings.json.
+  const slash = model.indexOf('/');
+  const provider = slash === -1 ? undefined : model.slice(0, slash);
+  const bareModel = slash === -1 ? model : model.slice(slash + 1);
+
+  return [
+    '--print',
+    '--mode', 'json',
+    '--approve',
+    ...(provider ? ['--provider', provider] : []),
+    '--model', bareModel,
+    prompt,
+  ];
+}
+
+// Thin wrappers so callers keep a stable, descriptive entry point.
 export async function runTallowDigest(
   manifestPath: string,
   interests: string,
-  model = 'qwen3-coder-next:cloud',
+  model = DEFAULT_AGENT_MODEL,
+): Promise<DigestResult> {
+  return runPiProtocolDigest('tallow', manifestPath, interests, model);
+}
+
+export async function runPiDigest(
+  manifestPath: string,
+  interests: string,
+  model = DEFAULT_AGENT_MODEL,
+): Promise<DigestResult> {
+  return runPiProtocolDigest('pi', manifestPath, interests, model);
+}
+
+async function runPiProtocolDigest(
+  bin: 'tallow' | 'pi',
+  manifestPath: string,
+  interests: string,
+  model = DEFAULT_AGENT_MODEL,
 ): Promise<DigestResult> {
   const prompt = buildDigestPrompt(manifestPath, interests);
 
-  // tallow accepts the prompt directly as a CLI argument — no temp file
+  // Both CLIs accept the prompt directly as an argument — no temp file
   // needed. spawn with args array bypasses shell quoting, so embedded
   // quotes/backticks/newlines in the prompt are safe.
   const home = process.env.HOME ?? '';
   const extraPaths = [
-    `${home}/.bun/bin`,                         // bun-installed tallow (the typical install)
+    `${home}/.bun/bin`,                         // bun-installed tallow/pi (the typical install)
     `${home}/.local/bin`,                       // npm global on Linux
     `${home}/.npm-global/bin`,                  // npm with custom prefix
     `${home}/.nvm/versions/node/current/bin`,   // nvm current
@@ -1210,60 +1379,55 @@ export async function runTallowDigest(
   ];
   const augmentedPath = [...extraPaths, process.env.PATH ?? ''].join(':');
 
-  log.debug('Launching tallow with --yolo --mode json (streaming)', {
+  const args = buildAgentCliArgs(bin, model, prompt);
+
+  log.debug(`Launching ${bin} with --mode json (streaming)`, {
     manifestPath,
     model,
     promptLength: prompt.length,
+    // Log the flags but NOT the prompt itself — it is ~270 chars of template
+    // and would bury the rest of the line.
+    flags: args.filter((a) => a !== prompt),
   });
 
-  const args = [
-    '--yolo',
-    '--mode', 'json',
-    '--model', model,
-    '--print', prompt,
-  ];
-
-  // ---- Stream tallow's JSONL output ----
+  // ---- Stream the agent's JSONL output ----
   //
-  // We use streaming spawn instead of spawnSync because tallow's JSONL grows
+  // We use streaming spawn instead of spawnSync because the JSONL grows
   // unboundedly with tool rounds (each Read tool call's full file contents
   // get echoed back as a tool_result event). Long digests with chatty models
   // were hitting ENOBUFS on the 50MB spawnSync cap. Streaming has no cap and
   // also lowers peak memory because we keep only the parsed turn_end events
   // (small) and discard everything else line-by-line.
-  type TallowUsage = {
-    input?: number;
-    output?: number;
-    cacheRead?: number;
-    cacheWrite?: number;
-    totalTokens?: number;
-    cost?: { input?: number; output?: number; total?: number };
-  };
-  type TallowContent = { type: string; text?: string };
-  type TallowEvent = {
-    type: string;
-    // `model` / `provider` are what tallow ACTUALLY routed to for this turn —
-    // the source of truth for the footer, since tallow may silently fall back
-    // to its default when the requested model can't be resolved.
-    message?: { content?: TallowContent[]; usage?: TallowUsage; model?: string; provider?: string };
-  };
+  // (TallowUsage / TallowContent / TallowEvent are declared at module scope,
+  // above, so selectDigestBody can be a standalone testable function.)
 
-  // Wall-clock the run so we can populate durationMs (tallow's JSONL doesn't
+  // Wall-clock the run so we can populate durationMs (the JSONL doesn't
   // include a top-level duration like Claude's --output-format json does).
   const start = Date.now();
-  const proc  = spawn('tallow', args, {
-    // cwd = digest-data so tallow picks up the workspace's CLAUDE.md and
-    // templates/ from there. Tallow scans both .claude/ and .tallow/ in cwd
-    // and reads CLAUDE.md natively.
+  const proc  = spawn(bin, args, {
+    // cwd = digest-data so the agent picks up the workspace's CLAUDE.md and
+    // templates/ from there. tallow scans .claude/ and .tallow/ in cwd; pi
+    // discovers CLAUDE.md/AGENTS.md the same way (its --no-context-files flag
+    // is what would DISABLE that, and we deliberately do not pass it).
     cwd:   path.dirname(manifestPath),
     env:   { ...process.env, PATH: augmentedPath },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
   // Hard timeout — kill tallow if it hangs (e.g. local model deadlock).
-  const TIMEOUT_MS = 30 * 60 * 1000;
+  //
+  // Raised 30 -> 60 min on 2026-08-30. Every ollama cloud model that used to
+  // run this digest is now behind a 402 paywall, and the free-tier models that
+  // replace them are FAR slower: nemotron-3-super:cloud took 1287s (21.5 min)
+  // for a light 11-subscription run, where minimax-m3 did 18 subscriptions in
+  // 105s. At 30 min a heavier day would have been SIGKILLed, which surfaces as
+  // "tallow produced no turn_end events" — indistinguishable from the paywall
+  // failure it replaced. 60 min buys roughly 2.5x headroom over the measured
+  // worst case. This is a ceiling for a hung process, not a target: a healthy
+  // run still exits as soon as the agent is done.
+  const TIMEOUT_MS = 60 * 60 * 1000;
   const timeoutHandle = setTimeout(() => {
-    log.warn(`tallow exceeded ${TIMEOUT_MS}ms timeout — killing process`);
+    log.warn(`${bin} exceeded ${TIMEOUT_MS}ms timeout — killing process`);
     proc.kill('SIGKILL');
   }, TIMEOUT_MS);
 
@@ -1314,7 +1478,7 @@ export async function runTallowDigest(
       }
       if (code !== 0) {
         reject(new Error(
-          `tallow exited with code ${code}: ${stderrChunks.slice(0, 1000)}`,
+          `${bin} exited with code ${code}: ${stderrChunks.slice(0, 1000)}`,
         ));
         return;
       }
@@ -1323,7 +1487,7 @@ export async function runTallowDigest(
   });
   const durationMs = Date.now() - start;
 
-  log.debug('Tallow stream complete', {
+  log.debug(`${bin} stream complete`, {
     bytesRead:  totalBytes,
     turnEnds:   turnEnds.length,
     durationMs,
@@ -1331,36 +1495,23 @@ export async function runTallowDigest(
 
   if (turnEnds.length === 0) {
     throw new Error(
-      `tallow produced no turn_end events (${totalBytes} bytes read). ` +
+      `${bin} produced no turn_end events (${totalBytes} bytes read). ` +
       `stderr: ${stderrChunks.slice(0, 500)}`,
     );
   }
 
   // ---- Pull the digest body ----
   //
-  // Walk turn_ends from newest backward and grab the text from the first
-  // one that has a non-empty `type:'text'` item. Tool-only turns contribute
-  // no body text. The prompt instructs the agent to write the entire digest
-  // in a single final response, so the last turn with text SHOULD be the
-  // synthesis.
-  let body = '';
-  let synthesisModel: string | undefined;     // model of the turn that wrote the digest
-  let synthesisProvider: string | undefined;
-  for (let i = turnEnds.length - 1; i >= 0; i--) {
-    const text = (turnEnds[i].message?.content ?? [])
-      .filter((c) => c.type === 'text' && typeof c.text === 'string' && c.text.trim().length > 0)
-      .map((c) => c.text as string)
-      .join('\n');
-    if (text) {
-      body = text;
-      synthesisModel    = turnEnds[i].message?.model;
-      synthesisProvider = turnEnds[i].message?.provider;
-      break;
-    }
-  }
+  // See selectDigestBody's doc comment for the 2026-08-07 failure mode this
+  // guards against (model writes the real digest via the `write` tool, then
+  // closes with an unrelated short text turn).
+  const { body: selectedBody, turnIndex } = selectDigestBody(turnEnds);
+  const body = selectedBody;
+  const synthesisModel:    string | undefined = turnIndex !== -1 ? turnEnds[turnIndex].message?.model    : undefined;
+  const synthesisProvider: string | undefined = turnIndex !== -1 ? turnEnds[turnIndex].message?.provider : undefined;
   if (!body) {
     throw new Error(
-      `tallow ran ${turnEnds.length} turn(s) but no turn produced assistant text. ` +
+      `${bin} ran ${turnEnds.length} turn(s) but no turn produced assistant text. ` +
       `Model may have looped on tool calls without ever synthesizing.`,
     );
   }
@@ -1376,7 +1527,7 @@ export async function runTallowDigest(
     costUsd      += u.cost?.total ?? 0;
   }
 
-  // ---- Determine the model tallow ACTUALLY used ----
+  // ---- Determine the model the agent ACTUALLY used ----
   // Prefer the synthesis turn (the one that wrote the digest); fall back to the
   // last turn that reported a model. Combine with provider so it's comparable to
   // the requested id (e.g. "ollama/minimax-m3:cloud").
@@ -1395,12 +1546,12 @@ export async function runTallowDigest(
     ? (reportedProvider ? `${reportedProvider}/${reportedModel}` : reportedModel)
     : undefined;
 
-  // Warn loudly if tallow silently routed to a different model than requested —
+  // Warn loudly if the agent silently routed to a different model than requested —
   // compare on the bare model name (after the last '/') so provider prefixes
   // don't cause false mismatches.
   const bare = (m: string) => m.split('/').pop();
   if (actualModel && bare(actualModel) !== bare(model)) {
-    log.warn(`tallow used a DIFFERENT model than requested — fell back?`, {
+    log.warn(`${bin} used a DIFFERENT model than requested — fell back?`, {
       requested: model,
       actual:    actualModel,
     });
@@ -1425,7 +1576,14 @@ export async function runTallowDigest(
 //                   data-fetch phase keeps total context within the 200K
 //                   model window so degeneration doesn't trigger.
 // 'tallow'        — tallow CLI (its own provider routing).
-export type AgentName = 'claude' | 'claude-ollama' | 'tallow';
+// 'pi'            — pi CLI (@earendil-works/pi-coding-agent). Same JSONL
+//                   event protocol as tallow — tallow is built on pi — so it
+//                   shares runPiProtocolDigest() and every downstream parser.
+//                   Preferred over tallow going forward: tallow 0.9.10 is
+//                   pinned to the DEPRECATED @mariozechner/pi-* ^0.72.1 and
+//                   has had no npm release since 2026-05-06, while pi ships
+//                   actively as @earendil-works/pi-coding-agent 0.84.x.
+export type AgentName = 'claude' | 'claude-ollama' | 'tallow' | 'pi';
 
 export async function runDigest(
   agent: AgentName,
@@ -1435,6 +1593,9 @@ export async function runDigest(
 ): Promise<DigestResult> {
   if (agent === 'tallow') {
     return runTallowDigest(manifestPath, interests, model);
+  }
+  if (agent === 'pi') {
+    return runPiDigest(manifestPath, interests, model);
   }
   // Both 'claude' and 'claude-ollama' share runClaudeDigest — the only
   // difference is whether we route through `ollama launch claude` to point
