@@ -80,3 +80,36 @@ export function buildEmailSubject(date: Date): string {
     day:     'numeric',
   })}`;
 }
+
+// ============================================================
+// statusSubjectPrefix — status tag for the email subject
+// ============================================================
+//
+// EVERY subject carries a status tag, successes included. Before 2026-08-30
+// only failures were tagged, which produced this: the 3am cron run failed
+// (ollama 402) and sent "[GENERATION FAILED] BGG Digest — Sunday, August 30,
+// 2026", then three later runs succeeded and sent the bare "BGG Digest —
+// Sunday, August 30, 2026". buildEmailSubject() encodes only the DATE, so
+// every run on a given day produces the same base subject, Gmail collapses
+// them into one conversation, and the conversation shows the FIRST message's
+// subject — leaving a good digest sitting under a GENERATION FAILED heading
+// for the rest of the day.
+//
+// Tagging success explicitly gives failures and successes DIFFERENT subject
+// lines, so a failed run can no longer head a thread of good ones.
+//
+// KNOWN LIMIT: this does not stop threading outright. Several successful runs
+// in one day still share "[OK] BGG Digest — <date>" and will still group
+// together — which is harmless, since they are all successes. If you want
+// every run to stand alone, the subject needs a time component too.
+export function statusSubjectPrefix(
+  status: 'complete' | 'partial' | 'rate_limited' | 'invalid' | 'error',
+  skippedCount = 0,
+): string {
+  // Order matters: 'partial' is also implied by a non-empty skipped list, so
+  // the hard-failure states must be checked first.
+  if (status === 'invalid' || status === 'error') return '[GENERATION FAILED] ';
+  if (status === 'rate_limited')                  return '[RATE LIMITED] ';
+  if (status === 'partial' || skippedCount > 0)   return '[PARTIAL] ';
+  return '[OK] ';
+}

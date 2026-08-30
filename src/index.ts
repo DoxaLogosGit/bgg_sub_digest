@@ -61,7 +61,7 @@ import {
 import type { ManifestEntry, DigestResult, AgentName } from './agent';
 import type { BggGeeklistItem, BggThreadArticle, BggSubscription } from './types';
 import { buildMarkdown, writeDigest } from './digest';
-import { sendDigestEmail, buildEmailSubject } from './email';
+import { sendDigestEmail, buildEmailSubject, statusSubjectPrefix } from './email';
 
 // ============================================================
 // PID lock — prevent concurrent runs
@@ -721,10 +721,11 @@ async function runAgentAndWriteDigest(
   const status   = digestResult.status ?? 'complete';
   const skipped  = digestResult.skipped ?? [];
   let bannerLine = '';
-  let subjectPrefix = '';
+  // Prefix comes from statusSubjectPrefix() so success is tagged too — see the
+  // note there about a failed run heading a Gmail thread of good ones.
+  const subjectPrefix = statusSubjectPrefix(status, skipped.length);
 
   if (status === 'invalid') {
-    subjectPrefix = '[GENERATION FAILED] ';
     bannerLine = (
       `> ⚠️ **Generation failed** — the model produced an unusable digest ` +
       `(unfilled template, or no Highlights block) twice, including a retry.\n` +
@@ -732,14 +733,12 @@ async function runAgentAndWriteDigest(
       `next run. The raw subscription data is in \`${digestDataDir}\`.\n\n`
     );
   } else if (status === 'error') {
-    subjectPrefix = '[GENERATION FAILED] ';
     bannerLine = (
       `> ⚠️ **Summarization failed** — the agent could not be reached or crashed.\n` +
       `> BGG notices were **NOT** cleared, so this activity will be retried on the ` +
       `next run. The raw subscription data is in \`${digestDataDir}\`.\n\n`
     );
   } else if (status === 'rate_limited') {
-    subjectPrefix = '[RATE LIMITED] ';
     const completed = digestResult.completedCount ?? 0;
     const total     = digestResult.totalCount ?? 0;
     bannerLine = (
@@ -748,7 +747,6 @@ async function runAgentAndWriteDigest(
       `> Quota typically resets weekly per Ollama's policy.\n\n`
     );
   } else if (status === 'partial' || skipped.length > 0) {
-    subjectPrefix = '[PARTIAL] ';
     bannerLine = (
       `> ⚠️ **Partial digest** — ${skipped.length} subscription(s) failed to summarize after retry and are linked below for manual review:\n` +
       skipped.map((s) => `> - [${s.title}] — \`${s.filePath}\``).join('\n') +
