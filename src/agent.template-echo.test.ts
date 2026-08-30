@@ -86,7 +86,7 @@ assert.equal(
 
 // ---- stripReasoningTags: clean leaked minimax reasoning ----
 //
-// When tallow's provider adapter fails to route a model's reasoning into the
+// When pi's provider adapter fails to route a model's reasoning into the
 // JSONL `thinking` channel, the raw <mm:think>…</mm:think> tokens land in the
 // `text` body. Strip them defensively.
 const paired = '<mm:think>plan the digest</mm:think>## ⭐ Highlights\n- ⭐ a thing';

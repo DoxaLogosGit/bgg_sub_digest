@@ -165,7 +165,7 @@ async function main(): Promise<void> {
 
     // Parse --agent <name> and --model <name> from CLI args.
     //   `npm start -- --agent pi     --model ollama/nemotron-3-super:cloud`
-    //   `npm start -- --agent tallow --model omnicoder-oc`
+    //   `npm start -- --agent pi     --model omnicoder-oc`
     //   `npm start -- --agent claude-ollama --model qwen3-coder-next:cloud`
     //   `npm start -- --model sonnet`                         (claude is the default agent)
     //
@@ -174,14 +174,14 @@ async function main(): Promise<void> {
     //
     // Default agent is `claude`. Default model varies by agent:
     //   - claude              → opus  (Anthropic API)
-    //   - claude-ollama/tallow/pi → DEFAULT_AGENT_MODEL
+    //   - claude-ollama / pi      → DEFAULT_AGENT_MODEL
     //
     // WARNING (2026-08-30): DEFAULT_AGENT_MODEL is `qwen3-coder-next:cloud`,
     // which is RETIRED on ollama. Any non-claude run without an explicit
     // --model will fail. The crontab passes --model, so this is latent.
     const agentArgIndex = process.argv.indexOf('--agent');
     const agentArg      = agentArgIndex !== -1 ? process.argv[agentArgIndex + 1] : 'claude';
-    const VALID_AGENTS: readonly AgentName[] = ['claude', 'claude-ollama', 'tallow', 'pi'];
+    const VALID_AGENTS: readonly AgentName[] = ['claude', 'claude-ollama', 'pi'];
     if (!VALID_AGENTS.includes(agentArg as AgentName)) {
       throw new Error(
         `--agent must be one of ${VALID_AGENTS.map((a) => `"${a}"`).join(', ')} ` +
@@ -781,14 +781,14 @@ async function runAgentAndWriteDigest(
 //
 // Example output:
 //   ---
-//   *Agent: tallow (qwen3-coder-next:cloud) | Token usage: 43,924 input + 1,234 output (45,158 total) | Cost: ~$0.0463 | 45.2s*
+//   *Agent: pi (ollama/nemotron-3-super:cloud) | Token usage: 43,924 input + 1,234 output (45,158 total) | Cost: ~$0.0463 | 45.2s*
 //
 // PYTHON CONTEXT: `result.inputTokens.toLocaleString()` formats a number
 // with thousands separators — Python: f"{result.input_tokens:,}"
 // Template literals: `${expr}` — Python: f"{expr}"
 function formatTokenUsage(result: DigestResult, agent: AgentName, model: string): string {
   // Prefer the model the agent ACTUALLY used (reported in its output) over the
-  // one we requested — tallow can silently fall back to its default. If they
+  // one we requested — pi can silently fall back to its default. If they
   // differ (compared on the bare model name, ignoring any provider/ prefix),
   // show both so the fallback is visible in the digest itself.
   const bare = (m: string) => m.split('/').pop();

@@ -1,9 +1,9 @@
 // ============================================================
-// agent.tallow-body-recovery.test.ts — unit tests for selectDigestBody()
+// agent.body-recovery.test.ts — unit tests for selectDigestBody()
 // ============================================================
 //
 // Standalone (no test framework). Run:
-//   npx tsx src/agent.tallow-body-recovery.test.ts
+//   npx tsx src/agent.body-recovery.test.ts
 //
 // Guards the 2026-08-07 failure mode (ollama/minimax-m3:cloud, 49-subscription
 // run): the model's synthesis text turn was cut off mid-sentence before it
@@ -146,4 +146,4 @@ const incidentTurns = [
   assert.equal(turnIndex, -1, 'no turns must yield turnIndex -1');
 }
 
-console.log('agent.tallow-body-recovery.test.ts: all assertions passed ✓');
+console.log('agent.body-recovery.test.ts: all assertions passed ✓');

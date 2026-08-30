@@ -26,6 +26,12 @@ rows.
   ordering, mark relevant items with ⭐, and decide which subscriptions get
   full vs one-line treatment.
 
+- **`BGG-DATA-GUIDE.md`** — how to read the subscription data files without
+  misreading them. Covers post attribution (quoted text vs. the actual
+  author), per-post coverage, stub files, and BGG conventions. **Read this
+  before you summarise anything** — the traps it describes have produced
+  wrong digests before.
+
 - **`templates/section.md`** — the exact markdown structure to use for each
   per-subscription section. Match it.
 
@@ -38,26 +44,28 @@ rows.
 
 ## Workflow when invoked
 
-1. **Read `INTERESTS.md`** — load the reader's tracked games, priority
+1. **Read `BGG-DATA-GUIDE.md`** — the data-format rules. Attribution in
+   particular is easy to get wrong and is the error readers notice most.
+2. **Read `INTERESTS.md`** — load the reader's tracked games, priority
    subscriptions, and keyword interests into your working context.
-2. **Read `manifest.json`** — get the full list of subscriptions to process.
-3. **Read every subscription file** referenced by `filePath` in the
+3. **Read `manifest.json`** — get the full list of subscriptions to process.
+4. **Read every subscription file** referenced by `filePath` in the
    manifest. Read all of them, in order. Do NOT write any digest content
    while reading — no progress narration, no partial sections, no
    clarifying questions. Just read.
-4. **After all files are read**, write the entire digest in a single
+5. **After all files are read**, write the entire digest in a single
    response. The response is a one-shot stream — anything you write up
    front cannot be edited later, so do NOT write a Highlights placeholder
    ("[To be populated...]") at the start intending to fill it in.
-5. **Order subscription sections** as described under "Ordering" below.
+6. **Order subscription sections** as described under "Ordering" below.
    Each subscription appears EXACTLY ONCE — if it matches multiple
    ordering categories, place it in the FIRST matching one and do not
    list it again. Do NOT use `[Already processed]` markers anywhere.
-6. **After every subscription section is rendered**, write the
+7. **After every subscription section is rendered**, write the
    `## ⭐ Highlights` block LAST, following `templates/highlights.md`.
    Automated post-processing moves the Highlights block to the top of
    the digest after you finish — that's why it goes last in your output.
-7. Begin your response directly with the first subscription's
+8. Begin your response directly with the first subscription's
    `### [Title](URL)` header. No preamble, no duplicate document title
    (the digest tooling adds its own wrapper header).
 

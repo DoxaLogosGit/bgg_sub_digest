@@ -1,5 +1,5 @@
 // ============================================================
-// agent.ts — write subscription data files and invoke an agent (claude or tallow) to produce the digest
+// agent.ts — write subscription data files and invoke an agent (claude or pi) to produce the digest
 //
 // ARCHITECTURE (file-based, replaces the old single-prompt approach):
 //
@@ -11,7 +11,7 @@
 //   3. Launch the configured agent with a prompt telling it to read the
 //      manifest then each subscription file via its Read tool:
 //        - Claude:  `claude --model <m> --dangerously-skip-permissions --print --output-format json`
-//        - Tallow:  `tallow --model <m> --yolo --mode json --print "<prompt>"`
+//        - pi:      `pi --print --mode json --approve --provider <p> --model <m> "<prompt>"`
 //
 //   4. Parse the agent's response to extract the digest body AND token usage stats.
 //
@@ -32,8 +32,8 @@
 // ============================================================
 
 // `spawnSync` runs a child process synchronously (blocks until it exits).
-// `spawn` streams stdout/stderr — used for tallow whose JSONL output can
-// `spawnSync` for claude (bounded JSON output); `spawn` streaming for tallow
+// `spawn` streams stdout/stderr — used for pi whose JSONL output can
+// `spawnSync` for claude (bounded JSON output); `spawn` streaming for pi
 // (large JSONL output exceeds spawnSync's buffer cap).
 import { spawn, spawnSync } from 'child_process';
 
@@ -340,9 +340,9 @@ export function isMissingHighlights(body: string): boolean {
 // stripReasoningTags — remove leaked model reasoning from the body
 // ============================================================
 //
-// tallow's JSONL separates a turn's reasoning ({"type":"thinking"}) from its
-// output ({"type":"text"}), and runTallowDigest reads only the text items — so
-// cleanly-routed reasoning never reaches the digest. But when tallow's provider
+// pi's JSONL separates a turn's reasoning ({"type":"thinking"}) from its
+// output ({"type":"text"}), and runPiDigest reads only the text items — so
+// cleanly-routed reasoning never reaches the digest. But when pi's provider
 // adapter does NOT recognize a model's reasoning delimiter (minimax-m3 emits
 // <mm:think>…</mm:think>, which the 0.9.x adapter left un-parsed on 2026-07-02),
 // the raw tags land inside the `text` channel and leak into the digest.
@@ -426,7 +426,7 @@ export interface DigestResult {
   skipped?:        DigestSkippedEntry[];
 
   // The model the agent ACTUALLY used, as reported in its own output — not the
-  // `--model` we asked for. tallow can silently fall back to its default when
+  // `--model` we asked for. pi can silently fall back to its default when
   // the requested model is unavailable, so the footer should report what really
   // ran. Format: "provider/model" (e.g. "ollama/minimax-m3:cloud") when the
   // provider is known. Undefined when the agent doesn't report it (plain claude).
@@ -482,7 +482,7 @@ export function writeSubscriptionFile(
 // to do its job — manifest.json, subscription files, INTERESTS.md, CLAUDE.md
 // (orchestration), and templates/ (format references). The agent runs with
 // cwd=digestDataDir so it picks up CLAUDE.md automatically (claude-code and
-// tallow both read CLAUDE.md from cwd).
+// pi both read CLAUDE.md from cwd).
 //
 // Source layout (in this repo): templates/workspace/
 //   ├── CLAUDE.md
@@ -587,7 +587,7 @@ function buildDigestPrompt(
   // CLAUDE.md, INTERESTS.md, manifest.json, and templates/ from the cwd
   // (which is set to digestDataDir on spawn).
   //
-  // Both claude-code and tallow read CLAUDE.md from cwd automatically.
+  // Both claude-code and pi read CLAUDE.md from cwd automatically.
   return `Build the BGG subscription digest. All instructions, ordering rules, and section/highlights format references are in this directory's CLAUDE.md and templates/. The reader's interests are in INTERESTS.md. The manifest of subscriptions to process is at ./manifest.json. Begin.`;
 }
 
@@ -861,7 +861,7 @@ function trimHighlightsBlock(block: string): string {
 // postProcessDigestBody — the full output-cleanup pipeline
 // ============================================================
 //
-// Both the claude and tallow paths produce a raw markdown body that needs the
+// Both the claude and pi paths produce a raw markdown body that needs the
 // same defensive cleanup before it becomes the digest. Composing the steps in
 // ONE place keeps the two call sites in sync and makes the pipeline testable
 // in isolation (see agent.preamble.test.ts).
@@ -1112,13 +1112,13 @@ export function runClaudeDigest(
       shell:     true,
       encoding:  'utf-8',
       // cwd = digest-data so claude reads the workspace's CLAUDE.md and
-      // templates/ automatically. Both claude-code and tallow read
+      // templates/ automatically. Both claude-code and pi read
       // CLAUDE.md from the cwd.
       cwd:       path.dirname(manifestPath),
       // 45-minute hard cap. Anthropic-backed runs typically finish in 1–2 min,
       // but Ollama-backed runs (claude-ollama) routinely take 5–15 min and
       // have high variance day-to-day; cron hits the slow tail. Matches/exceeds
-      // tallow's 30-min ceiling.
+      // pi's 60-min ceiling.
       timeout:   45 * 60 * 1000,
       maxBuffer: 20 * 1024 * 1024,  // 20 MB max output buffer
       env:       { ...process.env, PATH: augmentedPath },
@@ -1275,25 +1275,27 @@ export function runClaudeDigest(
 
 // ============================================================
 // ============================================================
-// runTallowDigest — launch tallow with file access and parse JSONL events
+// runPiDigest — launch pi with file access and parse JSONL events
 // ============================================================
 //
-// Tallow (https://github.com/dungle-scrubs/tallow) is an alternative coding
-// agent that speaks the same Read-tool dance as Claude Code but supports
-// arbitrary providers (ollama, anthropic, openai, etc.) via its config.
+// pi (https://github.com/badlogic/pi-mono, published as
+// @earendil-works/pi-coding-agent) is a coding agent that speaks the same
+// Read-tool dance as Claude Code but supports arbitrary providers (ollama,
+// anthropic, openai, etc.) via its config.
 //
 // CLI shape:
-//   tallow --model <model> --yolo --mode json --print "<prompt>"
-//     --yolo       : auto-approve all tool confirmations (parallel of --dangerously-skip-permissions)
+//   pi --print --mode json --approve --provider <p> --model <m> "<prompt>"
+//     --approve    : auto-approve tool confirmations (parallel of --dangerously-skip-permissions)
 //     --mode json  : emit JSON Lines — one JSON event per line on stdout
 //     --print      : single-shot run; the prompt is passed as an argument (not via stdin)
 //
-// Provider selection is left to the user's ~/.tallow/settings.json
-// `defaultProvider` (typically "ollama"). Override per-invocation by editing
-// that file or by including `provider/model` in the model string if tallow
-// supports it for the chosen backend.
+// Provider comes from the "provider/model" prefix when present, else from
+// `defaultProvider` in the user's pi settings.json (typically "ollama").
+// pi's model catalog lives in ~/.dotfiles/pi/models.json — a model absent
+// from it fails with "Model <provider>/<id> not found" even when the backend
+// serves it fine.
 //
-// JSONL event shape we care about (verified empirically against tallow 0.9.x):
+// JSONL event shape we care about (verified empirically against pi 0.84.x):
 //   {"type":"session", ...}                      // first line, has session id
 //   {"type":"message_start", ...}
 //   {"type":"message_end", ...}
@@ -1317,7 +1319,7 @@ export function runClaudeDigest(
 // turn whose content contains a non-empty `text` chunk to grab the digest
 // body. Token usage is summed across every turn_end so the footer reflects
 // the full cost of the run.
-type TallowUsage = {
+type AgentUsage = {
   input?: number;
   output?: number;
   cacheRead?: number;
@@ -1327,22 +1329,22 @@ type TallowUsage = {
 };
 // `name` / `arguments` are populated for `type:'toolCall'` items — we only
 // care about the `write` tool's `arguments.content` (see selectDigestBody).
-type TallowContent = {
+type AgentContent = {
   type: string;
   text?: string;
   name?: string;
   arguments?: { content?: string; path?: string };
 };
-type TallowEvent = {
+type AgentEvent = {
   type: string;
-  // `model` / `provider` are what tallow ACTUALLY routed to for this turn —
-  // the source of truth for the footer, since tallow may silently fall back
+  // `model` / `provider` are what pi ACTUALLY routed to for this turn —
+  // the source of truth for the footer, since pi may silently fall back
   // to its default when the requested model can't be resolved.
-  message?: { content?: TallowContent[]; usage?: TallowUsage; model?: string; provider?: string };
+  message?: { content?: AgentContent[]; usage?: AgentUsage; model?: string; provider?: string };
 };
 
 // ============================================================
-// selectDigestBody — recover the digest text from a tallow run
+// selectDigestBody — recover the digest text from an agent run
 // ============================================================
 //
 // Failure mode (observed 2026-08-07 with ollama/minimax-m3:cloud, a 49-
@@ -1374,7 +1376,7 @@ type TallowEvent = {
 // newest non-empty `text` item), so a genuinely defective run still
 // surfaces as defective and the existing retry/invalid guard still
 // applies.
-export function selectDigestBody(turnEnds: TallowEvent[]): { body: string; turnIndex: number } {
+export function selectDigestBody(turnEnds: AgentEvent[]): { body: string; turnIndex: number } {
   let fallbackBody  = '';
   let fallbackIndex = -1;
 
@@ -1419,40 +1421,30 @@ export function selectDigestBody(turnEnds: TallowEvent[]): { body: string; turnI
 // default is currently a dead fallback. It only bites when no --model is
 // passed (the crontab always passes one). Deliberately left as-is pending the
 // model decision; when that lands, changing this ONE constant fixes every
-// caller. See also ~/.tallow/settings.json defaultModel, which points at the
+// caller. See also ~/.dotfiles/pi/settings.json defaultModel, which points at the
 // now-paywalled minimax-m3:cloud.
 export const DEFAULT_AGENT_MODEL = 'qwen3-coder-next:cloud';
 
 // ============================================================
-// buildAgentCliArgs — flag shapes for the pi-protocol CLIs
+// buildAgentCliArgs — pi's command line
 // ============================================================
 //
-// tallow and pi speak the SAME JSONL event protocol (tallow is built on pi),
-// verified 2026-08-30: both emit `turn_end` events whose `message.content`
-// carries `{type:'toolCall', name:'write', arguments:{content,path}}` items
-// and a `usage` object with input/output/cacheRead/cacheWrite/cost.total.
-// That is exactly what selectDigestBody() and the usage loop below consume,
-// so the ONLY thing that differs between them is the command line:
+// Kept as a separate pure function purely so the flag shapes are unit
+// testable without spawning a process (see agent.pi-cli-args.test.ts).
 //
-//   tallow --yolo               --mode json --model ollama/nemotron-3-super:cloud --print <prompt>
-//   pi     --approve --print    --mode json --provider ollama --model nemotron-3-super:cloud <prompt>
+//   pi --print --mode json --approve --provider ollama --model nemotron-3-super:cloud <prompt>
 //
-// tallow takes one combined `provider/model` string; pi wants them as two
-// separate flags. `--yolo` and `--approve` are the respective
-// "don't stop to ask about tool use" switches, which an unattended cron run
-// must have or the process blocks forever on a prompt nobody can answer.
-export function buildAgentCliArgs(
-  bin: 'tallow' | 'pi',
-  model: string,
-  prompt: string,
-): string[] {
-  if (bin === 'tallow') {
-    return ['--yolo', '--mode', 'json', '--model', model, '--print', prompt];
-  }
-
-  // pi: split a leading "provider/" prefix off the model id. Split on the
-  // FIRST '/' only — model ids legitimately contain ':' (gpt-oss:20b-cloud)
-  // and must not be mangled. With no prefix we omit --provider entirely and
+// `--approve` is the "don't stop to ask about tool use" switch. An unattended
+// cron run MUST have it or the process blocks forever on a permission prompt
+// nobody is there to answer, until the timeout SIGKILLs it.
+//
+// `--print` puts pi in non-interactive mode; `--mode json` selects the JSONL
+// event stream that runPiDigest() parses.
+export function buildAgentCliArgs(model: string, prompt: string): string[] {
+  // Split a leading "provider/" prefix off the model id. Split on the FIRST
+  // '/' only — model ids legitimately contain ':' (gpt-oss:20b-cloud) and
+  // may contain further slashes (carstenuhlig/omnicoder-2-9b:latest), so
+  // neither may be mangled. With no prefix we omit --provider entirely and
   // let pi fall back to defaultProvider from its settings.json.
   const slash = model.indexOf('/');
   const provider = slash === -1 ? undefined : model.slice(0, slash);
@@ -1468,25 +1460,7 @@ export function buildAgentCliArgs(
   ];
 }
 
-// Thin wrappers so callers keep a stable, descriptive entry point.
-export async function runTallowDigest(
-  manifestPath: string,
-  interests: string,
-  model = DEFAULT_AGENT_MODEL,
-): Promise<DigestResult> {
-  return runPiProtocolDigest('tallow', manifestPath, interests, model);
-}
-
 export async function runPiDigest(
-  manifestPath: string,
-  interests: string,
-  model = DEFAULT_AGENT_MODEL,
-): Promise<DigestResult> {
-  return runPiProtocolDigest('pi', manifestPath, interests, model);
-}
-
-async function runPiProtocolDigest(
-  bin: 'tallow' | 'pi',
   manifestPath: string,
   interests: string,
   model = DEFAULT_AGENT_MODEL,
@@ -1498,7 +1472,7 @@ async function runPiProtocolDigest(
   // quotes/backticks/newlines in the prompt are safe.
   const home = process.env.HOME ?? '';
   const extraPaths = [
-    `${home}/.bun/bin`,                         // bun-installed tallow/pi (the typical install)
+    `${home}/.bun/bin`,                         // bun-installed pi (the typical install)
     `${home}/.local/bin`,                       // npm global on Linux
     `${home}/.npm-global/bin`,                  // npm with custom prefix
     `${home}/.nvm/versions/node/current/bin`,   // nvm current
@@ -1506,9 +1480,9 @@ async function runPiProtocolDigest(
   ];
   const augmentedPath = [...extraPaths, process.env.PATH ?? ''].join(':');
 
-  const args = buildAgentCliArgs(bin, model, prompt);
+  const args = buildAgentCliArgs(model, prompt);
 
-  log.debug(`Launching ${bin} with --mode json (streaming)`, {
+  log.debug('Launching pi with --mode json (streaming)', {
     manifestPath,
     model,
     promptLength: prompt.length,
@@ -1525,15 +1499,15 @@ async function runPiProtocolDigest(
   // were hitting ENOBUFS on the 50MB spawnSync cap. Streaming has no cap and
   // also lowers peak memory because we keep only the parsed turn_end events
   // (small) and discard everything else line-by-line.
-  // (TallowUsage / TallowContent / TallowEvent are declared at module scope,
+  // (AgentUsage / AgentContent / AgentEvent are declared at module scope,
   // above, so selectDigestBody can be a standalone testable function.)
 
   // Wall-clock the run so we can populate durationMs (the JSONL doesn't
   // include a top-level duration like Claude's --output-format json does).
   const start = Date.now();
-  const proc  = spawn(bin, args, {
+  const proc  = spawn('pi', args, {
     // cwd = digest-data so the agent picks up the workspace's CLAUDE.md and
-    // templates/ from there. tallow scans .claude/ and .tallow/ in cwd; pi
+    // templates/ from there. pi
     // discovers CLAUDE.md/AGENTS.md the same way (its --no-context-files flag
     // is what would DISABLE that, and we deliberately do not pass it).
     cwd:   path.dirname(manifestPath),
@@ -1541,26 +1515,26 @@ async function runPiProtocolDigest(
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
-  // Hard timeout — kill tallow if it hangs (e.g. local model deadlock).
+  // Hard timeout — kill pi if it hangs (e.g. local model deadlock).
   //
   // Raised 30 -> 60 min on 2026-08-30. Every ollama cloud model that used to
   // run this digest is now behind a 402 paywall, and the free-tier models that
   // replace them are FAR slower: nemotron-3-super:cloud took 1287s (21.5 min)
   // for a light 11-subscription run, where minimax-m3 did 18 subscriptions in
   // 105s. At 30 min a heavier day would have been SIGKILLed, which surfaces as
-  // "tallow produced no turn_end events" — indistinguishable from the paywall
+  // "pi produced no turn_end events" — indistinguishable from the paywall
   // failure it replaced. 60 min buys roughly 2.5x headroom over the measured
   // worst case. This is a ceiling for a hung process, not a target: a healthy
   // run still exits as soon as the agent is done.
   const TIMEOUT_MS = 60 * 60 * 1000;
   const timeoutHandle = setTimeout(() => {
-    log.warn(`${bin} exceeded ${TIMEOUT_MS}ms timeout — killing process`);
+    log.warn(`pi exceeded ${TIMEOUT_MS}ms timeout — killing process`);
     proc.kill('SIGKILL');
   }, TIMEOUT_MS);
 
   // Only retain turn_end events — every other event type is discarded as it
   // streams in, keeping memory bounded regardless of digest size.
-  const turnEnds: TallowEvent[] = [];
+  const turnEnds: AgentEvent[] = [];
   let stdoutTail   = '';     // partial last line awaiting a newline
   let stderrChunks = '';     // capped stderr for error diagnostics
   let totalBytes   = 0;
@@ -1575,7 +1549,7 @@ async function runPiProtocolDigest(
       stdoutTail = stdoutTail.slice(nl + 1);
       if (!line) continue;
       try {
-        const ev = JSON.parse(line) as TallowEvent;
+        const ev = JSON.parse(line) as AgentEvent;
         if (ev.type === 'turn_end') turnEnds.push(ev);
       } catch {
         // Skip un-parseable lines defensively.
@@ -1599,13 +1573,13 @@ async function runPiProtocolDigest(
       const last = stdoutTail.trim();
       if (last) {
         try {
-          const ev = JSON.parse(last) as TallowEvent;
+          const ev = JSON.parse(last) as AgentEvent;
           if (ev.type === 'turn_end') turnEnds.push(ev);
         } catch { /* skip */ }
       }
       if (code !== 0) {
         reject(new Error(
-          `${bin} exited with code ${code}: ${stderrChunks.slice(0, 1000)}`,
+          `pi exited with code ${code}: ${stderrChunks.slice(0, 1000)}`,
         ));
         return;
       }
@@ -1614,7 +1588,7 @@ async function runPiProtocolDigest(
   });
   const durationMs = Date.now() - start;
 
-  log.debug(`${bin} stream complete`, {
+  log.debug('pi stream complete', {
     bytesRead:  totalBytes,
     turnEnds:   turnEnds.length,
     durationMs,
@@ -1622,7 +1596,7 @@ async function runPiProtocolDigest(
 
   if (turnEnds.length === 0) {
     throw new Error(
-      `${bin} produced no turn_end events (${totalBytes} bytes read). ` +
+      `pi produced no turn_end events (${totalBytes} bytes read). ` +
       `stderr: ${stderrChunks.slice(0, 500)}`,
     );
   }
@@ -1638,7 +1612,7 @@ async function runPiProtocolDigest(
   const synthesisProvider: string | undefined = turnIndex !== -1 ? turnEnds[turnIndex].message?.provider : undefined;
   if (!body) {
     throw new Error(
-      `${bin} ran ${turnEnds.length} turn(s) but no turn produced assistant text. ` +
+      `pi ran ${turnEnds.length} turn(s) but no turn produced assistant text. ` +
       `Model may have looped on tool calls without ever synthesizing.`,
     );
   }
@@ -1678,7 +1652,7 @@ async function runPiProtocolDigest(
   // don't cause false mismatches.
   const bare = (m: string) => m.split('/').pop();
   if (actualModel && bare(actualModel) !== bare(model)) {
-    log.warn(`${bin} used a DIFFERENT model than requested — fell back?`, {
+    log.warn(`pi used a DIFFERENT model than requested — fell back?`, {
       requested: model,
       actual:    actualModel,
     });
@@ -1692,7 +1666,7 @@ async function runPiProtocolDigest(
 }
 
 // ============================================================
-// runDigest — dispatch to claude / claude-ollama / tallow based on agent name
+// runDigest — dispatch to claude / claude-ollama / pi based on agent name
 // ============================================================
 //
 // 'claude'        — claude CLI against Anthropic's API. Original tool-loop
@@ -1702,15 +1676,18 @@ async function runPiProtocolDigest(
 //                   pattern as plain claude. Item-cap truncation in the
 //                   data-fetch phase keeps total context within the 200K
 //                   model window so degeneration doesn't trigger.
-// 'tallow'        — tallow CLI (its own provider routing).
-// 'pi'            — pi CLI (@earendil-works/pi-coding-agent). Same JSONL
-//                   event protocol as tallow — tallow is built on pi — so it
-//                   shares runPiProtocolDigest() and every downstream parser.
-//                   Preferred over tallow going forward: tallow 0.9.10 is
-//                   pinned to the DEPRECATED @mariozechner/pi-* ^0.72.1 and
-//                   has had no npm release since 2026-05-06, while pi ships
-//                   actively as @earendil-works/pi-coding-agent 0.84.x.
-export type AgentName = 'claude' | 'claude-ollama' | 'tallow' | 'pi';
+// 'pi'            — pi CLI (@earendil-works/pi-coding-agent), JSONL event
+//                   stream parsed by runPiDigest().
+//
+// REMOVED 2026-08-30: 'tallow'. tallow 0.9.10 was pinned to the DEPRECATED
+// @mariozechner/pi-* ^0.72.1 with no npm release since 2026-05-06, while pi
+// moved to @earendil-works/pi-coding-agent 0.84.x and ships actively. tallow
+// was also measurably worse at the same job: on an identical manifest it took
+// 1287s and streamed 489 MB where pi took 310s and streamed 1.5 MB, because
+// tallow echoed full file contents back on every tool round. Since tallow was
+// built on pi, dropping it cost nothing at the parser level — the JSONL event
+// shape is the same one pi emits.
+export type AgentName = 'claude' | 'claude-ollama' | 'pi';
 
 export async function runDigest(
   agent: AgentName,
@@ -1718,9 +1695,6 @@ export async function runDigest(
   interests: string,
   model?: string,
 ): Promise<DigestResult> {
-  if (agent === 'tallow') {
-    return runTallowDigest(manifestPath, interests, model);
-  }
   if (agent === 'pi') {
     return runPiDigest(manifestPath, interests, model);
   }
