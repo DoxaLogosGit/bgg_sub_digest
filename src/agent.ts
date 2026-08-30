@@ -739,6 +739,125 @@ function stripPreamble(body: string): string {
 }
 
 // ============================================================
+// stripBlockNarration — drop model narration BETWEEN and AFTER blocks
+// ============================================================
+//
+// stripPreamble() handles narration BEFORE the first section. This handles
+// everywhere else. Observed 2026-08-30 (pi + nemotron-3-super:cloud, real
+// cron run): the model narrated its plan in three additional places —
+//
+//   1. between sections   "Now, next section: Priority Threads: ..."
+//   2. after the last section, before the Highlights header — a ~50-line
+//      planning block ("Let's list the tracked games ...", "We'll write:")
+//   3. after the Highlights bullets  "We'll output it all at once."
+//
+// and liftHighlightsToTop() then AMPLIFIED it. That helper slices from the
+// Highlights header to the END OF BODY and moves the slice to the top, so (3)
+// was relocated directly beneath the Highlights bullets while (2) was left
+// stranded at the bottom — clutter at both ends of the reader's email. The
+// tell in the real digest: its last line before the footer was "We'll write:",
+// the sentence that had immediately preceded the Highlights header.
+//
+// STRUCTURAL, NOT KEYWORD-BASED. We deliberately mirror stripPreamble's anchor
+// approach instead of matching phrases like "Let's" or "Now,": a keyword list
+// is endless, model-specific, and risks eating real digest prose (a summary
+// could legitimately begin "Now in its third printing..."). Instead we rely on
+// the structure templates/section.md already guarantees:
+//
+//   - A section runs from "### [Title](URL)" to the next block marker, and its
+//     LAST legitimate line is "**Topics Mentioned:** ...". Anything after that
+//     line, inside the section, is narration.
+//   - The Highlights block is its header plus contiguous "-" bullet lines.
+//     Anything after the bullets is narration.
+//
+// SAFETY VALVE: a section with no "**Topics Mentioned:**" line is left
+// completely untouched. Keeping a little narration beats silently deleting
+// real content from a section the model rendered unusually.
+//
+// ORDERING: must run BEFORE liftHighlightsToTop, so the trailing narration is
+// already gone when the Highlights block gets relocated. It also runs after
+// elideDuplicateSections so it only walks sections that survived dedup.
+export function stripBlockNarration(body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return body;
+
+  // Block markers: a bracketed section header, or the Highlights header.
+  // These are the only legitimate top-level starts in a digest.
+  const markerRe = /^[ \t]*(?:###[ \t]+\[|##[ \t]+(?:⭐[ \t]+)?Highlights[ \t]*$)/gim;
+
+  const starts: number[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = markerRe.exec(trimmed)) !== null) starts.push(m.index);
+
+  if (starts.length === 0) return body;      // nothing recognisable → leave alone
+
+  let removed = 0;
+  const kept: string[] = [];
+
+  for (let i = 0; i < starts.length; i++) {
+    const blockStart = starts[i];
+    const blockEnd   = i + 1 < starts.length ? starts[i + 1] : trimmed.length;
+    const block      = trimmed.slice(blockStart, blockEnd);
+
+    const isHighlights = /^[ \t]*##[ \t]+(?:⭐[ \t]+)?Highlights/i.test(block);
+    const cleaned      = isHighlights ? trimHighlightsBlock(block) : trimSectionBlock(block);
+
+    // Measure against the block's OWN trimEnd(), not its raw length: the
+    // helpers trimEnd their result, and re-joining blocks normalises the
+    // blank lines between them. Without this, a perfectly clean digest
+    // reports a spurious "Stripped 2 chars" warning purely from whitespace.
+    removed += block.trimEnd().length - cleaned.length;
+    kept.push(cleaned);
+  }
+
+  if (removed <= 0) return trimmed;
+
+  log.warn(`Stripped ${removed} chars of model narration between/after digest blocks`);
+  return kept.join('\n\n').trim();
+}
+
+// A section ends at its "**Topics Mentioned:**" line. Keep through the end of
+// that line (plus an optional "---" separator the models like to emit) and
+// drop whatever follows.
+function trimSectionBlock(block: string): string {
+  // Find the LAST Topics line — a section should have exactly one, but if the
+  // model repeated itself the final one is the true end of its content.
+  const topicsRe = /^[ \t]*\*\*Topics Mentioned:\*\*.*$/gim;
+  let last: RegExpExecArray | null = null;
+  let m: RegExpExecArray | null;
+  while ((m = topicsRe.exec(block)) !== null) last = m;
+
+  if (!last) return block.trimEnd();   // safety valve: no anchor → untouched
+
+  return block.slice(0, last.index + last[0].length).trimEnd();
+}
+
+// The Highlights block is its header followed by contiguous bullet lines.
+// Keep the header and every bullet up to the first non-bullet, non-blank line.
+function trimHighlightsBlock(block: string): string {
+  const lines = block.split('\n');
+  const out: string[] = [lines[0]];        // the "## ⭐ Highlights" header itself
+
+  let seenBullet = false;
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    const isBullet = /^[ \t]*[-*][ \t]+/.test(line);
+    const isBlank  = line.trim() === '';
+
+    if (isBullet) { seenBullet = true; out.push(line); continue; }
+    if (isBlank)  { out.push(line); continue; }
+
+    // First real prose line AFTER we've seen at least one bullet ends the
+    // block. Before any bullet we keep going — some models put a short lead-in
+    // line between the header and the list.
+    if (seenBullet) break;
+    out.push(line);
+  }
+
+  return out.join('\n').trimEnd();
+}
+
+// ============================================================
 // postProcessDigestBody — the full output-cleanup pipeline
 // ============================================================
 //
@@ -753,18 +872,26 @@ function stripPreamble(body: string): string {
 //   3. fixHallucinatedHostnames — repair "boardgeek.com" → "boardgamegeek.com"
 //   4. elideRepetitionCollapse  — cut runaway autoregressive line loops
 //   5. elideDuplicateSections   — drop a section rendered twice (keep first)
-//   6. liftHighlightsToTop      — move the trailing Highlights block to the top
+//   6. stripBlockNarration      — drop narration BETWEEN sections and AFTER
+//                                 the Highlights bullets. MUST precede the
+//                                 lift: liftHighlightsToTop slices to end-of-
+//                                 body, so any narration still trailing the
+//                                 Highlights block would be carried to the
+//                                 top of the digest with it.
+//   7. liftHighlightsToTop      — move the trailing Highlights block to the top
 //
 // stripReasoningTags is innermost so leaked reasoning is gone before stripPreamble
 // measures the "preamble", before dedup (which keys off "### [Title]" headers),
 // and before the Highlights lift reshuffles things.
 export function postProcessDigestBody(body: string): string {
   return liftHighlightsToTop(
-    elideDuplicateSections(
-      elideRepetitionCollapse(
-        fixHallucinatedHostnames(
-          stripPreamble(
-            stripReasoningTags(body),
+    stripBlockNarration(
+      elideDuplicateSections(
+        elideRepetitionCollapse(
+          fixHallucinatedHostnames(
+            stripPreamble(
+              stripReasoningTags(body),
+            ),
           ),
         ),
       ),
