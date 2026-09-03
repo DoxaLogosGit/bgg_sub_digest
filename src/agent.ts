@@ -337,6 +337,104 @@ export function isMissingHighlights(body: string): boolean {
 }
 
 // ============================================================
+// isVacuousDigest — detect a digest whose sections say nothing
+// ============================================================
+//
+// Failure mode (observed 2026-09-01, 09-02 and 09-03 with pi +
+// nemotron-3-super:cloud): the model emits STRUCTURALLY PERFECT markdown —
+// right number of `### [Title](url)` sections, correct field labels, a real
+// `## ⭐ Highlights` header — but the content is boilerplate it invented
+// rather than anything read out of the subscription files:
+//
+//     **Summary:** New activity detected in this subscription.
+//     **New Activity:**
+//     - See subscription details for new posts.
+//     **Topics Mentioned:** none
+//
+// ...repeated for all 34 sections, under a single "⭐ Placeholder highlight."
+//
+// Neither existing guard sees it. It is not isTemplateEcho() — none of the
+// template's angle-bracket sentinels appear, because the model wrote fresh
+// filler instead of copying the format examples. It is not
+// isMissingHighlights() — the header is right there. So digestDefect()
+// returned null, the run was stamped 'complete', the mail went out tagged
+// [OK], and 60 BGG notices were cleared: the same data-loss door the other
+// two guards were built to close, through a third entrance.
+//
+// WHAT WE KEY ON. A real digest describes a DIFFERENT thing in every section,
+// because every subscription had different activity. A vacuous one repeats
+// itself. Two independent ratios, measured over the `### [` sections only
+// (the lifted Highlights block sits above the first one and is excluded):
+//
+//   distinctSummaryRatio — distinct "Summary:" lines / sections
+//   dupBulletRatio       — sections whose whole bullet list duplicates
+//                          another section's / sections
+//
+// Measured over every digest on disk (2026-08-27 … 09-03):
+//
+//            secs  distinctSummary  dupBullet   verdict
+//   08-28      18       1.00           0.00     good
+//   08-30      11       1.00           0.00     good
+//   08-31      14       0.71           0.36     good
+//   09-01      33       1.00           0.97     BAD
+//   09-02      34       0.09           0.35     BAD
+//   09-03      34       0.06           0.94     BAD
+//
+// Each bad day is caught by exactly ONE of the two ratios and passes the
+// other cleanly, so the OR is load-bearing — neither signal alone is enough:
+// 09-01 wrote a unique "New activity in <Title>." per section (unique
+// summaries) but gave every one of them the identical bullet; 09-02 did the
+// reverse. Thresholds sit in the gap with room on both sides (worst good day
+// is 0.71 vs the 0.30 trigger, and 0.36 vs the 0.60 trigger).
+//
+// KNOWN LIMIT — stub-heavy days. Subscriptions whose replies fall outside
+// BGG's API window render as legitimate near-identical "content not
+// retrievable" sections, and those duplicates are CORRECT. 08-31 is exactly
+// that case (5 of 14 sections duplicated, ratio 0.36) and the thresholds are
+// set to clear it. But a day that is overwhelmingly stubs could still trip
+// this and cost the user one digest — which is the cheap direction to fail,
+// since a false positive only means notices are kept and retried tomorrow,
+// while a false negative clears them and loses the activity for good.
+//
+// The MIN_SECTIONS floor keeps light days out of it entirely: with 5 sections
+// a single pair of duplicates is 0.40 of the digest and means nothing.
+const MIN_SECTIONS            = 6;
+const MIN_DISTINCT_SUMMARY    = 0.30;
+const MAX_DUPLICATE_BULLETS   = 0.60;
+
+export function isVacuousDigest(body: string): boolean {
+  // Split on the per-subscription header. [1:] drops everything before the
+  // first section — the document title and the lifted Highlights block.
+  const sections = body.split(/^### \[/m).slice(1);
+  if (sections.length < MIN_SECTIONS) return false;
+
+  const summaries   = new Set<string>();
+  const bulletLists = new Set<string>();
+  let duplicateBulletSections = 0;
+
+  for (const section of sections) {
+    // Accept "**Summary:**", "Summary:" and "*Summary*" — which bolding the
+    // model uses drifts run to run and is not itself a defect.
+    const summaryMatch = /^\*{0,2}Summary:?\*{0,2}[ \t]*(.*)$/m.exec(section);
+    summaries.add(summaryMatch ? summaryMatch[1].trim() : '');
+
+    // The whole bullet list is the fingerprint, not individual bullets: two
+    // sections may legitimately share one bullet, but not their entire list.
+    const bullets = (section.match(/^[ \t]*[-*][ \t]+.*$/gm) ?? [])
+      .map((line) => line.trim())
+      .join('\n');
+    if (bulletLists.has(bullets)) duplicateBulletSections += 1;
+    bulletLists.add(bullets);
+  }
+
+  const distinctSummaryRatio = summaries.size / sections.length;
+  const dupBulletRatio       = duplicateBulletSections / sections.length;
+
+  return distinctSummaryRatio < MIN_DISTINCT_SUMMARY
+      || dupBulletRatio       > MAX_DUPLICATE_BULLETS;
+}
+
+// ============================================================
 // stripReasoningTags — remove leaked model reasoning from the body
 // ============================================================
 //
@@ -384,8 +482,9 @@ export function stripReasoningTags(body: string): string {
 // caller already banners those — so we never second-guess or override it here.
 function digestDefect(result: DigestResult): string | null {
   if (result.status && result.status !== 'complete') return null;
-  if (isTemplateEcho(result.body))     return 'unfilled template';
+  if (isTemplateEcho(result.body))      return 'unfilled template';
   if (isMissingHighlights(result.body)) return 'missing Highlights block';
+  if (isVacuousDigest(result.body))     return 'vacuous sections (no real content)';
   return null;
 }
 
