@@ -137,3 +137,68 @@ function digest(n: number, gen: (i: number) => { summary: string; bullets: strin
 }
 
 console.log('✓ agent.vacuous.test.ts — all assertions passed');
+
+// ============================================================
+// generateGuardedDigest — retry policy
+// ============================================================
+//
+// Verified 2026-09-03 by re-running the exact 09-03 workspace: the vacuous
+// failure is DETERMINISTIC at 34 subscriptions (a fourth run produced the same
+// 2-distinct-summary shape). A retry there costs another 9-17 minutes at 3am
+// and lands in the same place, so this defect alone skips it. The other two
+// defects were each seen once and keep the retry.
+
+import { generateGuardedDigest, type DigestResult } from './agent';
+
+function result(body: string): DigestResult {
+  return { body, inputTokens: 0, outputTokens: 0, costUsd: 0, durationMs: 0 };
+}
+
+const vacuousBody = digest(34, () => ({
+  summary: 'Activity detected.',
+  bullets: ['Activity detected.'],
+}));
+const goodBody = digest(14, (i) => ({
+  summary: `Users discussed scenario ${i} and its difficulty curve.`,
+  bullets: [`⭐ user${i} posted a session report scoring ${200 + i} points.`],
+}));
+
+// Wrapped in a function: tsx compiles these standalone tests to CJS, which
+// has no top-level await.
+async function retryPolicyTests() {
+  // ---- 9. a vacuous digest is marked invalid WITHOUT a second run ----
+  {
+    let runs = 0;
+    const out = await generateGuardedDigest(async () => { runs += 1; return result(vacuousBody); });
+
+    assert.equal(runs, 1, 'vacuous must not burn a retry — the failure is deterministic');
+    assert.equal(out.status, 'invalid', 'vacuous must be invalid so notices are NOT cleared');
+  }
+
+  // ---- 10. a missing-Highlights digest still gets its retry ----
+  // Unchanged behavior: that defect has no evidence of being deterministic,
+  // and a retry that succeeds saves the whole day's digest.
+  {
+    let runs = 0;
+    const out = await generateGuardedDigest(async () => {
+      runs += 1;
+      return result(runs === 1 ? goodBody.replace('## ⭐ Highlights', '## Notes') : goodBody);
+    });
+
+    assert.equal(runs, 2, 'missing Highlights must still retry once');
+    assert.equal(out.status, undefined, 'a successful retry stays shippable');
+  }
+
+  // ---- 11. a good digest runs exactly once ----
+  {
+    let runs = 0;
+    const out = await generateGuardedDigest(async () => { runs += 1; return result(goodBody); });
+
+    assert.equal(runs, 1);
+    assert.equal(out.status, undefined);
+  }
+
+  console.log('✓ agent.vacuous.test.ts — retry policy assertions passed');
+}
+
+retryPolicyTests().catch((err) => { console.error(err); process.exit(1); });

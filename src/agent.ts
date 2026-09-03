@@ -484,14 +484,34 @@ function digestDefect(result: DigestResult): string | null {
   if (result.status && result.status !== 'complete') return null;
   if (isTemplateEcho(result.body))      return 'unfilled template';
   if (isMissingHighlights(result.body)) return 'missing Highlights block';
-  if (isVacuousDigest(result.body))     return 'vacuous sections (no real content)';
+  if (isVacuousDigest(result.body))     return VACUOUS_DEFECT;
   return null;
 }
+
+// A vacuous digest is NOT worth a retry. Verified 2026-09-03: re-running the
+// exact 09-03 workspace (34 subscriptions, same model, same prompt) produced a
+// fourth vacuous digest with the same shape — 34 sections, 2 distinct
+// summaries, "Activity detected." in 23 of them. The failure is deterministic
+// at this input size, so a retry buys nothing and costs another 9-17 minutes
+// of wall clock and a second pass of Ollama free-tier quota at 3am.
+//
+// The other two defects keep the retry: they were each seen ONCE, and there is
+// no evidence they are deterministic the way this one demonstrably is.
+const VACUOUS_DEFECT = 'vacuous sections (no real content)';
 
 export async function generateGuardedDigest(run: () => Promise<DigestResult>): Promise<DigestResult> {
   let result = await run();
   let defect = digestDefect(result);
   if (!defect) return result;
+
+  if (defect === VACUOUS_DEFECT) {
+    log.error(
+      `Agent digest defective (${defect}) — deterministic at this input, ` +
+      `skipping the retry and marking invalid`,
+    );
+    result.status = 'invalid';
+    return result;
+  }
 
   log.warn(`Agent produced a defective digest (${defect}) — retrying once`);
   result = await run();
