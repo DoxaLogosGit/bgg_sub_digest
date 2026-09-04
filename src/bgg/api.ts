@@ -237,6 +237,19 @@ function truncate(text: string, max = 1000): string {
 // "this Promise resolves to either a BggThread or null".
 // Python: async def fetch_thread(...) -> Optional[BggThread]
 
+// Hours to widen the API-side cutoff by. Must exceed the largest negative
+// UTC offset in use (-12:00), so BGG's local reading of our naive string can
+// never land after the true cutoff. See the block comment in fetchThread.
+const TZ_SAFETY_HOURS = 14;
+
+// bggMinArticleDateParam — format a cutoff for BGG's `minarticledate` param.
+// Exported for testing; see fetchThread for why the value is widened.
+export function bggMinArticleDateParam(minArticleDate: Date): string {
+  const floor = new Date(minArticleDate.getTime() - TZ_SAFETY_HOURS * 3600 * 1000);
+  const iso = floor.toISOString();                          // 2026-04-28T05:00:00.000Z
+  return iso.slice(0, 10) + ' ' + iso.slice(11, 19);        // 2026-04-28 05:00:00
+}
+
 export async function fetchThread(
   threadId: number,
   apiKey: string,
@@ -249,11 +262,33 @@ export async function fetchThread(
 ): Promise<BggThread | null> {
   // BGG's date format for minarticledate is YYYY-MM-DD HH:mm:ss (URL-encoded space).
   // Verified empirically: ISO-8601 with "T" separator returns 400.
+  //
+  // TIMEZONE (2026-09-03 — this silently emptied 32% of the digest):
+  // the string carries NO offset, and BGG reads it in the ACCOUNT'S LOCAL
+  // zone, not UTC. We were formatting from toISOString() (UTC), so for an
+  // account at -05:00 every cutoff landed 5 HOURS IN THE FUTURE and the API
+  // returned nothing. The caller's 2h buffer could not absorb that, so real
+  // activity came back as "no fetchable new articles" and the pipeline wrote
+  // a "content not retrievable" stub. Proof, thread 3761626:
+  //
+  //   no minarticledate            -> 26 articles (newest 11:07:10-05:00)
+  //   "2026-09-02 12:12:31" (UTC)  ->  0 articles
+  //   same value minus 4h          ->  2 articles  <- exactly the 2 unread
+  //
+  // On the 2026-09-03 run, 11 of 34 subscriptions were emptied this way. All
+  // 11 had real content when re-fetched unfiltered.
+  //
+  // FIX: widen only what we SEND, by more than any real-world UTC offset
+  // (the extreme is -12:00), so BGG's local reading of the string can never
+  // land after the true cutoff. This deliberately over-fetches; the caller
+  // already re-filters client-side against the precise cutoff using parsed
+  // Date objects, which is timezone-correct. Do NOT "fix" this by formatting
+  // in the machine's local time instead: that only works while the box's
+  // timezone matches the BGG account's, and breaks on a DST shift or a box
+  // in another region.
   const params = new URLSearchParams({ id: String(threadId) });
   if (minArticleDate) {
-    const iso = minArticleDate.toISOString();   // 2026-04-28T05:00:00.000Z
-    const bgg = iso.slice(0, 10) + ' ' + iso.slice(11, 19);  // 2026-04-28 05:00:00
-    params.set('minarticledate', bgg);
+    params.set('minarticledate', bggMinArticleDateParam(minArticleDate));
   }
   const url = `${BGG_V2}/thread?${params.toString()}`;
   log.debug('Fetching thread', { threadId, url });
