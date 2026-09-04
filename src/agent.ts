@@ -858,6 +858,47 @@ function stripPreamble(body: string): string {
 }
 
 // ============================================================
+// tidyParentLines — repair the "*Parent:*" line
+// ============================================================
+//
+// Observed 2026-09-04 (pi + nemotron-3-super:cloud, repaired workspace): every
+// rendered section carried a dangling em dash, and sections with no parent got
+// an empty label:
+//
+//     *Parent: Marvel Champions: The Card Game* —
+//     *Parent: * —
+//
+// ROOT CAUSE was the template itself. templates/section.md wrote the pattern
+// and its own usage note on ONE line —
+//
+//     *Parent: <parentName>* — only include this line if `parentName` is set
+//
+// — so a model following the structure faithfully reproduced the separator
+// that introduced the note. The template has been fixed (the note moved into
+// Notes, where it cannot be copied into output), but a prompt change is only
+// a request: this runs unattended at 3am against a model that ignores
+// instructions under load, so we also repair it here.
+//
+// Two repairs, both conservative:
+//   - an EMPTY parent (`*Parent: *`) means the manifest had no parentName —
+//     drop the line entirely, which is what the template asks for.
+//   - a populated parent keeps its name; only trailing separator punctuation
+//     after the closing `*` is removed. We never touch the name itself.
+export function tidyParentLines(body: string): string {
+  const before = body.length;
+  const cleaned = body
+    // Empty parent → drop the whole line (and the newline it sits on).
+    .replace(/^[ \t]*\*Parent:[ \t]*\*[ \t]*[—\-–:]*[ \t]*\r?\n/gim, '')
+    // Populated parent → keep "*Parent: Name*", drop trailing separators.
+    .replace(/^([ \t]*\*Parent:[ \t]*[^*\n]+\*)[ \t]*[—\-–:]+[ \t]*$/gim, '$1');
+
+  if (cleaned.length !== before) {
+    log.debug('Tidied Parent lines', { removedChars: before - cleaned.length });
+  }
+  return cleaned;
+}
+
+// ============================================================
 // stripBlockNarration — drop model narration BETWEEN and AFTER blocks
 // ============================================================
 //
@@ -1004,12 +1045,17 @@ function trimHighlightsBlock(block: string): string {
 // and before the Highlights lift reshuffles things.
 export function postProcessDigestBody(body: string): string {
   return liftHighlightsToTop(
+    // tidyParentLines runs INSIDE stripBlockNarration's input so a repaired
+    // section still ends where that helper expects; it only edits the Parent
+    // line, never block boundaries.
     stripBlockNarration(
-      elideDuplicateSections(
-        elideRepetitionCollapse(
-          fixHallucinatedHostnames(
-            stripPreamble(
-              stripReasoningTags(body),
+      tidyParentLines(
+        elideDuplicateSections(
+          elideRepetitionCollapse(
+            fixHallucinatedHostnames(
+              stripPreamble(
+                stripReasoningTags(body),
+              ),
             ),
           ),
         ),
