@@ -345,4 +345,73 @@ assert.equal(
   'an empty configured username must never match',
 );
 
+// ============================================================
+// matchedIds — what the CAP must not throw away
+// ============================================================
+//
+// index.ts hard-caps each subscription at maxNewItemsPerSubscription. If that
+// cap drops the very post that triggered the flag, the digest names a reply
+// ("1 comment on your item X") whose content is not in the data file — the
+// same reason/content mismatch that produced the "nothing at the highlighted
+// item" bug on geeklists. matchedIds is what lets the caller sort the
+// qualifying entries safely inside the cap.
+
+// Threads: matchedIds are ARTICLE ids, and only the qualifying ones.
+{
+  const quoting = article({ id: 501, username: 'alice', body: 'DoxaLogos wrote:\nq\n\nreply' });
+  const plain   = article({ id: 502, username: 'bob' });
+
+  const quoteOnly = detectThreadSelfActivity({
+    me: ME, threadStarter: 'trekkienz', newArticles: [quoting, plain],
+  });
+  assert.deepEqual(quoteOnly!.matchedIds, [501],
+    'only the quoting article is a match — the cap may drop the other');
+
+  // When the reader started the thread, every reply qualifies.
+  const started = detectThreadSelfActivity({
+    me: ME, threadStarter: ME, newArticles: [quoting, plain],
+  });
+  assert.deepEqual([...started!.matchedIds].sort(), [501, 502],
+    'in a thread you started, every reply by others qualifies');
+  assert.equal(started!.matchedIds.length, started!.replyCount,
+    'one article per qualifying post here — no duplicates in matchedIds');
+}
+
+// Geeklists: matchedIds are ITEM ids — the container that must survive the
+// cap — even when several comments on one item qualify.
+{
+  const found = detectGeeklistSelfActivity({
+    me: ME,
+    geeklistOwner: 'kerskine',
+    items: [
+      item({ id: 11, username: ME, comments: [
+        comment({ username: 'alice', date: NEW }),
+        comment({ username: 'bob', date: NEW }),
+      ] }),
+      item({ id: 12, comments: [comment({ username: 'carol', date: NEW })] }),
+      item({ id: 13, comments: [
+        comment({ username: ME, date: OLD }),
+        comment({ username: 'dave', date: NEW }),
+      ] }),
+    ],
+    cutoff,
+  });
+  assert.deepEqual([...found!.matchedIds].sort((a, b) => a - b), [11, 13],
+    'the reader\'s own item and the item he commented on match; item 12 does not');
+  assert.equal(found!.replyCount, 3, 'three qualifying comments across two items');
+  assert.equal(new Set(found!.matchedIds).size, found!.matchedIds.length,
+    'matchedIds must not repeat an item that had several qualifying comments');
+}
+
+// A flagged subscription always names at least one surviving container.
+{
+  const found = detectGeeklistSelfActivity({
+    me: ME,
+    geeklistOwner: ME,
+    items: [item({ id: 21, username: 'alice', postdate: NEW, editdate: NEW })],
+    cutoff,
+  });
+  assert.deepEqual(found!.matchedIds, [21], 'a new item on your own list is itself the match');
+}
+
 console.log('self-activity.test.ts: all assertions passed ✓');

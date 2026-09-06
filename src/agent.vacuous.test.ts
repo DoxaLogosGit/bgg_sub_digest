@@ -20,7 +20,7 @@
 //   The fixtures below are trimmed from the actual digests on disk.
 
 import assert from 'node:assert/strict';
-import { isVacuousDigest, isTemplateEcho, isMissingHighlights } from './agent';
+import { isVacuousDigest, isTemplateEcho, isMissingHighlights, postProcessDigestBody } from './agent';
 
 // Build N sections from a (summary, bullet) generator — real digests are
 // dozens of sections long and the guard is a ratio, so shape matters.
@@ -184,6 +184,23 @@ import { generateGuardedDigest, type DigestResult } from './agent';
   );
   assert.equal(isVacuousDigest(vacuousWithMarkers), true,
     'the marker must not mask a vacuous digest');
+
+  // ---- and end-to-end through the whole post-processing chain ----
+  //
+  // The marker's phrasing is templated, so the SAME line appearing verbatim
+  // in several sections is a normal night — the shape elideRepetitionCollapse
+  // exists to kill. It only fires on CONSECUTIVE identical lines, and these
+  // are separated by whole sections, but that is worth pinning rather than
+  // reasoning about: an earlier version of that helper would have eaten them.
+  const processed = postProcessDigestBody(goodWithMarkers);
+  const markerCount = (processed.match(/Replies to you:/g) ?? []).length;
+  assert.equal(markerCount, 14,
+    `all 14 identical marker lines must survive post-processing, found ${markerCount}`);
+  assert.doesNotMatch(processed, /repetition loop/,
+    'identical markers across sections must not read as a repetition collapse');
+  assert.equal((processed.match(/^### \[/gm) ?? []).length, 14,
+    'no section may be dropped as a duplicate because its marker matches another');
+  assert.match(processed, /^## ⭐ Highlights/m, 'Highlights survives and is lifted');
 }
 
 function result(body: string): DigestResult {

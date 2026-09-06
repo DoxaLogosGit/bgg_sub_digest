@@ -424,10 +424,57 @@ async function main(): Promise<void> {
           // path: sorts by latest activity DESCENDING (post or edit, whichever
           // is later) and slices the top N — so the newest items are always
           // preserved and the older ones are dropped. Output is newest-first.
+          //
+          // REPLIES-TO-YOU ORDERING: detection has to happen BEFORE the cap,
+          // because the cap is what would throw the triggering post away. If
+          // it did, the digest would announce "2 posts quoting you" over a
+          // data file containing neither — the same reason/content mismatch
+          // the geeklist cutoff comment warns about. So: detect on the full
+          // selection, let the cap keep those articles preferentially, then
+          // re-detect on what actually survived so every rendered reason
+          // describes content that is really in the file.
+          //
+          // The opening post is almost never inside our minarticledate
+          // window, so the starter needs its own count=1 fetch. There is no
+          // cheaper predicate to gate it on — whether the reader started the
+          // thread IS the question. Held in a variable so the post-cap
+          // re-detection below costs no second request. Cache it if the added
+          // latency ever shows up; thread authorship never changes.
+          const threadStarter = articles.length > 0
+            ? await fetchThreadStarter(sub.id, config.bgg.apiKey, apiRequest)
+            : null;
+
+          let selfActivity = articles.length > 0
+            ? detectThreadSelfActivity({ me: config.bgg.username, threadStarter, newArticles: articles })
+            : null;
+
           if (articles.length > maxItems) {
-            const dropped = articles.length - maxItems;
-            articles = recentArticles(articles, maxItems);
-            log.info(`Capped thread ${sub.id} at ${maxItems} most-recent articles (dropped ${dropped} older)`);
+            const dropped  = articles.length - maxItems;
+            const matched  = new Set(selfActivity?.matchedIds ?? []);
+
+            // Sort everything newest-first once, then fill the cap with the
+            // qualifying articles before the rest. Re-selecting from `ordered`
+            // at the end preserves the newest-first output the old
+            // recentArticles() call produced.
+            const ordered  = recentArticles(articles, articles.length);
+            const keep     = new Set(
+              [...ordered.filter((a) => matched.has(a.id)),
+               ...ordered.filter((a) => !matched.has(a.id))]
+                .slice(0, maxItems)
+                .map((a) => a.id),
+            );
+            articles = ordered.filter((a) => keep.has(a.id));
+
+            log.info(`Capped thread ${sub.id} at ${maxItems} most-recent articles (dropped ${dropped} older)`, {
+              keptForYou: matched.size,
+            });
+
+            // The surviving set may be smaller than what we detected on, so
+            // the post-cap result is the authoritative one — never fall back
+            // to the pre-cap reasons, which could describe a dropped post.
+            selfActivity = detectThreadSelfActivity({
+              me: config.bgg.username, threadStarter, newArticles: articles,
+            });
           }
 
           log.info(`Thread "${thread.subject}": ${articles.length} articles selected`, {
@@ -441,24 +488,6 @@ async function main(): Promise<void> {
           // with empty entries. BGG flagged it but our API fetch+filter found
           // nothing matching, which usually means the API hasn't caught up yet.
           if (articles.length > 0) {
-            // ---- Is any of this aimed at the reader? ----
-            //
-            // Runs on the RAW articles, before formatThreadContent — that
-            // helper rewrites BGG's "Name wrote:" quote blocks into markdown
-            // blockquotes, and the quote is one of the two signals we need.
-            //
-            // The thread's opening post is almost never inside our
-            // minarticledate window, so the starter takes its own small
-            // count=1 fetch. There is no cheaper predicate to gate it on:
-            // knowing whether the reader started the thread IS the question,
-            // so it has to be asked for every thread. If the added latency
-            // ever matters, cache it — thread authorship never changes.
-            const threadStarter = await fetchThreadStarter(sub.id, config.bgg.apiKey, apiRequest);
-            const selfActivity  = detectThreadSelfActivity({
-              me: config.bgg.username,
-              threadStarter,
-              newArticles: articles,
-            });
             if (selfActivity) {
               log.info(`Thread ${sub.id} has activity aimed at you`, {
                 replyCount: selfActivity.replyCount,
@@ -542,10 +571,51 @@ async function main(): Promise<void> {
           // Hard-cap at maxItems. itemsWithActivityNewerThan already returns
           // items sorted newest-first by true last-activity (incl. comments), so
           // a plain slice keeps the freshest ones. (recentItems already caps.)
+          //
+          // REPLIES-TO-YOU ORDERING: detect BEFORE the cap for the same
+          // reason as the thread path above — the cap is what would drop the
+          // item the flag is about, leaving the digest naming a comment on
+          // "your item X" that the data file never mentions. Detection runs
+          // on the RAW items too, because formatGeeklistContent drops every
+          // comment older than the cutoff and the reader's OWN earlier
+          // comment is exactly what the reply-to-my-comment rule anchors on.
+          // No extra API call is needed: fetchGeeklist already returns every
+          // item and comment with its author.
+          let selfActivity = items.length > 0
+            ? detectGeeklistSelfActivity({
+                me: config.bgg.username,
+                geeklistOwner: geeklist.username,
+                items,
+                cutoff,
+              })
+            : null;
+
           if (items.length > maxItems) {
             const dropped = items.length - maxItems;
-            items = items.slice(0, maxItems);
-            log.info(`Capped geeklist ${sub.id} at ${maxItems} most-recent items (dropped ${dropped} older)`);
+            const matched = new Set(selfActivity?.matchedIds ?? []);
+
+            // items is already newest-activity-first. Fill the cap with the
+            // qualifying items first, then re-select from the original array
+            // so that ordering survives.
+            const keep = new Set(
+              [...items.filter((i) => matched.has(i.id)),
+               ...items.filter((i) => !matched.has(i.id))]
+                .slice(0, maxItems)
+                .map((i) => i.id),
+            );
+            items = items.filter((i) => keep.has(i.id));
+
+            log.info(`Capped geeklist ${sub.id} at ${maxItems} most-recent items (dropped ${dropped} older)`, {
+              keptForYou: matched.size,
+            });
+
+            // Authoritative re-detection over what actually survived.
+            selfActivity = detectGeeklistSelfActivity({
+              me: config.bgg.username,
+              geeklistOwner: geeklist.username,
+              items,
+              cutoff,
+            });
           }
 
           log.info(`Geeklist "${geeklist.title}": ${items.length} items selected`, {
@@ -556,20 +626,6 @@ async function main(): Promise<void> {
           });
 
           if (items.length > 0) {
-            // ---- Is any of this aimed at the reader? ----
-            //
-            // Runs on the RAW items, before formatGeeklistContent — that
-            // helper drops every comment older than the cutoff, but the
-            // reader's OWN earlier comment is precisely what the "reply to
-            // your comment" rule anchors on. No extra API call is needed
-            // here: fetchGeeklist already returns every item and comment
-            // with its author.
-            const selfActivity = detectGeeklistSelfActivity({
-              me: config.bgg.username,
-              geeklistOwner: geeklist.username,
-              items,
-              cutoff,
-            });
             if (selfActivity) {
               log.info(`Geeklist ${sub.id} has activity aimed at you`, {
                 replyCount: selfActivity.replyCount,

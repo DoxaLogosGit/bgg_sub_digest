@@ -49,6 +49,21 @@ export interface SelfActivity {
   // word: a post that matches two rules (someone quoted you in a thread you
   // started) counts once, never twice.
   replyCount: number;
+
+  // The ids of the entries that must survive index.ts's per-subscription
+  // maxItems cap: ARTICLE ids for threads, geeklist ITEM ids for geeklists.
+  //
+  // WHY THE CALLER NEEDS THIS: the cap keeps the newest N and drops the rest.
+  // If it drops the very post that triggered the flag, the digest announces
+  // "1 comment on your item X" while the data file contains no item X — the
+  // same reason/content mismatch that produced the "nothing at the
+  // highlighted item" bug on geeklists. The caller sorts these to the front
+  // of the selection before capping, then re-runs detection on the capped
+  // set so the rendered reasons can only ever describe content that is
+  // actually present.
+  //
+  // Deduplicated: an item with four qualifying comments appears once.
+  matchedIds: number[];
 }
 
 // At most this many per-item geeklist reasons before we collapse the tail
@@ -151,7 +166,8 @@ export function detectThreadSelfActivity(params: {
   }
 
   if (qualifying.size === 0) return null;
-  return { reasons, replyCount: qualifying.size };
+  // For threads the qualifying unit IS the article, so the two coincide.
+  return { reasons, replyCount: qualifying.size, matchedIds: [...qualifying] };
 }
 
 // ============================================================
@@ -188,6 +204,11 @@ export function detectGeeklistSelfActivity(params: {
   // item plus author plus timestamp — unique in practice and, more to the
   // point, stable across the three rules so the union below dedupes.
   const qualifying = new Set<string>();
+
+  // The ITEM ids that carry a qualifying comment or are themselves one. This
+  // is deliberately coarser than `qualifying`: the cap operates on whole
+  // items, so an item is what has to survive it.
+  const matchedItems = new Set<number>();
   const itemReasons: string[] = [];
 
   const ownsList = sameUser(geeklistOwner, me);
@@ -205,10 +226,12 @@ export function detectGeeklistSelfActivity(params: {
     if (ownsList) {
       if (!itemIsMine && isNew(item.postdate)) {
         qualifying.add(`item:${item.id}`);
+        matchedItems.add(item.id);
         ownListItems += 1;
       }
       for (const c of newCommentsByOthers) {
         qualifying.add(`comment:${item.id}:${c.username}:${c.date.getTime()}`);
+        matchedItems.add(item.id);
         ownListComments += 1;
       }
     }
@@ -219,6 +242,7 @@ export function detectGeeklistSelfActivity(params: {
         for (const c of newCommentsByOthers) {
           qualifying.add(`comment:${item.id}:${c.username}:${c.date.getTime()}`);
         }
+        matchedItems.add(item.id);
         itemReasons.push(
           `${plural(newCommentsByOthers.length, 'comment')} on your item "${item.objectName}"`,
         );
@@ -242,6 +266,7 @@ export function detectGeeklistSelfActivity(params: {
       for (const c of after) {
         qualifying.add(`comment:${item.id}:${c.username}:${c.date.getTime()}`);
       }
+      matchedItems.add(item.id);
       itemReasons.push(
         `${plural(after.length, 'reply', 'replies')} to your comment on "${item.objectName}"`,
       );
@@ -264,5 +289,5 @@ export function detectGeeklistSelfActivity(params: {
     reasons.push(`${parts.join(' and ')} on your geeklist`);
   }
 
-  return { reasons, replyCount: qualifying.size };
+  return { reasons, replyCount: qualifying.size, matchedIds: [...matchedItems] };
 }
