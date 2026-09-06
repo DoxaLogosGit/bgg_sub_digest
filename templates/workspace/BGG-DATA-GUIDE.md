@@ -83,7 +83,28 @@ else. Say so plainly — *"new replies, content not retrievable"* — and do not
 invent or infer what the discussion contained. The title is a subject line,
 not evidence of what was said.
 
-## 4. Highlights must name things
+## 4. Excerpted items — summarise the comments, not the excerpt
+
+A geeklist item whose body ends like this:
+
+```
+[Item by kerskine posted 8/1/2026, last activity 9/5/2026] — Wingspan Pocket
+Link: https://boardgamegeek.com/geeklist/383712#item13118053
+First couple plays of this one. I have the OG and most of its' expansions, but…
+[earlier item — excerpt only; the new activity is in the comments below]
+```
+
+was posted **before** the reader's last digest. They have already read it. It
+appears now only because somebody commented on it since, so:
+
+- **The new activity is the comments**, not the item text. Write your bullet
+  about what the commenters said.
+- The excerpt is context — enough to know what game and what claim is being
+  responded to. **Do not summarise the excerpt as if it were new**, and do not
+  guess what the missing remainder said. Same rule as stub files above.
+- An item with **no** excerpt marker is complete and new; treat it normally.
+
+## 5. Highlights must name things
 
 A highlight bullet must lead with a **specific game or a concrete topic**.
 Bare category words are not highlights:
@@ -97,7 +118,7 @@ Bare category words are not highlights:
 A theme bullet is fine, but it must carry specifics (which games, which
 subscriptions) rather than restating the category name.
 
-## 5. BGG conventions worth knowing
+## 6. BGG conventions worth knowing
 
 - `Re:` on a subject line is just a reply marker — not part of the topic.
 - Trade and sale threads use `H:` (have), `W:` (want), plus WTB / WTS / WTT.
@@ -112,7 +133,7 @@ subscriptions) rather than restating the category name.
 - "Geekgold", "thumbs", and microbadges are site currency/reactions. They
   rarely matter to a digest — do not build a bullet around them.
 
-## 6. Never narrate
+## 7. Never narrate
 
 Write digest content only. Do not write sentences about what you are about to
 do, what you just did, or how you are organising the work. No "Now, next

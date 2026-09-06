@@ -129,6 +129,40 @@ function renderQuotesAsBlockquotes(body: string): string {
 }
 
 // ============================================================
+// alreadyReadItemBody — trim a body the reader has already seen
+// ============================================================
+//
+// When an OLD geeklist item picks up a NEW comment, the item is selected for
+// the digest and its entire body rides along to deliver that one comment —
+// up to 1000 characters the reader saw weeks ago. Measured on SGOYT August
+// 2026 (843 items), that residue is 1% of the data file on the 10th and 28%
+// (17.6KB of 62KB) by the 31st, as the month's activity shifts from new posts
+// to discussion on existing ones.
+//
+// We keep a short lead rather than dropping the body outright. The header
+// already names the game, but a comment like "the automa is brutal" still
+// needs an anchor, and this pipeline has a history of the model inventing
+// content when handed too little (see BGG-DATA-GUIDE.md's stub rule, which
+// this marker deliberately echoes).
+const STALE_BODY_LEAD_CHARS = 200;
+
+// The marker is matched by BGG-DATA-GUIDE.md — change both together.
+const STALE_BODY_MARKER =
+  '[earlier item — excerpt only; the new activity is in the comments below]';
+
+function alreadyReadItemBody(body: string): string {
+  if (body.length <= STALE_BODY_LEAD_CHARS) return body;
+
+  // Cut on a word boundary so the excerpt reads as a sentence fragment rather
+  // than a severed word — the model quotes these back into bullets.
+  const slice = body.slice(0, STALE_BODY_LEAD_CHARS);
+  const lastSpace = slice.lastIndexOf(' ');
+  const lead = (lastSpace > 0 ? slice.slice(0, lastSpace) : slice).trimEnd();
+
+  return `${lead}…\n${STALE_BODY_MARKER}`;
+}
+
+// ============================================================
 // formatGeeklistContent — format geeklist items as plain text
 // ============================================================
 //
@@ -171,10 +205,24 @@ export function formatGeeklistContent(
     const itemIsNew = notificationDate !== null && item.postdate > notificationDate;
     const newTag    = itemIsNew ? ' [NEW ITEM]' : '';
 
+    // Is the BODY already-read content, or is it itself the news?
+    //
+    // itemsWithActivityNewerThan selects an item on postdate, editdate OR its
+    // comment dates. An old item EDITED since the cutoff was selected because
+    // the body changed — trimming that would hide exactly what we fetched it
+    // for. So the body is stale only when the item is old AND untouched since,
+    // which leaves "old item, new comments" as the only case we trim.
+    const bodyAlreadyRead =
+      notificationDate !== null &&
+      item.postdate <= notificationDate &&
+      item.editdate <= notificationDate;
+
     // `—` is an em-dash character used for visual separation in the output.
     lines.push(`[Item by ${item.username} posted ${dateStr}, last activity ${activityStr}]${newTag} — ${item.objectName}`);
     lines.push(`Link: ${item.link}`);
-    if (item.body) lines.push(item.body);
+    if (item.body) {
+      lines.push(bodyAlreadyRead ? alreadyReadItemBody(item.body) : item.body);
+    }
 
     // ---- Filter and label comments ----
     //

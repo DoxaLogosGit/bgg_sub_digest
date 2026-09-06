@@ -365,6 +365,16 @@ digest context stays comfortably within the model's window — preventing
 the over-summarization and repetition-collapse failures that happen when
 Ollama-served 200K-window models hit context pressure.
 
+**Already-read item bodies are excerpted.** When an old geeklist item picks up
+a new comment, the item is selected but its body is content the reader saw on
+a previous run. Those bodies are cut to a ~200-character lead plus an
+`[earlier item — excerpt only]` marker, so the new comments still have an
+anchor without paying full price for text already delivered. Items posted
+*or edited* since the cutoff are never trimmed — there the body is the news.
+Measured on SGOYT August 2026 (843 items): no effect early in the month,
+rising to an 18% smaller data file by the 31st as activity shifts from new
+posts to discussion on existing ones.
+
 Fallback chain for both types when the primary path returns nothing:
 1. `notifiedItemIds` — the specific item/article ID from the notice
 2. `recentItems(maxItems)` / `recentArticles(maxItems)` — most-recent N by date
