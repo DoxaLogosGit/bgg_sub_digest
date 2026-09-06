@@ -376,6 +376,39 @@ lightweight stub — title, parent context, and link — so the reader still kno
 there's new activity. Because every processed notice is cleared on BGG after the
 digest sends, a stub ensures nothing the feed reported is silently dropped.
 
+### Replies aimed at you
+
+Subscriptions where somebody responded to **you personally** are detected in
+TypeScript (`src/bgg/self-activity.ts`) and flagged in the manifest as
+`selfActivity`, so the ordering is deterministic rather than left to the
+model. Flagged sections sort to the very top of the digest, carry a
+`**💬 Replies to you:**` line, and lead the Highlights block.
+
+Matching is deliberately **strict** — BGG forum threads are flat, with no
+reply pointer, so "a reply to my post" can only ever be inferred. A thread
+counts only if you started it or somebody quoted you. Merely having posted in
+a thread does *not* count: the loose reading would promote every busy monthly
+thread you once dropped a comment into, every night. Geeklists are different
+— comments there attach to a specific item, so those attributions are real:
+
+| Type     | Flagged when |
+|----------|--------------|
+| Thread   | you wrote the opening post and others replied |
+| Thread   | a new post quotes you (`YourName wrote:`) |
+| Geeklist | you own the list and others added items or comments |
+| Geeklist | an item you contributed picked up comments |
+| Geeklist | somebody commented after you on another member's item |
+
+The thread rules need the opening post's author, which the `minarticledate`
+window almost never includes, so each thread costs one extra
+`thread?id=N&count=1` request. The notice feed can't supply it — its
+`essentialItems` carry no author field of any kind.
+
+**Known limitation:** this shares the digest's general blind spot — it can
+only see what BGG still marks unread. Replies to you are exactly what you are
+most likely to go read yourself before the 3am run, and that visit clears the
+notice, so the digest never sees them.
+
 ### Workspace-based agent invocation
 
 The script splits cleanly: **fetch phase** writes data files; **agent phase**
@@ -474,6 +507,7 @@ bgg_sub_digest/
 │   ├── bgg/
 │   │   ├── notifications.ts  # Notification feed API client + transform + clear
 │   │   ├── api.ts            # BGG XML API client (threads + geeklists) via ctx.request
+│   │   ├── self-activity.ts  # Detects replies aimed at you (thread/geeklist rules)
 │   │   ├── auth.ts           # Browser profile + interactive --reauth login
 │   │   ├── scraper.ts        # (legacy) HTML /subscriptions scraping — kept dormant
 │   │   └── page-content.ts   # (legacy) Playwright DOM fetch — kept dormant

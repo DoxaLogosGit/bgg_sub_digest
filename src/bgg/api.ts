@@ -404,6 +404,61 @@ export async function fetchThread(
 }
 
 // ============================================================
+// fetchThreadStarter — who opened this thread?
+// ============================================================
+//
+// Returns the username on the thread's FIRST article, or null if we can't
+// determine it. Used to answer "did the reader start this thread?" for the
+// replies-to-you flag (see bgg/self-activity.ts).
+//
+// WHY A SEPARATE CALL: fetchThread above sends minarticledate so long threads
+// return their NEW replies instead of their oldest 1000 archived posts. That
+// is exactly right for digest content — and it means article #1 is almost
+// never in the response, so the opening post's author is not available there.
+//
+// `count=N` is the complementary knob: with no minarticledate, BGG returns
+// the FIRST N articles chronologically. count=1 is therefore the opening
+// post, in one small response. Verified against thread 3763860.
+//
+// The notice feed cannot substitute: its essentialItems carry
+// name/href/label/breadcrumbs/imageSets and no author field of any kind.
+//
+// This costs one extra request per thread subscription. Deliberately
+// uncached for now — thread authorship never changes, so a cache is easy to
+// add later if the added latency shows up in a real run.
+export async function fetchThreadStarter(
+  threadId: number,
+  apiKey: string,
+  request: APIRequestContext,
+): Promise<string | null> {
+  const url = `${BGG_V2}/thread?id=${threadId}&count=1`;
+  log.debug('Fetching thread starter', { threadId, url });
+
+  // A failure here is not fatal — it only means one detection rule (R1, "a
+  // thread you started") can't be evaluated for this subscription. The digest
+  // itself is unaffected, so we log and return null rather than throwing.
+  try {
+    const parsed = await parseXml(await fetchXml(url, request, apiKey));
+
+    const threadNode = parsed['thread'] as Record<string, unknown> | undefined;
+    const articlesNode = threadNode?.['articles'] as Record<string, unknown> | undefined;
+    if (!articlesNode) return null;
+
+    // Same xml2js single-vs-array quirk as fetchThread: with count=1 this is
+    // a plain object, but a defensive Array check costs nothing.
+    const raw = articlesNode['article'];
+    const first = (Array.isArray(raw) ? raw[0] : raw) as Record<string, unknown> | undefined;
+    if (!first) return null;
+
+    const username = attr(first, 'username');
+    return username || null;
+  } catch (err) {
+    log.warn('Could not determine thread starter', { threadId, err: String(err) });
+    return null;
+  }
+}
+
+// ============================================================
 // fetchGeeklist — fetch a BGG geeklist via XML API v1
 // ============================================================
 //

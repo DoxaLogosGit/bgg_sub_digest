@@ -21,6 +21,13 @@ rows.
   - `unreadCount` — count BGG advertised on the notifications page (1 row per article/item/comment-batch)
   - `notificationDate` — when this subscription's oldest unread row was posted (ISO timestamp or null)
   - `parentName` (optional) — parent game name when the thread/geeklist/page lives inside a specific game's forum (e.g. "Marvel Champions: The Card Game"). Use it to label and group.
+  - `selfActivity` (optional) — **present only when somebody responded to the
+    reader personally**: a reply in a thread he started, a post quoting him,
+    comments on a geeklist item he contributed, or a reply to his comment.
+    Has `reasons` (ready-to-use phrases, e.g. `"3 replies in a thread you
+    started"`) and `replyCount`. This has already been worked out for you —
+    do NOT try to infer it yourself from the data files, and do NOT flag a
+    subscription as a reply to the reader when this field is absent.
 
 - **`INTERESTS.md`** — what the user cares about. Use this to prioritise
   ordering, mark relevant items with ⭐, and decide which subscriptions get
@@ -74,13 +81,17 @@ rows.
 Order subscription sections in this priority (each subscription appears
 in exactly the first category it matches):
 
-1. **Priority Subscriptions** — those listed in INTERESTS.md's
+1. **Replies to You** — every entry with a `selfActivity` field, FIRST,
+   ahead of everything else. Somebody addressed the reader directly and
+   may be waiting on an answer, so this outranks even his priority
+   subscriptions. Order these by `replyCount` descending.
+2. **Priority Subscriptions** — those listed in INTERESTS.md's
    "Priority Subscriptions" section, by title match.
-2. **Tracked Games** — subscriptions whose `parentName` matches one of
+3. **Tracked Games** — subscriptions whose `parentName` matches one of
    the games in INTERESTS.md's "Games I'm Tracking" section.
-3. **Other game-related** — subscriptions whose `parentName` is set
+4. **Other game-related** — subscriptions whose `parentName` is set
    but not in either list above.
-4. **Everything else** last — orphan threads, geeklists with no parent
+5. **Everything else** last — orphan threads, geeklists with no parent
    game, etc.
 
 Within each category, group adjacent any subscriptions sharing the same

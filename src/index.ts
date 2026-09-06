@@ -41,11 +41,13 @@ import {
 } from './bgg/notifications';
 import {
   fetchThread,
+  fetchThreadStarter,
   fetchGeeklist,
   recentArticles,
   recentItems,
   itemsWithActivityNewerThan,
 } from './bgg/api';
+import { detectThreadSelfActivity, detectGeeklistSelfActivity } from './bgg/self-activity';
 import {
   formatThreadContent,
   formatGeeklistContent,
@@ -439,6 +441,31 @@ async function main(): Promise<void> {
           // with empty entries. BGG flagged it but our API fetch+filter found
           // nothing matching, which usually means the API hasn't caught up yet.
           if (articles.length > 0) {
+            // ---- Is any of this aimed at the reader? ----
+            //
+            // Runs on the RAW articles, before formatThreadContent — that
+            // helper rewrites BGG's "Name wrote:" quote blocks into markdown
+            // blockquotes, and the quote is one of the two signals we need.
+            //
+            // The thread's opening post is almost never inside our
+            // minarticledate window, so the starter takes its own small
+            // count=1 fetch. There is no cheaper predicate to gate it on:
+            // knowing whether the reader started the thread IS the question,
+            // so it has to be asked for every thread. If the added latency
+            // ever matters, cache it — thread authorship never changes.
+            const threadStarter = await fetchThreadStarter(sub.id, config.bgg.apiKey, apiRequest);
+            const selfActivity  = detectThreadSelfActivity({
+              me: config.bgg.username,
+              threadStarter,
+              newArticles: articles,
+            });
+            if (selfActivity) {
+              log.info(`Thread ${sub.id} has activity aimed at you`, {
+                replyCount: selfActivity.replyCount,
+                reasons:    selfActivity.reasons,
+              });
+            }
+
             const threadContent  = formatThreadContent(thread.subject, articles);
             const threadFilePath = writeSubscriptionFile(sub, threadContent, digestDataDir);
             manifestEntries.push({
@@ -451,6 +478,7 @@ async function main(): Promise<void> {
               unreadCount:      sub.unreadCount,
               notificationDate: sub.notificationDate?.toISOString() ?? null,
               parentName:       sub.parentName,
+              selfActivity:     selfActivity ?? undefined,
             });
           } else {
             // The notice feed says there's new activity but the XML API window
@@ -528,6 +556,27 @@ async function main(): Promise<void> {
           });
 
           if (items.length > 0) {
+            // ---- Is any of this aimed at the reader? ----
+            //
+            // Runs on the RAW items, before formatGeeklistContent — that
+            // helper drops every comment older than the cutoff, but the
+            // reader's OWN earlier comment is precisely what the "reply to
+            // your comment" rule anchors on. No extra API call is needed
+            // here: fetchGeeklist already returns every item and comment
+            // with its author.
+            const selfActivity = detectGeeklistSelfActivity({
+              me: config.bgg.username,
+              geeklistOwner: geeklist.username,
+              items,
+              cutoff,
+            });
+            if (selfActivity) {
+              log.info(`Geeklist ${sub.id} has activity aimed at you`, {
+                replyCount: selfActivity.replyCount,
+                reasons:    selfActivity.reasons,
+              });
+            }
+
             const geeklistContent  = formatGeeklistContent(geeklist.title, items, cutoff);
             const geeklistFilePath = writeSubscriptionFile(sub, geeklistContent, digestDataDir);
             manifestEntries.push({
@@ -540,6 +589,7 @@ async function main(): Promise<void> {
               unreadCount:      sub.unreadCount,
               notificationDate: sub.notificationDate?.toISOString() ?? null,
               parentName:       sub.parentName,
+              selfActivity:     selfActivity ?? undefined,
             });
           } else {
             log.info(`Geeklist ${sub.id} "${geeklist.title}" — no fetchable new items; emitting stub`);

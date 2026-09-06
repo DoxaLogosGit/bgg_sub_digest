@@ -27,6 +27,12 @@ missed. Pin the header text.
 
 ## Content rules
 
+- **If any manifest entry has a `selfActivity` field, the FIRST bullet is
+  about those** — one bullet covering every subscription where somebody
+  replied to the reader, naming them, e.g.
+  `- 💬 **Replies to you** — 3 replies in your "Silent War setup" thread; 2 comments on your SGOYT item`.
+  This is the one thing he acts on rather than just reads, so it leads.
+  Omit the bullet entirely when no entry has `selfActivity`.
 - One bullet per **cross-subscription** standout — items matching the
   reader's tracked games or priority interests from INTERESTS.md.
 - One bullet per **major theme** that appeared multiple times across

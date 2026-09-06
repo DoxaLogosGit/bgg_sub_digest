@@ -150,6 +150,42 @@ console.log('✓ agent.vacuous.test.ts — all assertions passed');
 
 import { generateGuardedDigest, type DigestResult } from './agent';
 
+// ---- 8b. the "Replies to you" marker line must not disturb the guards ----
+//
+// These three detectors were calibrated on 125 real digests, none of which
+// contained the `**\u{1F4AC} Replies to you:**` line added for the replies-to-you
+// feature. The line is deliberately NOT a bullet — bullets feed
+// isVacuousDigest's duplicate-bullet ratio, and an identical marker repeated
+// across sections would push a healthy digest toward the vacuous threshold.
+// Assert both directions: it must not create a false positive, and it must
+// not mask a real one.
+{
+  const withMarker = (body: string): string =>
+    body.replace(
+      /^\*\*Summary:\*\*/gm,
+      '**\u{1F4AC} Replies to you:** 3 replies in a thread you started\n\n**Summary:**',
+    );
+
+  const goodWithMarkers = withMarker(
+    digest(14, (i) => ({
+      summary: `Users discussed scenario ${i} and its difficulty curve.`,
+      bullets: [`\u2b50 user${i} posted a session report scoring ${200 + i} points.`],
+    })),
+  );
+  assert.match(goodWithMarkers, /Replies to you/, 'fixture sanity: the marker was inserted');
+  assert.equal(isVacuousDigest(goodWithMarkers), false,
+    'the marker line must not make a healthy digest look vacuous');
+  assert.equal(isTemplateEcho(goodWithMarkers), false, 'the marker is not template residue');
+  assert.equal(isMissingHighlights(goodWithMarkers), false, 'Highlights still found');
+
+  // The same marker on a genuinely vacuous digest must not rescue it.
+  const vacuousWithMarkers = withMarker(
+    digest(34, () => ({ summary: 'Activity detected.', bullets: ['Activity detected.'] })),
+  );
+  assert.equal(isVacuousDigest(vacuousWithMarkers), true,
+    'the marker must not mask a vacuous digest');
+}
+
 function result(body: string): DigestResult {
   return { body, inputTokens: 0, outputTokens: 0, costUsd: 0, durationMs: 0 };
 }

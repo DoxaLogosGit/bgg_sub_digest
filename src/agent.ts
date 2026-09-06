@@ -265,6 +265,16 @@ export interface ManifestEntry {
   // and label related discussion. Captured from a sibling /boardgame URL in
   // the same notice row.
   parentName?: string;
+
+  // Set ONLY when this subscription contains activity aimed at the reader —
+  // a reply in a thread he started, a post quoting him, comments on his
+  // geeklist item, or a reply to his comment. Computed deterministically in
+  // TypeScript (see bgg/self-activity.ts) rather than left to the model, so
+  // the ordering is reliable. Absent on the overwhelming majority of entries.
+  //
+  // `reasons` are ready-to-render phrases; `replyCount` is the number of
+  // distinct qualifying posts/comments.
+  selfActivity?: { reasons: string[]; replyCount: number };
 }
 
 // ============================================================
