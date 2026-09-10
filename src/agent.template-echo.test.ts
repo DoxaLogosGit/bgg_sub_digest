@@ -124,7 +124,7 @@ const mk = (body: string): DigestResult => ({
 (async () => {
   // (a) Persistent echo → retried once (2 calls total) → status 'invalid'.
   let calls = 0;
-  let res = await generateGuardedDigest(async () => { calls += 1; return mk(bad); });
+  let res = await generateGuardedDigest(async () => { calls += 1; return mk(bad); }, 0);
   assert.equal(calls, 2, 'a template echo must trigger exactly one retry (2 calls total)');
   assert.equal(res.status, 'invalid', 'a persistent template echo must yield status=invalid');
   // The caller computes clearSafe = status !== 'invalid' && status !== 'error'.
@@ -133,26 +133,26 @@ const mk = (body: string): DigestResult => ({
 
   // (b) Echo once, then a good digest on retry → recovered, no invalid stamp.
   calls = 0;
-  res = await generateGuardedDigest(async () => { calls += 1; return mk(calls === 1 ? bad : good); });
+  res = await generateGuardedDigest(async () => { calls += 1; return mk(calls === 1 ? bad : good); }, 0);
   assert.equal(calls, 2, 'a recovered run still makes 2 calls (1 echo + 1 retry)');
   assert.notEqual(res.status, 'invalid', 'a successful retry must NOT be marked invalid');
 
   // (c) Good on first try → no retry (1 call), unchanged.
   calls = 0;
-  res = await generateGuardedDigest(async () => { calls += 1; return mk(good); });
+  res = await generateGuardedDigest(async () => { calls += 1; return mk(good); }, 0);
   assert.equal(calls, 1, 'a good first result must not be retried');
   assert.notEqual(res.status, 'invalid', 'a good result must not be marked invalid');
 
   // (d) Missing Highlights persists → retried once → status 'invalid'
   //     (the 2026-07-02 data-loss path: must NOT clear notices).
   calls = 0;
-  res = await generateGuardedDigest(async () => { calls += 1; return mk(noHighlights); });
+  res = await generateGuardedDigest(async () => { calls += 1; return mk(noHighlights); }, 0);
   assert.equal(calls, 2, 'a missing-Highlights digest must trigger exactly one retry');
   assert.equal(res.status, 'invalid', 'a persistently missing Highlights block must yield status=invalid');
 
   // (e) Missing Highlights, then a good digest on retry → recovered.
   calls = 0;
-  res = await generateGuardedDigest(async () => { calls += 1; return mk(calls === 1 ? noHighlights : good); });
+  res = await generateGuardedDigest(async () => { calls += 1; return mk(calls === 1 ? noHighlights : good); }, 0);
   assert.equal(calls, 2, 'a recovered missing-Highlights run still makes 2 calls');
   assert.notEqual(res.status, 'invalid', 'a successful retry must NOT be marked invalid');
 
@@ -162,7 +162,7 @@ const mk = (body: string): DigestResult => ({
   res = await generateGuardedDigest(async () => {
     calls += 1;
     return { ...mk(noHighlights), status: 'rate_limited' as const };
-  });
+  }, 0);
   assert.equal(calls, 1, 'an already-degraded run must not be retried by the highlights guard');
   assert.equal(res.status, 'rate_limited', 'the guard must not override a pre-existing degraded status');
 

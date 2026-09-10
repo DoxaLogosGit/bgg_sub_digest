@@ -222,7 +222,7 @@ async function retryPolicyTests() {
   // ---- 9. a vacuous digest is marked invalid WITHOUT a second run ----
   {
     let runs = 0;
-    const out = await generateGuardedDigest(async () => { runs += 1; return result(vacuousBody); });
+    const out = await generateGuardedDigest(async () => { runs += 1; return result(vacuousBody); }, 0);
 
     assert.equal(runs, 1, 'vacuous must not burn a retry — the failure is deterministic');
     assert.equal(out.status, 'invalid', 'vacuous must be invalid so notices are NOT cleared');
@@ -236,7 +236,7 @@ async function retryPolicyTests() {
     const out = await generateGuardedDigest(async () => {
       runs += 1;
       return result(runs === 1 ? goodBody.replace('## ⭐ Highlights', '## Notes') : goodBody);
-    });
+    }, 0);
 
     assert.equal(runs, 2, 'missing Highlights must still retry once');
     assert.equal(out.status, undefined, 'a successful retry stays shippable');
@@ -245,7 +245,7 @@ async function retryPolicyTests() {
   // ---- 11. a good digest runs exactly once ----
   {
     let runs = 0;
-    const out = await generateGuardedDigest(async () => { runs += 1; return result(goodBody); });
+    const out = await generateGuardedDigest(async () => { runs += 1; return result(goodBody); }, 0);
 
     assert.equal(runs, 1);
     assert.equal(out.status, undefined);

@@ -210,6 +210,7 @@ async function main(): Promise<void> {
     // performs an interactive login to mint fresh cookies into the profile, after
     // which normal headless cron runs work again.
     const reauth = process.argv.includes('--reauth');
+
     if (reauth) {
       config.digest.headless = false;
       log.info('--reauth: opening a visible browser to refresh the BGG login cookies');
@@ -794,8 +795,13 @@ async function runAgentAndWriteDigest(
     // Generate with a template-echo retry guard: if the model returns the
     // unfilled template, retry once, and if it's still a template stamp
     // status='invalid' so we don't clear the BGG notices below.
+    // entries.length is what the model was actually handed. Passing it lets
+    // the guard notice a digest that rendered almost none of it — the
+    // 2026-09-10 failure, where 1 of 31 sections shipped as 'complete' and
+    // cleared 90 notices.
     digestResult = await generateGuardedDigest(
       () => runDigest(agent, manifestPath, interests, model),
+      entries.length,
     );
   } catch (err) {
     log.error(`${agent} digest run failed`, { err: String(err) });
@@ -867,9 +873,18 @@ async function runAgentAndWriteDigest(
   log.info(`Digest complete → ${digestPath}`, { status, completed: digestResult.completedCount, skipped: skipped.length });
   console.log(`\nDigest written to: ${digestPath}`);
 
-  if (config.email) {
+  // --no-email: write the digest to disk but do NOT deliver it.
+  //
+  // Added 2026-09-10 after a --reuse-data reproduction launched to diagnose a
+  // bad digest would have mailed the user a second, spurious digest for that
+  // morning — the reuse path calls this same function, and it emails whenever
+  // config.email is set. Re-running a past workspace to debug it is exactly
+  // when you least want it delivered.
+  if (config.email && !process.argv.includes('--no-email')) {
     const subject = subjectPrefix + buildEmailSubject(runStart);
     await sendDigestEmail(config.email, subject, markdown);
+  } else if (config.email) {
+    log.warn('--no-email: digest written to disk but NOT delivered', { digestPath });
   }
 
   // clearSafe=false on a failed run (template-echo 'invalid' OR a crashed

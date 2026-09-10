@@ -534,15 +534,61 @@ export function stripReasoningTags(body: string): string {
 // We do NOT throw on an invalid result — the caller still emails a clearly
 // labeled alert. Throwing is reserved for the run itself failing (network, etc.),
 // which the caller's try/catch turns into a status='error' fallback.
+// ============================================================
+// isTruncatedDigest — most of the subscriptions never got rendered
+// ============================================================
+//
+// Failure mode (observed 2026-09-10, pi + nemotron-3-super:cloud, 31
+// subscriptions): the model read every subscription — its Highlights block
+// named SGOYT, the Marvel Champions threads, PIFF 3.0 and the deals threads —
+// but emitted exactly ONE `### [` section. The run was stamped 'complete',
+// emailed as [OK], and cleared 90 BGG notices, losing that activity.
+//
+// All three existing detectors were blind to it, each for its own reason:
+//   isTemplateEcho      — the one section was real content, not the template
+//   isMissingHighlights — the Highlights block was present and well-formed
+//   isVacuousDigest     — returns false below MIN_SECTIONS (6) by design, so
+//                         the more content is missing, the less it applies
+//
+// The gap was structural rather than a tuning problem: nothing compared what
+// the model rendered against how many subscriptions it was handed, even
+// though the manifest count sits at the call site.
+//
+// THRESHOLD: calibrated against real runs that were fine and shipped —
+// 2026-09-01 rendered 33 of 35 (0.94), 08-24 6 of 7 (0.86), 08-26 5 of 6
+// (0.83). Models do occasionally drop one or two of a large set, and blocking
+// on that would stop notices clearing on otherwise good nights. 0.60 sits far
+// below every healthy run observed and far above the 0.03 that triggered this.
+const MIN_SECTION_COVERAGE = 0.6;
+
+export function isTruncatedDigest(body: string, expectedSections: number): boolean {
+  // No manifest count (or an empty run) means we have no basis for an opinion.
+  // Never block on a guess — the cost of a false positive here is a digest
+  // withheld from the reader.
+  if (expectedSections <= 0) return false;
+
+  // Count headers WITHOUT capturing the title. A real BGG title can itself
+  // start with a bracket — "### [[Detective Hawk] Wayfarers of the South
+  // Tigris $23.40](...)" — and a `\[([^\]]+)\]` style pattern mis-parses
+  // exactly that shape. Counting the header marker alone sidesteps it.
+  const rendered = (body.match(/^[ \t]*###[ \t]+\[/gm) ?? []).length;
+
+  return rendered < expectedSections * MIN_SECTION_COVERAGE;
+}
+
 // digestDefect — name the reason a completed digest is unshippable, or null.
 // A run ALREADY flagged degraded (partial after skips, rate_limited after a 429,
 // or a prior error/invalid) may legitimately lack a Highlights block — the
 // caller already banners those — so we never second-guess or override it here.
-function digestDefect(result: DigestResult): string | null {
+function digestDefect(result: DigestResult, expectedSections: number): string | null {
   if (result.status && result.status !== 'complete') return null;
   if (isTemplateEcho(result.body))      return 'unfilled template';
   if (isMissingHighlights(result.body)) return 'missing Highlights block';
   if (isVacuousDigest(result.body))     return VACUOUS_DEFECT;
+  if (isTruncatedDigest(result.body, expectedSections)) {
+    const rendered = (result.body.match(/^[ \t]*###[ \t]+\[/gm) ?? []).length;
+    return `only ${rendered} of ${expectedSections} subscriptions rendered`;
+  }
   return null;
 }
 
@@ -557,9 +603,16 @@ function digestDefect(result: DigestResult): string | null {
 // no evidence they are deterministic the way this one demonstrably is.
 const VACUOUS_DEFECT = 'vacuous sections (no real content)';
 
-export async function generateGuardedDigest(run: () => Promise<DigestResult>): Promise<DigestResult> {
+export async function generateGuardedDigest(
+  run: () => Promise<DigestResult>,
+  // How many subscriptions the manifest handed the model. REQUIRED rather
+  // than optional: the 2026-09-10 data loss happened precisely because this
+  // number existed at the call site and was never passed in, and an optional
+  // parameter is one refactor away from silently going missing again.
+  expectedSections: number,
+): Promise<DigestResult> {
   let result = await run();
-  let defect = digestDefect(result);
+  let defect = digestDefect(result, expectedSections);
   if (!defect) return result;
 
   if (defect === VACUOUS_DEFECT) {
@@ -573,7 +626,7 @@ export async function generateGuardedDigest(run: () => Promise<DigestResult>): P
 
   log.warn(`Agent produced a defective digest (${defect}) — retrying once`);
   result = await run();
-  defect = digestDefect(result);
+  defect = digestDefect(result, expectedSections);
   if (defect) {
     log.error(`Agent digest still defective (${defect}) after retry — marking invalid`);
     result.status = 'invalid';
@@ -1816,6 +1869,63 @@ export async function runPiDigest(
     turnEnds:   turnEnds.length,
     durationMs,
   });
+
+  // ---- Post-mortem instrumentation --------------------------------
+  //
+  // WHY THIS EXISTS: on 2026-09-10 a 31-subscription run produced 81 turns
+  // and 4.19MB of stream, but the digest came out as one section. Nothing on
+  // disk could say whether the model had written the other 30 sections in
+  // earlier turns or never written them at all, because — unlike the legacy
+  // claude path, which saves claude-raw-*.json — the pi path persisted
+  // nothing. That is the difference between "the model degenerated" and "we
+  // threw away content it produced", and they need opposite fixes.
+  //
+  // The census is cheap and always logged. The full turn dump is only written
+  // when something looks wrong, so healthy runs don't accumulate MBs.
+  const turnCensus = turnEnds.map((t, i) => {
+    const content = t.message?.content ?? [];
+    const text = content
+      .filter((c) => c.type === 'text' && typeof c.text === 'string')
+      .map((c) => c.text as string)
+      .join('\n');
+    return {
+      turn:     i,
+      textLen:  text.length,
+      sections: (text.match(/^[ \t]*###[ \t]+\[/gm) ?? []).length,
+      hl:       /^[ \t]*##[ \t]+(?:⭐[ \t]+)?Highlights/im.test(text),
+      tools:    content.filter((c) => c.type === 'toolCall').length,
+    };
+  });
+
+  const turnsWithText     = turnCensus.filter((t) => t.textLen > 0);
+  const totalSectionsSeen = turnCensus.reduce((n, t) => n + t.sections, 0);
+
+  log.info('pi turn census', {
+    turns:            turnEnds.length,
+    turnsWithText:    turnsWithText.length,
+    sectionHeaders:   totalSectionsSeen,
+    turnsWithSections: turnCensus.filter((t) => t.sections > 0).map((t) => `${t.turn}:${t.sections}`),
+    highlightsInTurns: turnCensus.filter((t) => t.hl).map((t) => t.turn),
+  });
+
+  // Dump everything when the digest looks scattered across turns — i.e. more
+  // than one turn carried section headers. That is exactly the shape that
+  // makes selectDigestBody's single-turn pick lossy.
+  if (turnCensus.filter((t) => t.sections > 0).length > 1) {
+    try {
+      const logsDir = path.resolve('./logs');
+      if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const dumpPath = path.join(logsDir, `pi-turns-${stamp}.json`);
+      fs.writeFileSync(dumpPath, JSON.stringify(turnEnds, null, 2), 'utf-8');
+      log.warn('Digest content spans multiple turns — full turn dump saved', {
+        dumpPath,
+        turnsWithSections: turnCensus.filter((t) => t.sections > 0).length,
+      });
+    } catch (err) {
+      log.warn('Could not save pi turn dump', { err: String(err) });
+    }
+  }
 
   if (turnEnds.length === 0) {
     throw new Error(
