@@ -444,9 +444,20 @@ The flow:
 
 Runs at or under `chunkSize` take the original single-pass path untouched.
 
-If a chunk is still defective after its retry, its subscriptions are reported
-as skipped and **BGG notices are not cleared** — the night re-fetches tomorrow
-rather than disappearing.
+**Escalation on failure.** A group that comes back defective is retried
+*smaller* before it is written off: a failing 12 becomes 6 + 6, a failing 6
+becomes 3 + 3. Degeneration is driven by how much the model is handed at once,
+so a half-size retry has a real chance. Recursion is capped at two levels — if
+the model is broken rather than overloaded, splitting cannot help, and an
+uncapped retry would burn hours on a bad night. A single-pass run that fails
+escalates the same way, dropping into the chunked path rather than shipping an
+invalid digest.
+
+Only the part that fails at *every* size is lost. If the first half of a group
+never renders but the second half does, the second half ships.
+
+Whatever is still lost is reported as skipped and **BGG notices are not
+cleared** — the night re-fetches tomorrow rather than disappearing.
 
 ### Workspace-based agent invocation
 

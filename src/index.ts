@@ -838,6 +838,28 @@ async function runAgentAndWriteDigest(
         () => runDigest(agent, manifestPath, interests, model),
         ranked.length,
       );
+
+      // ---- Escalate a struggling single run ----
+      //
+      // A small night can still overwhelm the model — count is the usual
+      // driver but not the only one (one enormous geeklist file can do it).
+      // Rather than shipping an invalid digest and clearing nothing, split
+      // the run in half and go through the chunked path, which escalates
+      // further on its own if a half also fails.
+      //
+      // Only reachable after the single pass AND its retry have both failed,
+      // so a healthy night never pays for this.
+      if (digestResult.status === 'invalid' && ranked.length > 1) {
+        log.warn(
+          `Single-pass digest failed for ${ranked.length} subscription(s) — ` +
+          `retrying as smaller groups rather than shipping an invalid digest`,
+        );
+        const halves = chunkEntries(ranked, Math.ceil(ranked.length / 2));
+        digestResult = await runChunkedDigest(
+          agent, halves, digestDataDir, interests, model,
+          (chunkManifestPath) => runDigest(agent, chunkManifestPath, interests, model),
+        );
+      }
     } else {
       log.info(
         `Chunked digest: ${ranked.length} subscription(s) in ${chunks.length} chunk(s) ` +

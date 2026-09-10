@@ -46,10 +46,20 @@ function res(body: string, over: Partial<DigestResult> = {}): DigestResult {
 
 const HL = '## ⭐ Highlights\n\n- ⭐ Spirit Island — a rules question in two chunks.';
 
-// Read back the chunk manifests the orchestrator wrote, so we can assert on
-// what each pass was actually handed.
-function manifestSeen(): ManifestEntry[] {
-  return JSON.parse(fs.readFileSync(path.join(workspace, 'manifest.json'), 'utf-8'));
+// Which pass is the injected runner currently serving?
+//
+// Manifest length is NOT a safe discriminator — a single chunk of 12 and the
+// synthesis pass over 12 subscriptions look identical by size. The run mode
+// installed into CLAUDE.md is the real signal, and checking it here also
+// asserts that installRunMode actually wrote what it claims.
+function isSynthesisPass(): boolean {
+  const claude = fs.readFileSync(path.join(workspace, 'CLAUDE.md'), 'utf-8');
+  return claude.includes('THIS RUN: HIGHLIGHTS ONLY');
+}
+
+function isSectionsPass(): boolean {
+  const claude = fs.readFileSync(path.join(workspace, 'CLAUDE.md'), 'utf-8');
+  return claude.includes('THIS RUN: SECTIONS ONLY');
 }
 
 async function tests() {
@@ -65,7 +75,7 @@ async function tests() {
         call += 1;
         const m = JSON.parse(fs.readFileSync(mp, 'utf-8')) as ManifestEntry[];
         // The 4th call is the synthesis pass.
-        if (call === chunks.length + 1) return res(HL);
+        if (isSynthesisPass()) return res(HL);
         seen.push(m.length);
         return res(sectionsFor(m));
       });
@@ -92,13 +102,17 @@ async function tests() {
   // This is the 2026-09-10 lesson: content that never got summarised must make
   // the run refuse to clear BGG notices. skipped[] is what drives that.
   {
-    let call = 0;
     const out = await runChunkedDigest('pi', chunks, workspace, 'interests', 'm',
       async (mp) => {
-        call += 1;
         const m = JSON.parse(fs.readFileSync(mp, 'utf-8')) as ManifestEntry[];
-        if (call === 1 || call === 2) return res('### [Only one](https://x)\n\n**Topics Mentioned:** none\n');
-        if (m.length === 25) return res(HL);          // synthesis
+        if (isSynthesisPass()) return res(HL);
+        // Chunk 1 fails at EVERY size, so escalation cannot rescue it.
+        // (Keyed on content rather than call count: splitting changes the
+        // call sequence, and a call-index fixture would silently stop
+        // testing what it claims to.)
+        if (m.every((e) => Number(e.title.split(' ')[1]) < 12)) {
+          return res('the model rambled instead of rendering');
+        }
         return res(sectionsFor(m));
       });
 
@@ -112,13 +126,13 @@ async function tests() {
 
   // ---- 3. a chunk that THROWS is contained ----
   {
-    let call = 0;
     const out = await runChunkedDigest('pi', chunks, workspace, 'interests', 'm',
       async (mp) => {
-        call += 1;
-        if (call === 1) throw new Error('model unreachable');
         const m = JSON.parse(fs.readFileSync(mp, 'utf-8')) as ManifestEntry[];
-        if (m.length === 25) return res(HL);
+        if (isSynthesisPass()) return res(HL);
+        // Chunk 1 throws at every size — escalation tries smaller and still
+        // cannot get through, which is the unreachable-model case.
+        if (m.every((e) => Number(e.title.split(' ')[1]) < 12)) throw new Error('model unreachable');
         return res(sectionsFor(m));
       });
 
@@ -135,7 +149,7 @@ async function tests() {
       async (mp) => {
         call += 1;
         const m = JSON.parse(fs.readFileSync(mp, 'utf-8')) as ManifestEntry[];
-        if (m.length === 25) throw new Error('synthesis died');
+        if (isSynthesisPass()) throw new Error('synthesis died');
         return res(sectionsFor(m));
       });
 
@@ -164,7 +178,7 @@ async function tests() {
     await runChunkedDigest('pi', chunks, workspace, 'interests', 'm',
       async (mp) => {
         const m = JSON.parse(fs.readFileSync(mp, 'utf-8')) as ManifestEntry[];
-        if (m.length === 25) {
+        if (isSynthesisPass()) {
           const sections = fs.readFileSync(path.join(workspace, 'SECTIONS.md'), 'utf-8');
           assert.equal((sections.match(/^### \[/gm) ?? []).length, 25,
             'SECTIONS.md must contain every rendered section for the synthesis pass');
@@ -186,7 +200,7 @@ async function tests() {
       async (mp) => {
         call += 1;
         const m = JSON.parse(fs.readFileSync(mp, 'utf-8')) as ManifestEntry[];
-        if (m.length === 25) return res(HL);
+        if (isSynthesisPass()) return res(HL);
         return res(sectionsFor(m) + '\n\n## ⭐ Highlights\n\n- ⭐ only my chunk\n');
       });
 
@@ -210,6 +224,99 @@ async function tests() {
     assert.ok(!stripped.includes('Highlights'), 'the block is removed');
     assert.ok(stripped.includes('### [A]') && stripped.includes('### [B]'),
       'sections on both sides of the block survive');
+  }
+
+  // ============================================================
+  // SPLIT-ON-FAILURE ESCALATION
+  // ============================================================
+  //
+  // Degeneration is driven by how much the model is handed at once, so a
+  // group that fails is worth retrying SMALLER before giving up on it.
+  // Runtime is not a constraint here (the digest runs at 03:00 unattended)
+  // and the extra passes are only paid on the nights something goes wrong.
+
+  // ---- 9. a group that fails whole succeeds when halved ----
+  {
+    const calls: number[] = [];
+    const out = await runChunkedDigest('pi', [all.slice(0, 12)], workspace, 'interests', 'm',
+      async (mp) => {
+        const m = JSON.parse(fs.readFileSync(mp, 'utf-8')) as ManifestEntry[];
+        if (isSynthesisPass()) return res(HL);
+        calls.push(m.length);
+        // Fails at 12, fine at 6.
+        if (m.length > 6) return res('model rambled instead of rendering');
+        return res(sectionsFor(m));
+      });
+
+    assert.equal(out.status, undefined, 'a group recovered by splitting must not be partial');
+    assert.equal(out.skipped, undefined, 'nothing is skipped when a split succeeds');
+    assert.equal((out.body.match(/^### \[/gm) ?? []).length, 12,
+      'every subscription is rendered by the halves');
+
+    // 12 twice (initial + its retry), then 6 and 6.
+    assert.deepEqual(calls, [12, 12, 6, 6],
+      'the whole group is tried (with its retry) before being halved');
+
+    // Order must survive the split.
+    const order = [...out.body.matchAll(/^### \[(.+?)\]/gm)].map((m) => m[1]);
+    assert.deepEqual(order, all.slice(0, 12).map((e) => e.title),
+      'splitting must not reorder subscriptions');
+  }
+
+  // ---- 10. escalation recurses: 12 -> 6 -> 3 ----
+  {
+    const sizes: number[] = [];
+    const out = await runChunkedDigest('pi', [all.slice(0, 12)], workspace, 'interests', 'm',
+      async (mp) => {
+        const m = JSON.parse(fs.readFileSync(mp, 'utf-8')) as ManifestEntry[];
+        if (isSynthesisPass()) return res(HL);
+        sizes.push(m.length);
+        if (m.length > 3) return res('still too much');
+        return res(sectionsFor(m));
+      });
+
+    assert.equal(out.skipped, undefined, 'a second split level must still recover everything');
+    assert.equal((out.body.match(/^### \[/gm) ?? []).length, 12, 'all 12 recovered at depth 2');
+    assert.ok(sizes.includes(3), 'the escalation reached groups of 3');
+  }
+
+  // ---- 11. escalation is BOUNDED — a hopeless group is skipped, not looped ----
+  //
+  // If the model is broken rather than overloaded, splitting cannot help. The
+  // depth cap stops a bad night burning hours of pointless passes.
+  {
+    let calls = 0;
+    const out = await runChunkedDigest('pi', [all.slice(0, 12)], workspace, 'interests', 'm',
+      async () => { calls += 1; return res('never renders anything'); });
+
+    assert.equal(out.status, 'invalid', 'nothing rendered anywhere means invalid');
+    assert.equal(out.skipped?.length, 12, 'the whole group is reported as skipped');
+    assert.ok(calls <= 16,
+      `escalation must stay bounded; the depth cap allows at most 16 passes, saw ${calls}`);
+    assert.ok(calls > 2, 'it must actually have tried splitting, not given up at the top');
+  }
+
+  // ---- 12. a partial recovery reports only what was really lost ----
+  //
+  // The half that renders must ship; only the half that never does is skipped,
+  // and it is what makes the caller withhold notice-clearing.
+  {
+    const out = await runChunkedDigest('pi', [all.slice(0, 12)], workspace, 'interests', 'm',
+      async (mp) => {
+        const m = JSON.parse(fs.readFileSync(mp, 'utf-8')) as ManifestEntry[];
+        // Only groups drawn entirely from the first half (0..5) ever fail, so
+        // escalation rescues 6 of the 12 and loses the rest — the partial case.
+        if (m.every((e) => Number(e.title.split(' ')[1]) < 6)) return res('rambled');
+        if (isSynthesisPass()) return res(HL);
+        if (m.length === 12) return res('rambled');   // the whole group fails
+        return res(sectionsFor(m));
+      });
+
+    assert.equal(out.status, 'partial');
+    assert.ok(out.skipped!.length < 12,
+      `only the failing part is lost, not the whole group (lost ${out.skipped!.length})`);
+    assert.ok(out.body.includes('Subscription 11'), 'the healthy half still ships');
+    assert.ok(!out.body.includes('Subscription 0'), 'the failing part contributes nothing');
   }
 
   fs.rmSync(workspace, { recursive: true, force: true });

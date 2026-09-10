@@ -2234,29 +2234,74 @@ export async function runChunkedDigest(
 
   const total = chunks.reduce((n, c) => n + c.length, 0);
 
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
-    log.info(`Digest chunk ${i + 1}/${chunks.length} — ${chunk.length} subscription(s)`);
+  // ---- renderGroup — render these subscriptions, splitting if they fail ----
+  //
+  // Degeneration is driven by how much the model is handed at once, so a group
+  // that comes back defective is worth retrying SMALLER before it is written
+  // off. A failing 12 becomes 6 + 6; a failing 6 becomes 3 + 3. That turns
+  // "lose twelve subscriptions and clear nothing tonight" into "lose three, or
+  // none at all".
+  //
+  // Runtime pays for this and runtime is free: the digest runs unattended at
+  // 03:00, and the extra passes only happen on a night that was already going
+  // wrong.
+  //
+  // BOUNDED on purpose. If the model is broken rather than overloaded,
+  // splitting cannot help, and an uncapped recursion would burn hours on a bad
+  // night. At depth 2 a group of 12 costs at most 1 + 2 + 4 = 7 passes (14
+  // with each pass's own internal retry) before its subscriptions are skipped.
+  const MAX_SPLIT_DEPTH = 2;
+
+  const renderGroup = async (
+    group: ManifestEntry[],
+    label: string,
+    depth: number,
+  ): Promise<void> => {
+    if (group.length === 0) return;
+
+    log.info(`Digest ${label} — ${group.length} subscription(s)${depth > 0 ? ` (split level ${depth})` : ''}`);
 
     // Reinstall the workspace each pass: installRunMode APPENDS to CLAUDE.md,
-    // so without a fresh copy the overrides would stack up across chunks.
+    // so without a fresh copy the overrides would stack up across passes.
     installWorkspaceTemplate(digestDataDir, interests);
-    installRunMode(digestDataDir, 'sections', { index: i, total: chunks.length });
-    const manifestPath = writeManifest(chunk, digestDataDir);
+    installRunMode(digestDataDir, 'sections', { index: 0, total: chunks.length });
+    const manifestPath = writeManifest(group, digestDataDir);
+
+    // Can this group be usefully retried smaller? A single subscription cannot
+    // be split, and past the depth cap we stop regardless.
+    const canSplit = group.length > 1 && depth < MAX_SPLIT_DEPTH;
+
+    const giveUp = (reason: string): void => {
+      log.error(`Digest ${label} failed — ${reason}; its ${group.length} subscription(s) are skipped`);
+      skipped.push(...group.map((e) => ({ title: e.title, filePath: e.filePath, reason: `${label}: ${reason}` })));
+    };
+
+    const split = async (reason: string): Promise<void> => {
+      const mid = Math.ceil(group.length / 2);
+      log.warn(
+        `Digest ${label} failed (${reason}) — retrying as two smaller groups ` +
+        `of ${mid} and ${group.length - mid}`,
+      );
+      await renderGroup(group.slice(0, mid), `${label}a`, depth + 1);
+      await renderGroup(group.slice(mid),   `${label}b`, depth + 1);
+    };
 
     let result: DigestResult;
     try {
-      // Guard each chunk on its OWN expected count, and do not require a
+      // Guard each group on its OWN expected count, and do not require a
       // Highlights block — chunks are explicitly told not to write one.
       result = await generateGuardedDigest(
         () => runOne(manifestPath),
-        chunk.length,
+        group.length,
         { requireHighlights: false },
       );
     } catch (err) {
-      log.error(`Digest chunk ${i + 1} threw — skipping it`, { err: String(err) });
-      skipped.push(...chunk.map((e) => ({ title: e.title, filePath: e.filePath, reason: `chunk ${i + 1} failed: ${String(err)}` })));
-      continue;
+      // A thrown pass is usually the model being unreachable rather than
+      // overloaded, but splitting is cheap and occasionally the smaller
+      // request is the one that gets through.
+      if (canSplit) return split(String(err));
+      giveUp(String(err));
+      return;
     }
 
     inputTokens  += result.inputTokens;
@@ -2265,17 +2310,24 @@ export async function runChunkedDigest(
     actualModel ??= result.actualModel;
 
     if (result.status === 'invalid') {
-      log.error(`Digest chunk ${i + 1} defective after retry — its subscriptions are skipped`);
-      skipped.push(...chunk.map((e) => ({ title: e.title, filePath: e.filePath, reason: `chunk ${i + 1} still defective after retry` })));
-      continue;
+      if (canSplit) return split('defective after retry');
+      giveUp('defective after retry');
+      return;
     }
 
-    // Strip any Highlights block a chunk produced despite being told not to.
+    // Strip any Highlights block a group produced despite being told not to.
     // Leaving it in would give the post-processor several candidates and it
     // lifts the LAST one, which would be a partial summary of one chunk.
     const sections = stripHighlightsBlock(result.body);
     sectionParts.push(sections);
     completed += (sections.match(/^[ \t]*###[ \t]+\[/gm) ?? []).length;
+  };
+
+  // Sequential, not parallel: the passes share one workspace directory
+  // (manifest.json and CLAUDE.md are rewritten for each), and the ordering of
+  // sectionParts is the digest's reading order.
+  for (let i = 0; i < chunks.length; i++) {
+    await renderGroup(chunks[i], `chunk ${i + 1}/${chunks.length}`, 0);
   }
 
   const assembled = sectionParts.join('\n\n').trim();
