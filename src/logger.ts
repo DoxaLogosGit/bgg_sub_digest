@@ -48,12 +48,24 @@ if (!fs.existsSync(LOG_DIR)) {
   fs.mkdirSync(LOG_DIR, { recursive: true });
 }
 
+// Are we running one of the standalone *.test.ts scripts?
+//
+// WHY THIS MATTERS: the tests exercise the real guards and orchestrator, which
+// log at ERROR ("Agent digest still defective...", "Digest chunk 2 defective
+// after retry") — into the SAME dated file the nightly cron writes. Those
+// lines are indistinguishable from a real failure after the fact, and on
+// 2026-09-10 they briefly derailed a post-mortem of an actual bad digest.
+//
+// A test run keeps its console output and simply stops writing to the day's
+// production log.
+const isTestRun = process.argv.some((a) => /\.test\.ts$/.test(a));
+
 // Open a writable stream in append mode ('a'). This is lower-level
 // than writeFileSync — it keeps the file handle open for the whole
 // process lifetime rather than opening/closing on every write.
 //
 // Python equivalent: open(LOG_FILE, 'a', buffering=1)  (line-buffered)
-const logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+const logStream = isTestRun ? null : fs.createWriteStream(LOG_FILE, { flags: 'a' });
 
 // ---- Type alias for log levels --------------------------------
 //
@@ -94,7 +106,7 @@ function write(level: LogLevel, message: string, meta?: Record<string, unknown>)
 
   // Write to the file stream. '\n' adds a newline — Node streams don't
   // add one automatically (unlike Python's print()).
-  logStream.write(line + '\n');
+  logStream?.write(line + '\n');
 
   // Also write to the terminal. ERROR and WARN go to stderr so shell
   // redirections like `npm start 2>errors.log` capture them separately.
