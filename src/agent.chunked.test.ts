@@ -319,6 +319,50 @@ async function tests() {
     assert.ok(!out.body.includes('Subscription 0'), 'the failing part contributes nothing');
   }
 
+  // ---- 13. a chunk that drops ONE subscription is split, not shipped short ----
+  //
+  // 2026-09-10: a chunk of 12 rendered 11 and shipped, because 11/12 clears the
+  // lenient guard. skipped was 0, so a real run would have cleared that
+  // subscription's BGG notices and lost it silently. Escalation makes strictness
+  // affordable — the split renders all 12.
+  {
+    const out = await runChunkedDigest('pi', [all.slice(0, 12)], workspace, 'interests', 'm',
+      async (mp) => {
+        if (isSynthesisPass()) return res(HL);
+        const m = JSON.parse(fs.readFileSync(mp, 'utf-8')) as ManifestEntry[];
+        // At full size the model drops one; at half size it renders everything.
+        if (m.length === 12) return res(sectionsFor(m.slice(0, 11)));
+        return res(sectionsFor(m));
+      });
+
+    assert.equal((out.body.match(/^### \[/gm) ?? []).length, 12,
+      'the dropped subscription must be recovered by splitting');
+    assert.equal(out.skipped, undefined, 'nothing is lost');
+    assert.ok(out.body.includes('Subscription 11'),
+      'the specific subscription the full-size pass dropped is present');
+  }
+
+  // ---- 14. at the deepest level a short render still SHIPS ----
+  //
+  // The counterpart to 13: once splitting is exhausted, demanding every section
+  // would discard the sections the model did produce. Partial content beats no
+  // content, and whatever is genuinely missing is caught by the top-level guard.
+  {
+    const out = await runChunkedDigest('pi', [all.slice(0, 12)], workspace, 'interests', 'm',
+      async (mp) => {
+        if (isSynthesisPass()) return res(HL);
+        const m = JSON.parse(fs.readFileSync(mp, 'utf-8')) as ManifestEntry[];
+        // Always one short, at every size — so escalation runs out of room.
+        return res(sectionsFor(m.slice(0, Math.max(1, m.length - 1))));
+      });
+
+    const rendered = (out.body.match(/^### \[/gm) ?? []).length;
+    assert.ok(rendered > 0,
+      'a persistently-short model must still produce a shippable digest, not nothing');
+    assert.equal(out.skipped, undefined,
+      'leaf groups that rendered most of their content are not reported as lost');
+  }
+
   fs.rmSync(workspace, { recursive: true, force: true });
   console.log('agent.chunked.test.ts: all assertions passed ✓');
 }

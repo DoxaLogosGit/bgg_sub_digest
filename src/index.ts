@@ -837,6 +837,12 @@ async function runAgentAndWriteDigest(
       digestResult = await generateGuardedDigest(
         () => runDigest(agent, manifestPath, interests, model),
         ranked.length,
+        {
+          // Demand every section, because the escalation just below can still
+          // rescue a short render by splitting. Without a route onward this
+          // would be the wrong call — see the leaf case in runChunkedDigest.
+          minCoverage: ranked.length > 1 ? 1 : undefined,
+        },
       );
 
       // ---- Escalate a struggling single run ----
@@ -852,7 +858,7 @@ async function runAgentAndWriteDigest(
       if (digestResult.status === 'invalid' && ranked.length > 1) {
         log.warn(
           `Single-pass digest failed for ${ranked.length} subscription(s) — ` +
-          `retrying as smaller groups rather than shipping an invalid digest`,
+          `retrying as smaller groups rather than shipping a short digest`,
         );
         const halves = chunkEntries(ranked, Math.ceil(ranked.length / 2));
         digestResult = await runChunkedDigest(

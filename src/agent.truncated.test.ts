@@ -97,6 +97,35 @@ const HL = '## ⭐ Highlights\n\n- ⭐ Spirit Island — a rules question.\n\n';
     'no manifest count means no opinion — never block on a guess');
 }
 
+// ---- 6b. an explicit coverage floor can demand EVERY section ----
+//
+// A chunk is small and is told to render every entry it was given, so one
+// missing section is 8% of a chunk rather than a rounding error on a
+// 35-subscription night. Where a split can still rescue it, we ask for all of
+// them; the caller supplies the floor.
+{
+  const body = HL + sections(11);
+  assert.equal(isTruncatedDigest(body, 12), false,
+    '11 of 12 clears the default lenient floor');
+  assert.equal(isTruncatedDigest(body, 12, 1), true,
+    'the same digest fails a full-coverage requirement');
+  assert.equal(isTruncatedDigest(HL + sections(12), 12, 1), false,
+    '12 of 12 satisfies full coverage');
+}
+
+// ---- 6c. the strict floor must never be used where a split cannot follow ----
+//
+// This is the trap the design has to avoid: demanding full coverage at the
+// deepest split level would turn "rendered 2 of 3" into "skipped all 3" —
+// discarding content the model actually produced. The DEFAULT floor stays
+// lenient precisely so the leaf keeps shipping partial work.
+{
+  assert.equal(isTruncatedDigest(HL + sections(2), 3), false,
+    '2 of 3 must still ship under the default floor');
+  assert.equal(isTruncatedDigest(HL + sections(2), 3, 1), true,
+    '...even though it would fail a strict floor — hence the caller must not use one here');
+}
+
 function result(body: string): DigestResult {
   return { body, inputTokens: 0, outputTokens: 0, costUsd: 0, durationMs: 0 };
 }

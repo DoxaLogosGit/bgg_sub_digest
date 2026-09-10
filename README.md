@@ -444,6 +444,13 @@ The flow:
 
 Runs at or under `chunkSize` take the original single-pass path untouched.
 
+**Coverage.** While a split can still follow, a group must render *every*
+subscription it was given — one missing section is 8% of a 12-item chunk, not
+a rounding error, and a chunk that ships short has its missing subscription's
+notices cleared and lost. Once splitting is exhausted the requirement relaxes
+to the lenient 60% floor, because insisting on every section where nothing can
+follow would discard the sections the model did produce.
+
 **Escalation on failure.** A group that comes back defective is retried
 *smaller* before it is written off: a failing 12 becomes 6 + 6, a failing 6
 becomes 3 + 3. Degeneration is driven by how much the model is handed at once,

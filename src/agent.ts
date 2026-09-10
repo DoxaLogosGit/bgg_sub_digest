@@ -561,7 +561,15 @@ export function stripReasoningTags(body: string): string {
 // below every healthy run observed and far above the 0.03 that triggered this.
 const MIN_SECTION_COVERAGE = 0.6;
 
-export function isTruncatedDigest(body: string, expectedSections: number): boolean {
+export function isTruncatedDigest(
+  body: string,
+  expectedSections: number,
+  // Fraction of the expected sections that must be present. Defaults to the
+  // lenient calibrated floor. Callers pass 1 where a SPLIT can still rescue a
+  // short render — see runChunkedDigest — and must NOT pass it anywhere a
+  // failure means giving up, or "rendered 2 of 3" becomes "skipped all 3".
+  minCoverage: number = MIN_SECTION_COVERAGE,
+): boolean {
   // No manifest count (or an empty run) means we have no basis for an opinion.
   // Never block on a guess — the cost of a false positive here is a digest
   // withheld from the reader.
@@ -573,7 +581,7 @@ export function isTruncatedDigest(body: string, expectedSections: number): boole
   // exactly that shape. Counting the header marker alone sidesteps it.
   const rendered = (body.match(/^[ \t]*###[ \t]+\[/gm) ?? []).length;
 
-  return rendered < expectedSections * MIN_SECTION_COVERAGE;
+  return rendered < expectedSections * minCoverage;
 }
 
 // digestDefect — name the reason a completed digest is unshippable, or null.
@@ -583,14 +591,14 @@ export function isTruncatedDigest(body: string, expectedSections: number): boole
 function digestDefect(
   result: DigestResult,
   expectedSections: number,
-  opts: { requireHighlights?: boolean } = {},
+  opts: { requireHighlights?: boolean; minCoverage?: number } = {},
 ): string | null {
   const requireHighlights = opts.requireHighlights ?? true;
   if (result.status && result.status !== 'complete') return null;
   if (isTemplateEcho(result.body))      return 'unfilled template';
   if (requireHighlights && isMissingHighlights(result.body)) return 'missing Highlights block';
   if (isVacuousDigest(result.body))     return VACUOUS_DEFECT;
-  if (isTruncatedDigest(result.body, expectedSections)) {
+  if (isTruncatedDigest(result.body, expectedSections, opts.minCoverage)) {
     const rendered = (result.body.match(/^[ \t]*###[ \t]+\[/gm) ?? []).length;
     return `only ${rendered} of ${expectedSections} subscriptions rendered`;
   }
@@ -618,7 +626,7 @@ export async function generateGuardedDigest(
   // requireHighlights=false for a CHUNK pass, which is explicitly instructed
   // not to write a Highlights block — without this the missing-Highlights
   // guard would condemn every chunk for obeying its instructions.
-  opts: { requireHighlights?: boolean } = {},
+  opts: { requireHighlights?: boolean; minCoverage?: number } = {},
 ): Promise<DigestResult> {
   let result = await run();
   let defect = digestDefect(result, expectedSections, opts);
@@ -2293,7 +2301,21 @@ export async function runChunkedDigest(
       result = await generateGuardedDigest(
         () => runOne(manifestPath),
         group.length,
-        { requireHighlights: false },
+        {
+          requireHighlights: false,
+          // Demand EVERY section while a split can still rescue a short
+          // render. A chunk is small and is told to render all of its
+          // entries, so one missing section is 8% of a chunk rather than a
+          // rounding error on a 35-subscription night — and on 2026-09-10 a
+          // chunk of 12 shipped 11 with skipped=0, which in a real run would
+          // have cleared the missing subscription's notices and lost it.
+          //
+          // At the leaf we deliberately fall back to the lenient floor:
+          // insisting on every section where nothing can follow would turn
+          // "rendered 2 of 3" into "skipped all 3" and discard work the model
+          // actually did.
+          minCoverage: canSplit ? 1 : undefined,
+        },
       );
     } catch (err) {
       // A thrown pass is usually the model being unreachable rather than
