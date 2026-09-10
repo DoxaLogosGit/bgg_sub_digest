@@ -30,7 +30,7 @@ import * as path from 'path';
 //
 // `import type { ... }` imports only the type (erased at compile time).
 // `import { ... }` imports the actual runtime value.
-import { loadConfig, loadInterests } from './config';
+import { loadConfig, loadInterests, loadInterestsConfig } from './config';
 import { log } from './logger';
 import { createBrowserContext, ensureLoggedIn } from './bgg/auth';
 import {
@@ -48,7 +48,10 @@ import {
   itemsWithActivityNewerThan,
 } from './bgg/api';
 import { detectThreadSelfActivity, detectGeeklistSelfActivity } from './bgg/self-activity';
+import { rankEntries, chunkEntries, renderInterestsMarkdown } from './interests';
+import type { InterestsConfig } from './interests';
 import {
+  runChunkedDigest,
   formatThreadContent,
   formatGeeklistContent,
   writeSubscriptionFile,
@@ -163,7 +166,15 @@ async function main(): Promise<void> {
     // ---- 1. Load config and interests ----------------------
 
     const config    = loadConfig();
-    const interests = loadInterests(config.digest.interestsFile);
+    // Two views of the same file. `interests` is the text handed to the model;
+    // `interestsConfig` is the structured form the pipeline ranks with. For a
+    // .toml both come from interests.toml (the markdown is rendered from it);
+    // for a legacy .md, interestsConfig carries the prose as notes and no
+    // machine-readable priorities.
+    const interestsConfig = loadInterestsConfig(config.digest.interestsFile);
+    const interests = config.digest.interestsFile.toLowerCase().endsWith('.toml')
+      ? renderInterestsMarkdown(interestsConfig)
+      : loadInterests(config.digest.interestsFile);
 
     // Parse --agent <name> and --model <name> from CLI args.
     //   `npm start -- --agent pi     --model ollama/nemotron-3-super:cloud`
@@ -260,7 +271,7 @@ async function main(): Promise<void> {
 
       const reusedDigest = await runAgentAndWriteDigest(
         agent, model, manifestPath, interests, reusedEntries, digestDataDir,
-        config, runStart,
+        config, runStart, interestsConfig,
       );
 
       const reusedElapsed = Date.now() - runStart.getTime();
@@ -508,7 +519,11 @@ async function main(): Promise<void> {
               unreadCount:      sub.unreadCount,
               notificationDate: sub.notificationDate?.toISOString() ?? null,
               parentName:       sub.parentName,
-              selfActivity:     selfActivity ?? undefined,
+              // matchedIds is internal plumbing for the cap above — the model
+              // has no use for raw ids, so keep them out of manifest.json.
+              selfActivity:     selfActivity
+                ? { reasons: selfActivity.reasons, replyCount: selfActivity.replyCount }
+                : undefined,
             });
           } else {
             // The notice feed says there's new activity but the XML API window
@@ -646,7 +661,11 @@ async function main(): Promise<void> {
               unreadCount:      sub.unreadCount,
               notificationDate: sub.notificationDate?.toISOString() ?? null,
               parentName:       sub.parentName,
-              selfActivity:     selfActivity ?? undefined,
+              // matchedIds is internal plumbing for the cap above — the model
+              // has no use for raw ids, so keep them out of manifest.json.
+              selfActivity:     selfActivity
+                ? { reasons: selfActivity.reasons, replyCount: selfActivity.replyCount }
+                : undefined,
             });
           } else {
             log.info(`Geeklist ${sub.id} "${geeklist.title}" — no fetchable new items; emitting stub`);
@@ -686,7 +705,7 @@ async function main(): Promise<void> {
 
       const digestOutcome = await runAgentAndWriteDigest(
         agent, model, manifestPath, interests, manifestEntries, digestDataDir,
-        config, runStart,
+        config, runStart, interestsConfig,
       );
 
       // ---- 7. Clear the processed notices on BGG --------------
@@ -778,8 +797,10 @@ async function runAgentAndWriteDigest(
   entries: ManifestEntry[],
   digestDataDir: string,
   // Inline shape — only the fields we actually need from the full Config.
-  config: { digest: { outputDir: string }; email?: Parameters<typeof sendDigestEmail>[0] },
+  config: { digest: { outputDir: string; chunkSize: number }; email?: Parameters<typeof sendDigestEmail>[0] },
   runStart: Date,
+  // Structured interests, used to rank subscriptions before chunking.
+  interestsConfig: InterestsConfig,
 ): Promise<{ digestPath: string; clearSafe: boolean }> {
   log.info(
     `Running ${agent} (${model}) against ${entries.length} subscription(s) from ${digestDataDir}`,
@@ -795,14 +816,38 @@ async function runAgentAndWriteDigest(
     // Generate with a template-echo retry guard: if the model returns the
     // unfilled template, retry once, and if it's still a template stamp
     // status='invalid' so we don't clear the BGG notices below.
-    // entries.length is what the model was actually handed. Passing it lets
-    // the guard notice a digest that rendered almost none of it — the
-    // 2026-09-10 failure, where 1 of 31 sections shipped as 'complete' and
-    // cleared 90 notices.
-    digestResult = await generateGuardedDigest(
-      () => runDigest(agent, manifestPath, interests, model),
-      entries.length,
-    );
+    // ---- Rank, then decide single-pass or chunked ----
+    //
+    // Ranking happens HERE, over the whole set, because a chunk cannot see
+    // the others: "priority subscriptions first" has to be settled before the
+    // split or it means nothing. See interests.ts.
+    const ranked = rankEntries(entries, interestsConfig);
+    const chunks = chunkEntries(ranked, config.digest.chunkSize);
+
+    if (chunks.length <= 1) {
+      // Small night — the original single-pass path, untouched. This is the
+      // proven behaviour for every healthy run on record, so it stays exactly
+      // as it was rather than being routed through the chunk machinery.
+      //
+      // entries.length is what the model was actually handed. Passing it lets
+      // the guard notice a digest that rendered almost none of it — the
+      // 2026-09-10 failure, where 1 of 31 sections shipped as 'complete' and
+      // cleared 90 notices.
+      writeManifest(ranked, digestDataDir);
+      digestResult = await generateGuardedDigest(
+        () => runDigest(agent, manifestPath, interests, model),
+        ranked.length,
+      );
+    } else {
+      log.info(
+        `Chunked digest: ${ranked.length} subscription(s) in ${chunks.length} chunk(s) ` +
+        `of up to ${config.digest.chunkSize} — the model degrades on larger one-shot runs`,
+      );
+      digestResult = await runChunkedDigest(
+        agent, chunks, digestDataDir, interests, model,
+        (chunkManifestPath) => runDigest(agent, chunkManifestPath, interests, model),
+      );
+    }
   } catch (err) {
     log.error(`${agent} digest run failed`, { err: String(err) });
     // Fallback — show a minimal digest pointing at the data files so the user
@@ -890,7 +935,25 @@ async function runAgentAndWriteDigest(
   // clearSafe=false on a failed run (template-echo 'invalid' OR a crashed
   // 'error' fallback) tells the caller to skip clearViewdates so the unread BGG
   // notices survive to the next run instead of being silently lost.
-  return { digestPath, clearSafe: status !== 'invalid' && status !== 'error' };
+  // clearSafe=false on a failed run AND on any run that lost subscriptions.
+  //
+  // The skipped-entries case is new (2026-09-10): with the digest built in
+  // chunks, a single bad chunk means ~12 subscriptions were never summarised.
+  // Clearing their BGG notices would lose that activity exactly the way the
+  // 09-10 run lost 90 notices. Not clearing means tomorrow re-fetches the
+  // whole night — duplicated effort, which is cheap, instead of data loss,
+  // which is not.
+  const lostSubscriptions = skipped.length > 0;
+  if (lostSubscriptions) {
+    log.warn(
+      `${skipped.length} subscription(s) were not summarised — NOT clearing BGG ` +
+      `notices, so tonight's activity survives to the next run`,
+    );
+  }
+  return {
+    digestPath,
+    clearSafe: status !== 'invalid' && status !== 'error' && !lostSubscriptions,
+  };
 }
 
 // ---- formatTokenUsage ----------------------------------------

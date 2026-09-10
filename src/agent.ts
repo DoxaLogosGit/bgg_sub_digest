@@ -580,10 +580,15 @@ export function isTruncatedDigest(body: string, expectedSections: number): boole
 // A run ALREADY flagged degraded (partial after skips, rate_limited after a 429,
 // or a prior error/invalid) may legitimately lack a Highlights block — the
 // caller already banners those — so we never second-guess or override it here.
-function digestDefect(result: DigestResult, expectedSections: number): string | null {
+function digestDefect(
+  result: DigestResult,
+  expectedSections: number,
+  opts: { requireHighlights?: boolean } = {},
+): string | null {
+  const requireHighlights = opts.requireHighlights ?? true;
   if (result.status && result.status !== 'complete') return null;
   if (isTemplateEcho(result.body))      return 'unfilled template';
-  if (isMissingHighlights(result.body)) return 'missing Highlights block';
+  if (requireHighlights && isMissingHighlights(result.body)) return 'missing Highlights block';
   if (isVacuousDigest(result.body))     return VACUOUS_DEFECT;
   if (isTruncatedDigest(result.body, expectedSections)) {
     const rendered = (result.body.match(/^[ \t]*###[ \t]+\[/gm) ?? []).length;
@@ -610,9 +615,13 @@ export async function generateGuardedDigest(
   // number existed at the call site and was never passed in, and an optional
   // parameter is one refactor away from silently going missing again.
   expectedSections: number,
+  // requireHighlights=false for a CHUNK pass, which is explicitly instructed
+  // not to write a Highlights block — without this the missing-Highlights
+  // guard would condemn every chunk for obeying its instructions.
+  opts: { requireHighlights?: boolean } = {},
 ): Promise<DigestResult> {
   let result = await run();
-  let defect = digestDefect(result, expectedSections);
+  let defect = digestDefect(result, expectedSections, opts);
   if (!defect) return result;
 
   if (defect === VACUOUS_DEFECT) {
@@ -626,7 +635,7 @@ export async function generateGuardedDigest(
 
   log.warn(`Agent produced a defective digest (${defect}) — retrying once`);
   result = await run();
-  defect = digestDefect(result, expectedSections);
+  defect = digestDefect(result, expectedSections, opts);
   if (defect) {
     log.error(`Agent digest still defective (${defect}) after retry — marking invalid`);
     result.status = 'invalid';
@@ -764,6 +773,105 @@ export function installWorkspaceTemplate(
 }
 
 // ============================================================
+// installRunMode — tell the model what THIS pass is for
+// ============================================================
+//
+// A chunked digest runs the agent several times over the same workspace, and
+// the passes want different things:
+//
+//   'single'    — the original one-shot behaviour: every section, then the
+//                 Highlights block last. Used whenever a run fits in one chunk.
+//   'sections'  — one chunk of subscriptions, sections ONLY. A chunk must not
+//                 write Highlights: it can only see its own slice, so any
+//                 "cross-subscription" summary it produced would be wrong, and
+//                 several competing Highlights blocks would confuse the
+//                 post-processor, which lifts the LAST one it finds.
+//   'highlights'— the synthesis pass. Reads the assembled sections from
+//                 SECTIONS.md and writes only the Highlights block.
+//
+// The instructions are APPENDED to the workspace CLAUDE.md rather than
+// replacing it, so all the format rules, attribution traps and ordering
+// guidance still apply. The appended block explicitly says it overrides, since
+// CLAUDE.md's own workflow section tells the model to write Highlights last —
+// a direct contradiction in a chunk pass if left unqualified.
+export type RunMode = 'single' | 'sections' | 'highlights';
+
+export function installRunMode(digestDataDir: string, mode: RunMode, chunkInfo?: { index: number; total: number }): void {
+  if (mode === 'single') return;   // CLAUDE.md as shipped is already correct
+
+  const claudePath = path.join(digestDataDir, 'CLAUDE.md');
+  if (!fs.existsSync(claudePath)) {
+    log.warn('No CLAUDE.md in workspace — cannot install run mode', { digestDataDir, mode });
+    return;
+  }
+
+  const override = mode === 'sections'
+    ? [
+        '',
+        '---',
+        '',
+        '# THIS RUN: SECTIONS ONLY — overrides the instructions above',
+        '',
+        `You are processing part ${chunkInfo ? chunkInfo.index + 1 : '?'} of ` +
+        `${chunkInfo ? chunkInfo.total : '?'} of tonight's digest.`,
+        '',
+        '`manifest.json` contains ONLY your part. Other parts are handled by',
+        'separate runs, and a combined Highlights block is written at the end',
+        'from all parts together.',
+        '',
+        '**Therefore:**',
+        '',
+        '1. Render a `### [Title](URL)` section for EVERY entry in',
+        '   `manifest.json`, using `templates/section.md`. That is the whole job.',
+        '2. Do **NOT** write a `## ⭐ Highlights` block. Not at the start, not at',
+        '   the end, not at all. A later pass writes it from every part at once;',
+        '   yours would only see this slice and would be wrong.',
+        '3. Do **NOT** re-order the entries. They arrive already sorted into the',
+        '   reader\'s priority order — keep manifest order exactly.',
+        '4. Begin directly with the first `### [` header and emit nothing else.',
+        '',
+      ].join('\n')
+    : [
+        '',
+        '---',
+        '',
+        '# THIS RUN: HIGHLIGHTS ONLY — overrides the instructions above',
+        '',
+        'Every subscription has already been summarised. The complete set of',
+        'sections is in **`SECTIONS.md`** in this directory. Read that file.',
+        '',
+        'Do NOT read `manifest.json` or any subscription data file — the work of',
+        'summarising is done, and re-reading the raw data will only produce a',
+        'summary that disagrees with the sections the reader is about to see.',
+        '',
+        '**Your entire output is ONE `## ⭐ Highlights` block**, following',
+        '`templates/highlights.md`. No section content, no preamble, no closing',
+        'remarks. Begin with the line `## ⭐ Highlights` and stop when the',
+        'bullets are done.',
+        '',
+      ].join('\n');
+
+  fs.appendFileSync(claudePath, override, 'utf-8');
+  log.debug('Run mode installed', { mode, chunk: chunkInfo });
+}
+
+// ============================================================
+// writeSectionsFile — hand the synthesis pass the assembled digest
+// ============================================================
+//
+// The Highlights pass reads this instead of the raw subscription data. That is
+// deliberate: Highlights should summarise what the reader will actually see,
+// and it keeps the synthesis context small (the assembled sections, tens of
+// KB) rather than re-loading the full workspace that caused the degeneration
+// in the first place.
+export function writeSectionsFile(sections: string, digestDataDir: string): string {
+  const sectionsPath = path.join(digestDataDir, 'SECTIONS.md');
+  fs.writeFileSync(sectionsPath, sections, 'utf-8');
+  log.debug('Sections file written', { sectionsPath, bytes: sections.length });
+  return sectionsPath;
+}
+
+// ============================================================
 // writeManifest — write manifest.json listing all subscription files
 // ============================================================
 //
@@ -842,6 +950,47 @@ function buildDigestPrompt(
 //   - Strips any earlier (placeholder) Highlights blocks so we don't keep
 //     a dead "[To be populated...]" stub above the real one.
 //   - If no Highlights header is found at all, returns the body unchanged.
+// ============================================================
+// Highlights block helpers — used by the chunked digest path
+// ============================================================
+//
+// Both use the SAME header pattern as liftHighlightsToTop, so what one
+// extracts is exactly what the other would have lifted. Keep them in sync.
+const HIGHLIGHTS_HEADER_RE = /^[ \t]*##[ \t]+(?:⭐[ \t]+)?Highlights[ \t]*$/im;
+
+// extractHighlightsBlock — pull the Highlights block out of a synthesis pass.
+// Returns '' when there isn't one, so the caller can ship sections regardless.
+export function extractHighlightsBlock(body: string): string {
+  const m = HIGHLIGHTS_HEADER_RE.exec(body ?? '');
+  if (!m) return '';
+  // Everything from the header to the end: the synthesis pass is instructed to
+  // emit nothing after the bullets, and any stray trailing remark is dealt
+  // with by stripBlockNarration in the normal post-processing chain.
+  return body.slice(m.index).trim();
+}
+
+// stripHighlightsBlock — remove a Highlights block a CHUNK produced.
+//
+// Chunks are told not to write one, because a chunk can only see its own
+// slice and its "cross-subscription" summary would be wrong. Models don't
+// always obey, and several competing blocks would confuse the post-processor
+// (liftHighlightsToTop keeps the LAST one it finds — which would be one
+// chunk's partial view). Cut from the header to the next section header.
+export function stripHighlightsBlock(body: string): string {
+  const m = HIGHLIGHTS_HEADER_RE.exec(body ?? '');
+  if (!m) return body;
+
+  const after      = body.slice(m.index + m[0].length);
+  const nextHeader = /\n[ \t]*###[ \t]+\[/.exec(after);
+  const end        = nextHeader
+    ? m.index + m[0].length + nextHeader.index
+    : body.length;
+
+  const out = (body.slice(0, m.index) + body.slice(end)).trim();
+  log.debug('Stripped a Highlights block from a chunk', { removedChars: body.length - out.length });
+  return out;
+}
+
 function liftHighlightsToTop(body: string): string {
   const trimmed = body.trim();
   if (!trimmed) return body;
@@ -1653,8 +1802,15 @@ type AgentEvent = {
 // surfaces as defective and the existing retry/invalid guard still
 // applies.
 export function selectDigestBody(turnEnds: AgentEvent[]): { body: string; turnIndex: number } {
-  let fallbackBody  = '';
-  let fallbackIndex = -1;
+  let fallbackBody     = '';
+  let fallbackIndex    = -1;
+  let fallbackSections = -1;
+
+  // How many rendered sections does this candidate carry? Counted without
+  // capturing the title, because a real BGG title can itself open with a
+  // bracket ("### [[Detective Hawk] Wayfarers ...](...)").
+  const sectionCount = (text: string): number =>
+    (text.match(/^[ \t]*###[ \t]+\[/gm) ?? []).length;
 
   for (let i = turnEnds.length - 1; i >= 0; i--) {
     const content = turnEnds[i].message?.content ?? [];
@@ -1664,11 +1820,27 @@ export function selectDigestBody(turnEnds: AgentEvent[]): { body: string; turnIn
       .map((c) => c.text as string)
       .join('\n');
 
-    // Preserve the ORIGINAL behavior exactly as the fallback: the newest
-    // turn with non-empty text, regardless of content.
-    if (fallbackIndex === -1 && textJoined) {
-      fallbackBody  = textJoined;
-      fallbackIndex = i;
+    // FALLBACK CHOICE: the text turn carrying the MOST sections, newest
+    // winning ties. Iteration is newest-first, so a strict `>` keeps the
+    // newest of equal candidates — which reduces to the original "newest
+    // non-empty text turn" whenever section counts are equal or all zero.
+    //
+    // WHY IT IS NOT SIMPLY "NEWEST" (2026-09-10): the Highlights preference
+    // below is inert during a CHUNK pass, because chunks are explicitly told
+    // not to write a Highlights block — so every chunk lands here. A real run
+    // that night had the model emit 11 turns of one section each and then
+    // re-emit all 12 together in its final turn; "newest" happened to be the
+    // complete one. Had it closed with a short wrap-up instead, "newest"
+    // would have discarded 12 sections in favour of a sentence — exactly the
+    // 2026-08-07 failure this function exists to prevent, reappearing through
+    // the door the chunk mode opened.
+    if (textJoined) {
+      const n = sectionCount(textJoined);
+      if (fallbackIndex === -1 || n > fallbackSections) {
+        fallbackBody     = textJoined;
+        fallbackIndex    = i;
+        fallbackSections = n;
+      }
     }
 
     const writeCandidates = content
@@ -2021,6 +2193,142 @@ export async function runPiDigest(
 // built on pi, dropping it cost nothing at the parser level — the JSONL event
 // shape is the same one pi emits.
 export type AgentName = 'claude' | 'claude-ollama' | 'pi';
+
+// ============================================================
+// runChunkedDigest — build the digest in survivable pieces
+// ============================================================
+//
+// WHY (2026-09-10): handing nemotron-3-super:cloud ~30 subscriptions in one
+// call produces garbage. Six healthy runs at <=21 subscriptions against four
+// degenerate ones at >=31; the 09-10 run emitted ONE section for 31
+// subscriptions and still cleared 90 BGG notices.
+//
+// Shape:
+//   1. entries arrive ALREADY ranked (see interests.ts) — chunk order is
+//      digest order, so concatenating chunk outputs preserves priority.
+//   2. one agent run per chunk, sections only, guarded and retried
+//      independently. A bad chunk costs one chunk, not the night.
+//   3. one final synthesis run over the assembled sections for Highlights.
+//
+// A run that fits in a single chunk takes the ORIGINAL path untouched — the
+// proven behaviour for the small nights that have always worked.
+//
+// FAILURE POLICY: a chunk that is still defective after its retry is recorded
+// in `skipped` and its subscriptions are left out. The caller refuses to clear
+// BGG notices when anything is skipped, so a bad chunk means tomorrow re-fetches
+// the night rather than losing it. Duplication is cheap; the 09-10 loss was not.
+export async function runChunkedDigest(
+  agent: AgentName,
+  chunks: ManifestEntry[][],
+  digestDataDir: string,
+  interests: string,
+  model: string | undefined,
+  runOne: (manifestPath: string) => Promise<DigestResult>,
+): Promise<DigestResult> {
+  const started      = Date.now();
+  const sectionParts: string[] = [];
+  const skipped:      DigestSkippedEntry[] = [];
+  let inputTokens = 0, outputTokens = 0, costUsd = 0;
+  let completed   = 0;
+  let actualModel: string | undefined;
+
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    log.info(`Digest chunk ${i + 1}/${chunks.length} — ${chunk.length} subscription(s)`);
+
+    // Reinstall the workspace each pass: installRunMode APPENDS to CLAUDE.md,
+    // so without a fresh copy the overrides would stack up across chunks.
+    installWorkspaceTemplate(digestDataDir, interests);
+    installRunMode(digestDataDir, 'sections', { index: i, total: chunks.length });
+    const manifestPath = writeManifest(chunk, digestDataDir);
+
+    let result: DigestResult;
+    try {
+      // Guard each chunk on its OWN expected count, and do not require a
+      // Highlights block — chunks are explicitly told not to write one.
+      result = await generateGuardedDigest(
+        () => runOne(manifestPath),
+        chunk.length,
+        { requireHighlights: false },
+      );
+    } catch (err) {
+      log.error(`Digest chunk ${i + 1} threw — skipping it`, { err: String(err) });
+      skipped.push(...chunk.map((e) => ({ title: e.title, filePath: e.filePath, reason: `chunk ${i + 1} failed: ${String(err)}` })));
+      continue;
+    }
+
+    inputTokens  += result.inputTokens;
+    outputTokens += result.outputTokens;
+    costUsd      += result.costUsd;
+    actualModel ??= result.actualModel;
+
+    if (result.status === 'invalid') {
+      log.error(`Digest chunk ${i + 1} defective after retry — its subscriptions are skipped`);
+      skipped.push(...chunk.map((e) => ({ title: e.title, filePath: e.filePath, reason: `chunk ${i + 1} still defective after retry` })));
+      continue;
+    }
+
+    // Strip any Highlights block a chunk produced despite being told not to.
+    // Leaving it in would give the post-processor several candidates and it
+    // lifts the LAST one, which would be a partial summary of one chunk.
+    const sections = stripHighlightsBlock(result.body);
+    sectionParts.push(sections);
+    completed += (sections.match(/^[ \t]*###[ \t]+\[/gm) ?? []).length;
+  }
+
+  const assembled = sectionParts.join('\n\n').trim();
+
+  if (!assembled) {
+    log.error('Every digest chunk failed — no sections were produced');
+    return {
+      body: '', inputTokens, outputTokens, costUsd,
+      durationMs: Date.now() - started,
+      status: 'invalid', completedCount: 0, totalCount: total, skipped, actualModel,
+    };
+  }
+
+  // ---- Synthesis pass: Highlights over the assembled sections ----
+  let highlights = '';
+  try {
+    installWorkspaceTemplate(digestDataDir, interests);
+    installRunMode(digestDataDir, 'highlights');
+    writeSectionsFile(assembled, digestDataDir);
+    // The synthesis pass reads SECTIONS.md, but the agent still expects a
+    // manifest path argument; hand it the full ranked list for context.
+    const manifestPath = writeManifest(chunks.flat(), digestDataDir);
+
+    log.info('Digest synthesis pass — writing Highlights from the assembled sections');
+    const hlResult = await runOne(manifestPath);
+    inputTokens  += hlResult.inputTokens;
+    outputTokens += hlResult.outputTokens;
+    costUsd      += hlResult.costUsd;
+
+    highlights = extractHighlightsBlock(hlResult.body);
+    if (!highlights) {
+      log.warn('Synthesis pass produced no Highlights block — shipping sections without it');
+    }
+  } catch (err) {
+    // A failed synthesis pass must not cost the sections we already have.
+    log.error('Digest synthesis pass failed — shipping sections without Highlights', { err: String(err) });
+  }
+
+  const body = highlights ? `${highlights}\n\n${assembled}` : assembled;
+
+  return {
+    body,
+    inputTokens, outputTokens, costUsd,
+    durationMs: Date.now() - started,
+    // 'partial' whenever any chunk was lost, which makes the caller refuse to
+    // clear notices; otherwise let the caller treat it as a normal complete run.
+    status:         skipped.length > 0 ? 'partial' : undefined,
+    completedCount: completed,
+    totalCount:     total,
+    skipped:        skipped.length > 0 ? skipped : undefined,
+    actualModel,
+  };
+}
 
 export async function runDigest(
   agent: AgentName,

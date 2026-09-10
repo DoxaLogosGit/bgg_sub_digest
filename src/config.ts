@@ -33,6 +33,8 @@ import * as path from 'path';
 // `z` is the conventional import name for the Zod library.
 // All Zod schema constructors live on this `z` object.
 import { z } from 'zod';
+import * as TOML from 'smol-toml';
+import type { InterestsConfig } from './interests';
 
 // ---- Schema definition ----------------------------------------
 //
@@ -72,10 +74,21 @@ const ConfigSchema = z.object({
     // so you can watch it navigate and solve any Cloudflare challenge manually.
     headless: z.boolean().default(true),
 
-    // Path to the plain-text/markdown file describing what you care about.
-    // Its full content is passed verbatim to Claude when building the prompt.
-    // Relative paths are resolved from the project root (where `npm start` runs).
-    interestsFile: z.string().default('./interests.md'),
+    // Path to the file describing what you care about. Prefer interests.toml
+    // (structured — the pipeline reads priority_titles from it to order the
+    // digest before chunking). A .md path still works and is treated as
+    // free text with no machine-readable priorities; see loadInterestsConfig.
+    interestsFile: z.string().default('./interests.toml'),
+
+    // How many subscriptions to hand the model in a single run.
+    //
+    // The digest is built in chunks because nemotron-3-super:cloud degenerates
+    // on large one-shot runs: six healthy runs at <=21 subscriptions
+    // (2026-09-04 .. 09-09) against four degenerate ones at >=31 (09-01,
+    // 09-02, 09-03, 09-10). 12 leaves real margin under the smallest observed
+    // failure. Runs with fewer subscriptions than this take the original
+    // single-pass path unchanged.
+    chunkSize: z.number().int().positive().default(12),
 
     // Whether to actually clear (mark-as-read) each processed subscription on BGG.
     // true  = click BGG's remove button on each notification row after processing.
@@ -171,6 +184,59 @@ export function loadInterests(interestsFilePath: string): string {
   }
   // .trim() strips leading/trailing whitespace — same as Python's str.strip()
   return fs.readFileSync(interestsFilePath, 'utf-8').trim();
+}
+
+// ---- loadInterestsConfig --------------------------------------
+//
+// Read interests.toml into the structured shape the ranking code needs.
+//
+// FALLBACK: if the configured path is not a .toml, or the .toml is missing,
+// we still return a usable config — with the file's raw text as `notes` and
+// NO machine-readable priorities. The digest then still works and the model
+// still sees the reader's interests; only the code-side priority ordering is
+// unavailable, which degrades chunk ordering rather than breaking the run.
+// This is what keeps an existing interests.md installation working.
+export function loadInterestsConfig(interestsFilePath: string): InterestsConfig {
+  const empty: InterestsConfig = {
+    priorityTitles: [], trackedGames: [], keywords: [], notes: '',
+  };
+
+  if (!fs.existsSync(interestsFilePath)) return empty;
+  const raw = fs.readFileSync(interestsFilePath, 'utf-8');
+
+  if (!interestsFilePath.toLowerCase().endsWith('.toml')) {
+    // A legacy free-text interests.md: hand it to the model wholesale.
+    return { ...empty, notes: raw.trim() };
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = TOML.parse(raw) as Record<string, unknown>;
+  } catch (err) {
+    // A typo in the TOML must not take the whole digest down. Fall back to
+    // treating it as prose and say so loudly.
+    console.error(
+      `[WARN] Could not parse ${interestsFilePath} as TOML (${String(err)}). ` +
+      `Falling back to free text — priority ordering will be unavailable.`,
+    );
+    return { ...empty, notes: raw.trim() };
+  }
+
+  // Coerce defensively: a hand-edited file may hold a string where a list
+  // belongs, and a crashed digest is a worse outcome than an ignored key.
+  const list = (key: string): string[] => {
+    const v = parsed[key];
+    if (Array.isArray(v)) return v.filter((x): x is string => typeof x === 'string');
+    if (typeof v === 'string') return [v];
+    return [];
+  };
+
+  return {
+    priorityTitles: list('priority_titles'),
+    trackedGames:   list('tracked_games'),
+    keywords:       list('keywords'),
+    notes:          typeof parsed['notes'] === 'string' ? parsed['notes'].trim() : '',
+  };
 }
 
 // ---- Type export -----------------------------------------------

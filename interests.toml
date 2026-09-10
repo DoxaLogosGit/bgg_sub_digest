@@ -1,0 +1,88 @@
+# ============================================================
+# interests.toml — what the digest should prioritise and highlight
+# ============================================================
+#
+# This file replaces the old free-text interests.md. It is still meant to be
+# edited by hand — the structure exists so the PIPELINE can act on it, not
+# just the model.
+#
+# Why it had to become structured (2026-09-10): the digest now summarises
+# subscriptions in chunks, because the model degenerates when handed ~30 at
+# once. Each chunk only sees its own subscriptions, so "put the priority ones
+# first" can no longer be a judgement the model makes — nothing in a chunk
+# knows what is in the other chunks. The ordering is decided in code, before
+# the split, which means the priority rules have to be machine-readable.
+#
+# Anything that ISN'T a title match still works: put it in `notes` at the
+# bottom, which is passed to the model verbatim.
+
+# ---- Priority subscriptions -------------------------------------
+#
+# Case-insensitive SUBSTRINGS matched against a subscription's title. Any
+# match sorts that subscription to the top of the digest, ahead of everything
+# except direct replies to you. Order within this list does not matter.
+priority_titles = [
+  "SGOYT",
+  "Solitaire Games on your Table",
+  "SROYT",
+  "Top 20 Solo",
+  "GMT P500",
+  "Acquisition",
+  "Dave's",
+  "SpaceBiff",
+  "Dad Jokes",
+  "Shopping",
+  "Culling",
+  "Giveaway",
+  "Crowdfunding",
+  "What's on your table",
+]
+
+# ---- Games being tracked ----------------------------------------
+#
+# Matched against a subscription's parent game to rank it, and given to the
+# model so it can mark mentions with a star.
+tracked_games = [
+  "Star Trek: Captain's Chair",
+  "Spirit Island",
+  "Earthborne Rangers",
+  "Marvel Champions",
+  "Deckers",
+  "Spacecorp",
+  "Western Front Ace",
+  "RAF: The Battle of Britain 1940",
+  "Terraforming Mars",
+  "Lord of the Rings: Fate of the Fellowship",
+  "Silent War",
+  "Away Team",
+  "Firefight Tactical",
+  "Star Wars: Outer Rim",
+]
+
+# ---- Keywords ---------------------------------------------------
+#
+# Used by the MODEL only, to mark matching content with a star. Not used for
+# ordering — a keyword can appear anywhere in a subscription's body, so it
+# says nothing about which subscription matters more.
+keywords = [
+  "solo / solitaire",
+  "cooperative",
+  "expansion",
+  "kickstarter / crowdfunding",
+  "review",
+  "giveaway",
+]
+
+# ---- Free text --------------------------------------------------
+#
+# Passed to the model verbatim. Use it for anything that is a judgement
+# rather than a title match — the pipeline does not interpret it.
+notes = """
+Also treat these as high priority when you see them, even though they are not
+simple title matches:
+- Auction geeklists
+- Solo RPG geeklists
+- Monthly shopping / deals threads
+- "What's on your table" weekly threads
+- Culling threads
+"""

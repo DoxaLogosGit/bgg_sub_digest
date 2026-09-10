@@ -146,4 +146,43 @@ const incidentTurns = [
   assert.equal(turnIndex, -1, 'no turns must yield turnIndex -1');
 }
 
+// ---- (f) CHUNK MODE: the turn with the most sections wins, not the newest ----
+//
+// A chunk pass never contains a Highlights block (chunks are instructed not to
+// write one), so every chunk falls through to the fallback. Observed on
+// 2026-09-10: the model emitted 11 turns of one section each and then
+// re-emitted all 12 together at the end. Picking "newest with text" got the
+// right turn by luck; if the model had signed off with a wrap-up sentence,
+// 12 sections would have been thrown away for one line of prose.
+{
+  const many = Array.from({ length: 12 }, (_, i) =>
+    `### [Sub ${i}](https://boardgamegeek.com/thread/${i})\n\n**Summary:** real.\n\n**Topics Mentioned:** none\n`,
+  ).join('\n');
+
+  const chunkTurns = [
+    { type: 'turn_end', message: { model: 'm', provider: 'p', content: [{ type: 'text', text: '### [Sub 0](https://boardgamegeek.com/thread/0)\n\n**Summary:** real.\n' }] } },
+    { type: 'turn_end', message: { model: 'm', provider: 'p', content: [{ type: 'text', text: many }] } },
+    { type: 'turn_end', message: { model: 'm', provider: 'p', content: [{ type: 'text', text: 'All 12 subscriptions are summarised above.' }] } },
+  ];
+
+  const { body, turnIndex } = selectDigestBody(chunkTurns);
+  assert.equal(turnIndex, 1, 'the turn carrying all 12 sections must win over a later wrap-up');
+  assert.equal((body.match(/^### \[/gm) ?? []).length, 12, 'all 12 sections are recovered');
+}
+
+// ---- (g) equal section counts still resolve to the NEWEST turn ----
+//
+// Guards the reduction to the original behaviour: when nothing distinguishes
+// candidates by section count, this must behave exactly as it always did.
+{
+  const one = '### [Sub A](https://boardgamegeek.com/thread/1)\n\n**Summary:** a.\n';
+  const two = '### [Sub B](https://boardgamegeek.com/thread/2)\n\n**Summary:** b.\n';
+  const { body, turnIndex } = selectDigestBody([
+    { type: 'turn_end', message: { model: 'm', provider: 'p', content: [{ type: 'text', text: one }] } },
+    { type: 'turn_end', message: { model: 'm', provider: 'p', content: [{ type: 'text', text: two }] } },
+  ]);
+  assert.equal(turnIndex, 1, 'ties go to the newest turn');
+  assert.equal(body, two);
+}
+
 console.log('agent.body-recovery.test.ts: all assertions passed ✓');

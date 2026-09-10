@@ -2,19 +2,20 @@
   "bgg": {
     "username": "your_bgg_username",
     "password": "your_bgg_password",
-    "apiKey":   "your_bgg_xml_api_key"
+    "apiKey": "your_bgg_xml_api_key"
   },
   "digest": {
-    "outputDir":                  "./digests",
-    "scheduleMode":               "daily",
+    "outputDir": "./digests",
+    "scheduleMode": "daily",
     "maxNewItemsPerSubscription": 15,
-    "headless":                   true,
-    "interestsFile":              "./interests.md",
-    "clearSubs":                  false
+    "chunkSize": 12,
+    "headless": true,
+    "interestsFile": "./interests.toml",
+    "clearSubs": false
   },
   "email": {
     "resendApiKey": "re_......",
-    "from":         "your send@domain.com",
-    "to":           "your_read@someother_domain.com"
+    "from": "your send@domain.com",
+    "to": "your_read@someother_domain.com"
   }
 }

@@ -419,6 +419,35 @@ only see what BGG still marks unread. Replies to you are exactly what you are
 most likely to go read yourself before the 3am run, and that visit clears the
 notice, so the digest never sees them.
 
+### Chunked generation
+
+Above `chunkSize` subscriptions (default 12), the digest is built in pieces
+rather than one shot. The model degrades badly on large single runs: six
+healthy runs at ≤21 subscriptions (2026-09-04 → 09-09) against four
+degenerate ones at ≥31 (09-01, 09-02, 09-03, 09-10). The 09-10 run read all
+31 subscriptions, wrote a Highlights block naming most of them, and emitted
+exactly **one** section — then cleared 90 BGG notices, because nothing
+compared what it rendered against what it was given.
+
+The flow:
+
+1. **Rank the whole set** (`src/interests.ts`) — replies to you, then
+   `priority_titles` matches, then tracked games, then everything else.
+   This happens in code, before the split, because a chunk cannot see the
+   other chunks: "priority subscriptions first" is meaningless to a model
+   looking at 12 of 31. That is why priority rules live in `interests.toml`.
+2. **One pass per chunk**, sections only. Each is guarded and retried on its
+   own, so a bad chunk costs a chunk rather than the night.
+3. **One synthesis pass** over the assembled sections (`SECTIONS.md`) that
+   writes only the Highlights block — so Highlights summarises what you will
+   actually read, and its context stays small.
+
+Runs at or under `chunkSize` take the original single-pass path untouched.
+
+If a chunk is still defective after its retry, its subscriptions are reported
+as skipped and **BGG notices are not cleared** — the night re-fetches tomorrow
+rather than disappearing.
+
 ### Workspace-based agent invocation
 
 The script splits cleanly: **fetch phase** writes data files; **agent phase**
@@ -526,9 +555,10 @@ bgg_sub_digest/
 │   ├── index.ts              # Main orchestrator
 │   ├── types.ts              # TypeScript interfaces
 │   ├── config.ts             # Config loading + validation
+│   ├── interests.ts          # Priority ranking + chunk splitting
 │   └── logger.ts             # Logging
 ├── config.example.json       # Copy this to config.json
-├── interests.md              # Your personalization file (edit freely)
+├── interests.toml            # Your personalization file (edit freely)
 ├── digests/                  # Generated digest files (gitignored)
 ├── digest-data/              # Per-subscription data files (recreated each run)
 ├── logs/                     # Run logs
