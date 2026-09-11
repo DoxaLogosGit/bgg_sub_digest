@@ -363,6 +363,71 @@ async function tests() {
       'leaf groups that rendered most of their content are not reported as lost');
   }
 
+  // ============================================================
+  // SERVICE FAILURES MUST NOT ESCALATE
+  // ============================================================
+  //
+  // 2026-09-11: the ollama account hit its monthly usage limit mid-run. Every
+  // subsequent call returned a byte-identical 429 (13,235 bytes, 4 turns,
+  // ~17.9s, sixteen times). Escalation treated each one as "too much at once"
+  // and split it into two more doomed calls, so one dead chunk cost seven
+  // failed requests instead of one. Splitting cannot fix a quota.
+
+  // ---- 15. a thrown pass is NOT split ----
+  {
+    let calls = 0;
+    const out = await runChunkedDigest('pi', [all.slice(0, 12)], workspace, 'interests', 'm',
+      async () => { calls += 1; throw new Error('429 Too Many Requests: monthly usage limit'); });
+
+    assert.equal(calls, 1,
+      `a thrown pass must be tried ONCE and not split into more doomed calls, saw ${calls}`);
+    assert.equal(out.skipped?.length, 12, 'its subscriptions are recorded as lost');
+    assert.equal(out.status, 'invalid', 'nothing rendered means invalid');
+  }
+
+  // ---- 16. a quota failure ABORTS the whole run ----
+  //
+  // Once the account is out of credit, every remaining chunk and the synthesis
+  // pass are guaranteed to fail too. Continuing wastes hours (the real run
+  // took 3h20m) and burns nothing but time. Stop at the first one.
+  {
+    let calls = 0;
+    const out = await runChunkedDigest('pi', [all.slice(0, 12), all.slice(12, 24), all.slice(24)],
+      workspace, 'interests', 'm',
+      async () => {
+        calls += 1;
+        throw new Error('429 Too Many Requests: you have reached your monthly usage limit');
+      });
+
+    assert.equal(calls, 1, `a quota error must stop the run immediately, saw ${calls} calls`);
+    assert.equal(out.skipped?.length, 25,
+      'every subscription, including those in chunks never attempted, is reported lost');
+    assert.equal(out.status, 'invalid');
+    assert.ok(out.skipped!.some((sk) => /quota|usage limit|429/i.test(sk.reason)),
+      'the reason must name the quota so the morning post-mortem is one line long');
+  }
+
+  // ---- 17. an ordinary error still escalates normally ----
+  //
+  // Only quota/rate-limit failures abort. A one-off crash should still let the
+  // remaining chunks run — otherwise one flaky pass costs the whole night.
+  {
+    let calls = 0;
+    const out = await runChunkedDigest('pi', [all.slice(0, 12), all.slice(12, 24)],
+      workspace, 'interests', 'm',
+      async (mp) => {
+        calls += 1;
+        if (isSynthesisPass()) return res(HL);
+        const m = JSON.parse(fs.readFileSync(mp, 'utf-8')) as ManifestEntry[];
+        if (m.some((e) => e.title === 'Subscription 0')) throw new Error('transient crash');
+        return res(sectionsFor(m));
+      });
+
+    assert.equal(out.status, 'partial', 'the healthy chunk still ships');
+    assert.ok(out.body.includes('Subscription 12'),
+      'chunks after a non-quota failure must still be attempted');
+  }
+
   fs.rmSync(workspace, { recursive: true, force: true });
   console.log('agent.chunked.test.ts: all assertions passed ✓');
 }

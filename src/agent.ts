@@ -1994,10 +1994,21 @@ export async function runPiDigest(
   let stdoutTail   = '';     // partial last line awaiting a newline
   let stderrChunks = '';     // capped stderr for error diagnostics
   let totalBytes   = 0;
+  // Head of the raw event stream, kept for error reporting only.
+  const STREAM_SAMPLE_CHARS = 4000;
+  let streamSample = '';
 
   proc.stdout.setEncoding('utf-8');
   proc.stdout.on('data', (chunk: string) => {
     totalBytes += chunk.length;
+    // Keep a bounded head of the raw stream. When no turn produces assistant
+    // text the events themselves are the only record of WHY, and on
+    // 2026-09-11 that why was a provider 429 that never reached stderr — the
+    // run spent 3h20m splitting around an error nobody could see. Bounded so
+    // a healthy multi-MB stream costs nothing.
+    if (streamSample.length < STREAM_SAMPLE_CHARS) {
+      streamSample += chunk.slice(0, STREAM_SAMPLE_CHARS - streamSample.length);
+    }
     stdoutTail += chunk;
     let nl: number;
     while ((nl = stdoutTail.indexOf('\n')) !== -1) {
@@ -2125,8 +2136,10 @@ export async function runPiDigest(
   const synthesisProvider: string | undefined = turnIndex !== -1 ? turnEnds[turnIndex].message?.provider : undefined;
   if (!body) {
     throw new Error(
-      `pi ran ${turnEnds.length} turn(s) but no turn produced assistant text. ` +
-      `Model may have looped on tool calls without ever synthesizing.`,
+      `pi ran ${turnEnds.length} turn(s) but no turn produced assistant text ` +
+      `(${totalBytes} bytes). Model may have looped on tool calls without ever ` +
+      `synthesizing, or the provider refused the request. ` +
+      `stderr: ${stderrChunks.slice(0, 300)} | stream: ${streamSample.slice(0, 1200)}`,
     );
   }
 
@@ -2203,6 +2216,26 @@ export async function runPiDigest(
 export type AgentName = 'claude' | 'claude-ollama' | 'pi';
 
 // ============================================================
+// isQuotaError — is this failure fatal to the whole run?
+// ============================================================
+//
+// Some failures mean "try smaller" and some mean "stop". An exhausted monthly
+// quota is the second kind: every remaining pass will fail identically, so
+// continuing costs hours and gains nothing.
+//
+// Matched against the WHOLE error text, which now carries a sample of pi's
+// event stream. That matters: on 2026-09-11 the account hit its ollama limit
+// and the provider's "429 Too Many Requests: you have reached your monthly
+// usage limit" appeared only inside the JSON event stream — stderr was empty,
+// and the error our code raised said "no turn produced assistant text", which
+// names a completely different cause. The real reason was invisible until it
+// was reproduced by hand.
+export function isQuotaError(err: unknown): boolean {
+  return /\b429\b|too many requests|usage limit|rate ?limit|quota|insufficient (credit|funds)|payment required|\b402\b/i
+    .test(String(err));
+}
+
+// ============================================================
 // runChunkedDigest — build the digest in survivable pieces
 // ============================================================
 //
@@ -2259,6 +2292,11 @@ export async function runChunkedDigest(
   // night. At depth 2 a group of 12 costs at most 1 + 2 + 4 = 7 passes (14
   // with each pass's own internal retry) before its subscriptions are skipped.
   const MAX_SPLIT_DEPTH = 2;
+
+  // Set when a pass fails for a reason that dooms every remaining pass too
+  // (an exhausted quota, a hard rate limit). Stops the run instead of grinding
+  // through chunks that cannot possibly succeed.
+  let abortReason: string | null = null;
 
   const renderGroup = async (
     group: ManifestEntry[],
@@ -2318,10 +2356,21 @@ export async function runChunkedDigest(
         },
       );
     } catch (err) {
-      // A thrown pass is usually the model being unreachable rather than
-      // overloaded, but splitting is cheap and occasionally the smaller
-      // request is the one that gets through.
-      if (canSplit) return split(String(err));
+      // A THROWN pass is a service or process failure, not "too much at once".
+      //
+      // This used to split, on the theory that a smaller request might get
+      // through. 2026-09-11 disproved it: the ollama account hit its monthly
+      // limit mid-run and every call afterwards returned a byte-identical 429
+      // (13,235 bytes, 4 turns, ~17.9s, sixteen times). Splitting turned each
+      // dead chunk into seven dead requests and the run burned 3h20m.
+      // Splitting cannot fix a quota, a crash, or an unreachable host.
+      if (isQuotaError(err)) {
+        // Everything after this is guaranteed to fail too — stop the run
+        // rather than working through the remaining chunks for nothing.
+        abortReason = String(err);
+        giveUp(`provider quota or rate limit reached — aborting the run: ${String(err)}`);
+        return;
+      }
       giveUp(String(err));
       return;
     }
@@ -2349,7 +2398,23 @@ export async function runChunkedDigest(
   // (manifest.json and CLAUDE.md are rewritten for each), and the ordering of
   // sectionParts is the digest's reading order.
   for (let i = 0; i < chunks.length; i++) {
+    if (abortReason) {
+      // Never attempted. Recorded as skipped anyway so the caller withholds
+      // notice-clearing for these too — they are just as unsummarised as the
+      // chunk that failed.
+      skipped.push(...chunks[i].map((e) => ({
+        title: e.title, filePath: e.filePath,
+        reason: `not attempted — run aborted: ${abortReason}`,
+      })));
+      continue;
+    }
     await renderGroup(chunks[i], `chunk ${i + 1}/${chunks.length}`, 0);
+  }
+
+  if (abortReason) {
+    log.error(
+      `Digest run aborted after ${sectionParts.length} group(s) — ${abortReason}`,
+    );
   }
 
   const assembled = sectionParts.join('\n\n').trim();
@@ -2366,6 +2431,9 @@ export async function runChunkedDigest(
   // ---- Synthesis pass: Highlights over the assembled sections ----
   let highlights = '';
   try {
+    // A synthesis pass against an exhausted quota is one more guaranteed
+    // failure; ship the sections we have without Highlights instead.
+    if (abortReason) throw new Error(`skipped — run aborted: ${abortReason}`);
     installWorkspaceTemplate(digestDataDir, interests);
     installRunMode(digestDataDir, 'highlights');
     writeSectionsFile(assembled, digestDataDir);
