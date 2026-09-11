@@ -151,11 +151,14 @@ the manifest count) still apply to the assembled result.
 
 Unchanged in spirit from the cloud path, and safety-first:
 
-1. local call defective -> retry locally
-2. still defective -> split the input and retry the parts locally
-3. smallest part still defective -> escalate that group to cloud (one call),
-   unless `--local-only`
-4. cloud also fails -> the group's subscriptions are recorded as `skipped`
+1. local call defective -> retry locally once (free)
+2. still defective -> escalate that subscription to cloud (one call), unless
+   `--local-only`
+3. cloud also fails -> the subscription is recorded as `skipped`
+
+Splitting happens **up front by input size**, not in response to failure. The
+cliff is a measured property of the input length, so there is nothing to learn
+by failing first — the part size is known before the call is made.
 
 Any skipped subscription means **BGG notices are not cleared**, so the night
 re-fetches rather than disappearing. This is the rule that held on both 09-10
