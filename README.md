@@ -421,8 +421,19 @@ notice, so the digest never sees them.
 
 ### Chunked generation
 
-Above `chunkSize` subscriptions (default 12), the digest is built in pieces
-rather than one shot. The model degrades badly on large single runs: six
+**The digest tries ONE pass first.** Only if that pass fails is the run rebuilt
+in chunks. Model calls are a metered resource, and chunking unconditionally
+took this pipeline from 1 call per night to 41 — exhausting the monthly quota
+on both providers within a day (2026-09-11). Chunking is therefore a response
+to failure, like every other escalation here, not the default. A night the
+model can handle costs one call; a night it cannot costs one wasted call and
+then chunks.
+
+A hard `maxModelCalls` ceiling (default 12) applies to the whole run and cannot
+be exceeded by any amount of retrying or splitting. Hitting it aborts the run,
+and — like a provider quota — nothing is cleared.
+
+When a run does chunk, it is built in pieces rather than one shot. The model degrades badly on large single runs: six
 healthy runs at ≤21 subscriptions (2026-09-04 → 09-09) against four
 degenerate ones at ≥31 (09-01, 09-02, 09-03, 09-10). The 09-10 run read all
 31 subscriptions, wrote a Highlights block naming most of them, and emitted
@@ -453,8 +464,8 @@ follow would discard the sections the model did produce.
 
 **Escalation on failure.** A group that comes back defective is retried
 *smaller* before it is written off: a failing 12 becomes 6 + 6, a failing 6
-becomes 3 + 3. Degeneration is driven by how much the model is handed at once,
-so a half-size retry has a real chance. Recursion is capped at two levels — if
+Degeneration is driven by how much the model is handed at once, so a half-size
+retry has a real chance. Recursion is capped at ONE level — if
 the model is broken rather than overloaded, splitting cannot help, and an
 uncapped retry would burn hours on a bad night. A single-pass run that fails
 escalates the same way, dropping into the chunked path rather than shipping an

@@ -2235,6 +2235,16 @@ export function isQuotaError(err: unknown): boolean {
     .test(String(err));
 }
 
+// isFatalRunError — should this failure stop the entire run?
+//
+// Two causes, one response. A provider quota means every remaining pass fails
+// identically. An exhausted call budget means we have decided not to spend any
+// more. Either way, continuing to work through the remaining chunks buys
+// nothing and costs metered calls.
+export function isFatalRunError(err: unknown): boolean {
+  return isQuotaError(err) || /call budget/i.test(String(err));
+}
+
 // ============================================================
 // runChunkedDigest — build the digest in survivable pieces
 // ============================================================
@@ -2287,11 +2297,15 @@ export async function runChunkedDigest(
   // 03:00, and the extra passes only happen on a night that was already going
   // wrong.
   //
-  // BOUNDED on purpose. If the model is broken rather than overloaded,
-  // splitting cannot help, and an uncapped recursion would burn hours on a bad
-  // night. At depth 2 a group of 12 costs at most 1 + 2 + 4 = 7 passes (14
-  // with each pass's own internal retry) before its subscriptions are skipped.
-  const MAX_SPLIT_DEPTH = 2;
+  // BOUNDED on purpose, and the bound is about COST, not just time.
+  //
+  // Originally 2, chosen when the only cost of an extra pass looked like wall
+  // clock. It is not: model calls are metered. On 2026-09-11 this pipeline made
+  // 41 calls in one night against a pre-chunking baseline of 1, and exhausted
+  // the monthly quota on both providers. At depth 1 a group of 12 costs at most
+  // 1 + 1 + 2 + 2 = 6 passes instead of 14, and still captures the case
+  // splitting was built for — the model managing 6 where it could not manage 12.
+  const MAX_SPLIT_DEPTH = 1;
 
   // Set when a pass fails for a reason that dooms every remaining pass too
   // (an exhausted quota, a hard rate limit). Stops the run instead of grinding
@@ -2364,11 +2378,11 @@ export async function runChunkedDigest(
       // (13,235 bytes, 4 turns, ~17.9s, sixteen times). Splitting turned each
       // dead chunk into seven dead requests and the run burned 3h20m.
       // Splitting cannot fix a quota, a crash, or an unreachable host.
-      if (isQuotaError(err)) {
+      if (isFatalRunError(err)) {
         // Everything after this is guaranteed to fail too — stop the run
         // rather than working through the remaining chunks for nothing.
         abortReason = String(err);
-        giveUp(`provider quota or rate limit reached — aborting the run: ${String(err)}`);
+        giveUp(`run cannot continue — aborting: ${String(err)}`);
         return;
       }
       giveUp(String(err));

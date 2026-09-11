@@ -275,9 +275,13 @@ async function tests() {
         return res(sectionsFor(m));
       });
 
-    assert.equal(out.skipped, undefined, 'a second split level must still recover everything');
-    assert.equal((out.body.match(/^### \[/gm) ?? []).length, 12, 'all 12 recovered at depth 2');
-    assert.ok(sizes.includes(3), 'the escalation reached groups of 3');
+    // At depth 1 the escalation stops at halves, so a model that needs groups
+    // of 3 cannot be fully rescued — the halves ship what they render and the
+    // rest is skipped. Depth is capped at 1 because each level multiplies
+    // METERED model calls, which is what exhausted two provider quotas on
+    // 2026-09-11.
+    assert.ok(!sizes.includes(3), 'depth 1 must not split beyond halves');
+    assert.ok(sizes.filter((n) => n === 6).length >= 2, 'it did split into halves');
   }
 
   // ---- 11. escalation is BOUNDED — a hopeless group is skipped, not looped ----
@@ -291,8 +295,8 @@ async function tests() {
 
     assert.equal(out.status, 'invalid', 'nothing rendered anywhere means invalid');
     assert.equal(out.skipped?.length, 12, 'the whole group is reported as skipped');
-    assert.ok(calls <= 16,
-      `escalation must stay bounded; the depth cap allows at most 16 passes, saw ${calls}`);
+    assert.ok(calls <= 8,
+      `escalation must stay bounded; at depth 1 a group of 12 allows at most 8 passes, saw ${calls}`);
     assert.ok(calls > 2, 'it must actually have tried splitting, not given up at the top');
   }
 
@@ -426,6 +430,32 @@ async function tests() {
     assert.equal(out.status, 'partial', 'the healthy chunk still ships');
     assert.ok(out.body.includes('Subscription 12'),
       'chunks after a non-quota failure must still be attempted');
+  }
+
+  // ---- 18. a per-run call budget stops a runaway ----
+  //
+  // 2026-09-11: chunking took this pipeline from 1 model call per night to 41,
+  // and exhausted the monthly quota on BOTH providers. Model calls are a
+  // metered resource, so the run needs a hard ceiling that no amount of
+  // retrying or splitting can talk its way past.
+  {
+    let calls = 0;
+    const BUDGET = 4;
+    const out = await runChunkedDigest('pi',
+      [all.slice(0, 12), all.slice(12, 24)], workspace, 'interests', 'm',
+      async () => {
+        calls += 1;
+        if (calls > BUDGET) throw new Error(`model call budget of ${BUDGET} exhausted for this run`);
+        return res('the model rambled instead of rendering');
+      });
+
+    assert.ok(calls <= BUDGET + 1,
+      `the budget must halt the run, saw ${calls} calls against a budget of ${BUDGET}`);
+    assert.equal(out.status, 'invalid');
+    assert.ok(out.skipped!.some((sk) => /budget/i.test(sk.reason)),
+      'the reason must name the budget so the cause is obvious in the morning');
+    assert.equal(out.skipped!.length, 24,
+      'subscriptions in chunks never attempted are still counted as lost');
   }
 
   fs.rmSync(workspace, { recursive: true, force: true });

@@ -90,6 +90,16 @@ const ConfigSchema = z.object({
     // single-pass path unchanged.
     chunkSize: z.number().int().positive().default(12),
 
+    // Hard ceiling on model invocations for one run.
+    //
+    // Model calls are METERED, which the chunked design did not account for.
+    // On 2026-09-11 a single night made 41 calls against a pre-chunking
+    // baseline of 1, and exhausted the monthly quota on both providers. A
+    // healthy run now costs 1 call (single pass); a run that has to chunk 50
+    // subscriptions costs about 6. 12 leaves room for retries and one level of
+    // splitting while making a runaway impossible.
+    maxModelCalls: z.number().int().positive().default(12),
+
     // Whether to actually clear (mark-as-read) each processed subscription on BGG.
     // true  = click BGG's remove button on each notification row after processing.
     // false = log "[DEBUG] Would click..." but don't click — useful for testing.

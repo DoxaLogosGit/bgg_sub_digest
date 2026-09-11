@@ -9,6 +9,7 @@
     "scheduleMode": "daily",
     "maxNewItemsPerSubscription": 15,
     "chunkSize": 12,
+    "maxModelCalls": 12,
     "headless": true,
     "interestsFile": "./interests.toml",
     "clearSubs": false

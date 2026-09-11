@@ -797,7 +797,7 @@ async function runAgentAndWriteDigest(
   entries: ManifestEntry[],
   digestDataDir: string,
   // Inline shape — only the fields we actually need from the full Config.
-  config: { digest: { outputDir: string; chunkSize: number }; email?: Parameters<typeof sendDigestEmail>[0] },
+  config: { digest: { outputDir: string; chunkSize: number; maxModelCalls: number }; email?: Parameters<typeof sendDigestEmail>[0] },
   runStart: Date,
   // Structured interests, used to rank subscriptions before chunking.
   interestsConfig: InterestsConfig,
@@ -816,66 +816,65 @@ async function runAgentAndWriteDigest(
     // Generate with a template-echo retry guard: if the model returns the
     // unfilled template, retry once, and if it's still a template stamp
     // status='invalid' so we don't clear the BGG notices below.
-    // ---- Rank, then decide single-pass or chunked ----
+    // ---- Rank, then TRY ONE PASS, and chunk only if that fails ----
     //
-    // Ranking happens HERE, over the whole set, because a chunk cannot see
-    // the others: "priority subscriptions first" has to be settled before the
-    // split or it means nothing. See interests.ts.
+    // Ranking happens HERE, over the whole set, because a chunk cannot see the
+    // others: "priority subscriptions first" has to be settled before any split
+    // or it means nothing. See interests.ts.
+    //
+    // WHY SINGLE-PASS FIRST (2026-09-11): chunking unconditionally took this
+    // pipeline from 1 model call per night to 41, and exhausted the monthly
+    // quota on BOTH providers within a day. Model calls are metered — that is
+    // the cost nobody priced in when chunking was designed.
+    //
+    // So chunking becomes what escalation already is everywhere else here: a
+    // response to failure, not the default. A night the model can handle costs
+    // ONE call, exactly as 09-05 through 09-09 did. A night it cannot costs one
+    // wasted call and then chunks, which is what 09-10 and 09-11 needed anyway.
     const ranked = rankEntries(entries, interestsConfig);
-    const chunks = chunkEntries(ranked, config.digest.chunkSize);
 
-    if (chunks.length <= 1) {
-      // Small night — the original single-pass path, untouched. This is the
-      // proven behaviour for every healthy run on record, so it stays exactly
-      // as it was rather than being routed through the chunk machinery.
-      //
-      // entries.length is what the model was actually handed. Passing it lets
-      // the guard notice a digest that rendered almost none of it — the
-      // 2026-09-10 failure, where 1 of 31 sections shipped as 'complete' and
-      // cleared 90 notices.
-      writeManifest(ranked, digestDataDir);
-      digestResult = await generateGuardedDigest(
-        () => runDigest(agent, manifestPath, interests, model),
-        ranked.length,
-        {
-          // Demand every section, because the escalation just below can still
-          // rescue a short render by splitting. Without a route onward this
-          // would be the wrong call — see the leaf case in runChunkedDigest.
-          minCoverage: ranked.length > 1 ? 1 : undefined,
-        },
-      );
-
-      // ---- Escalate a struggling single run ----
-      //
-      // A small night can still overwhelm the model — count is the usual
-      // driver but not the only one (one enormous geeklist file can do it).
-      // Rather than shipping an invalid digest and clearing nothing, split
-      // the run in half and go through the chunked path, which escalates
-      // further on its own if a half also fails.
-      //
-      // Only reachable after the single pass AND its retry have both failed,
-      // so a healthy night never pays for this.
-      if (digestResult.status === 'invalid' && ranked.length > 1) {
-        log.warn(
-          `Single-pass digest failed for ${ranked.length} subscription(s) — ` +
-          `retrying as smaller groups rather than shipping a short digest`,
-        );
-        const halves = chunkEntries(ranked, Math.ceil(ranked.length / 2));
-        digestResult = await runChunkedDigest(
-          agent, halves, digestDataDir, interests, model,
-          (chunkManifestPath) => runDigest(agent, chunkManifestPath, interests, model),
+    // Every model invocation for this run goes through here, so the ceiling
+    // cannot be talked past by any amount of retrying or splitting.
+    let modelCalls = 0;
+    const callBudget = config.digest.maxModelCalls;
+    const runOne = (mp: string): Promise<DigestResult> => {
+      if (modelCalls >= callBudget) {
+        // Recognised by isFatalRunError, so this aborts the run rather than
+        // being mistaken for one more chunk that needs splitting.
+        throw new Error(
+          `model call budget of ${callBudget} exhausted for this run — refusing further calls`,
         );
       }
-    } else {
-      log.info(
-        `Chunked digest: ${ranked.length} subscription(s) in ${chunks.length} chunk(s) ` +
-        `of up to ${config.digest.chunkSize} — the model degrades on larger one-shot runs`,
+      modelCalls += 1;
+      log.debug(`Model call ${modelCalls}/${callBudget}`);
+      return runDigest(agent, mp, interests, model);
+    };
+
+    writeManifest(ranked, digestDataDir);
+    digestResult = await generateGuardedDigest(
+      () => runOne(manifestPath),
+      ranked.length,
+      {
+        // Demand every section: the escalation below can still rescue a short
+        // render. Without a route onward this would be the wrong call — see the
+        // leaf case in runChunkedDigest.
+        minCoverage: ranked.length > 1 ? 1 : undefined,
+      },
+    );
+
+    // ---- Escalate only if that one pass could not do the job ----
+    if (digestResult.status === 'invalid' && ranked.length > 1) {
+      const chunks = chunkEntries(ranked, config.digest.chunkSize);
+      log.warn(
+        `Single pass failed for ${ranked.length} subscription(s) — ` +
+        `rebuilding as ${chunks.length} chunk(s) of up to ${config.digest.chunkSize}`,
       );
       digestResult = await runChunkedDigest(
-        agent, chunks, digestDataDir, interests, model,
-        (chunkManifestPath) => runDigest(agent, chunkManifestPath, interests, model),
+        agent, chunks, digestDataDir, interests, model, runOne,
       );
     }
+
+    log.info(`Digest used ${modelCalls} model call(s) of a ${callBudget} budget`);
   } catch (err) {
     log.error(`${agent} digest run failed`, { err: String(err) });
     // Fallback — show a minimal digest pointing at the data files so the user
