@@ -912,20 +912,24 @@ async function runAgentAndWriteDigest(
       // isMissingHighlights reads that as a defective generation.
       let highlights = '';
       if (localResult.sections.trim()) {
-        try {
-          const raw = await askLocalProse(
-            config.digest.localModel,
-            summaryLines(localResult.sections),
-            true,
-          );
-          highlights = extractHighlightsBlock(raw);
-          if (!highlights && raw.trim()) {
-            // The model wrote a summary without the header. The header is
-            // structure, so we supply it — same principle as the sections.
-            highlights = `## ⭐ Highlights\n\n${raw.trim()}`;
+        const lines = summaryLines(localResult.sections);
+        // Retried like the sections are, and for the same reason: the local
+        // model returns empty intermittently. On 2026-09-12 a single attempt
+        // came back empty and the run fell through to the mechanical block —
+        // correct, but a real written summary is better content and costs
+        // only time.
+        for (let tryNo = 1; tryNo <= 3 && !highlights; tryNo++) {
+          try {
+            const raw = await askLocalProse(config.digest.localModel, lines, true);
+            highlights = extractHighlightsBlock(raw);
+            if (!highlights && raw.trim()) {
+              // The model wrote a summary without the header. The header is
+              // structure, so we supply it — same principle as the sections.
+              highlights = `## ⭐ Highlights\n\n${raw.trim()}`;
+            }
+          } catch (err) {
+            log.warn('Local highlights pass failed', { err: String(err), attempt: tryNo });
           }
-        } catch (err) {
-          log.warn('Local highlights pass failed', { err: String(err) });
         }
       }
       if (!highlights) {
