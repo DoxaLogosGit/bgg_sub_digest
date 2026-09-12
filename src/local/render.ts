@@ -94,3 +94,102 @@ export async function renderSubscriptionLocally(params: {
   const defect  = sectionDefect(section);
   return defect ? { section: null, defect, calls } : { section, defect: null, calls };
 }
+
+// ============================================================
+// renderLocalFirst — the whole digest, local first
+// ============================================================
+//
+// Every subscription is attempted on the unmetered model. One that fails is
+// retried locally (free), and only then escalates — ALONE.
+//
+// That containment is the point. On 2026-09-11 the pipeline exhausted the
+// monthly quota on both providers in a day; an unconditional "fall back to
+// cloud" would have spent 50 metered calls in one night. One stubborn
+// subscription costs one metered call.
+//
+// Anything no tier could render is returned in `skipped`, which makes the
+// caller withhold BGG notice-clearing. That rule held on 09-10 and 09-11 and
+// is what keeps a bad night from becoming lost activity.
+
+import type { DigestSkippedEntry } from '../agent';
+import { log } from '../logger';
+
+export interface LocalFirstResult {
+  sections:   string;                 // assembled section markdown, in ranked order
+  skipped:    DigestSkippedEntry[];   // subscriptions no tier could render
+  localCalls: number;
+  cloudCalls: number;
+}
+
+export async function renderLocalFirst(params: {
+  entries: ManifestEntry[];
+  contents: Map<string, string>;      // filePath -> data file contents
+  interests: InterestsConfig;
+  maxInputChars: number;
+  escalates: boolean;                 // false under --local-only
+  maxLocalCalls?: number;
+  askLocal: (input: string, wantSummary: boolean, entry: ManifestEntry) => Promise<string>;
+  // Returns assembled section markdown, or null when cloud could not do it.
+  escalateGroup: (group: ManifestEntry[]) => Promise<string | null>;
+}): Promise<LocalFirstResult> {
+  const { entries, contents, interests, maxInputChars, escalates, askLocal, escalateGroup } = params;
+  const budget = params.maxLocalCalls ?? Number.MAX_SAFE_INTEGER;
+
+  const rendered: string[] = [];
+  const skipped:  DigestSkippedEntry[] = [];
+  let localCalls = 0, cloudCalls = 0;
+
+  for (const entry of entries) {
+    const content = contents.get(entry.filePath) ?? '';
+
+    if (localCalls >= budget) {
+      skipped.push({
+        title: entry.title, filePath: entry.filePath,
+        reason: `local call budget of ${budget} exhausted before this subscription`,
+      });
+      continue;
+    }
+
+    const attempt = (): Promise<LocalRenderResult> => renderSubscriptionLocally({
+      entry, content, interests, maxInputChars,
+      askProse: (input, wantSummary) => askLocal(input, wantSummary, entry),
+    });
+
+    let result = await attempt();
+    localCalls += result.calls;
+
+    // ONE local retry before spending anything metered. Local calls cost time
+    // only, so this is near-free insurance against a one-off bad generation.
+    if (!result.section) {
+      log.debug('Local render defective — retrying locally', {
+        title: entry.title, defect: result.defect,
+      });
+      result = await attempt();
+      localCalls += result.calls;
+    }
+
+    if (result.section) { rendered.push(result.section); continue; }
+
+    if (!escalates) {
+      skipped.push({
+        title: entry.title, filePath: entry.filePath,
+        reason: `local render failed (${result.defect}) and escalation is disabled`,
+      });
+      continue;
+    }
+
+    log.info('Escalating one subscription to the metered model', {
+      title: entry.title, defect: result.defect,
+    });
+    const fromCloud = await escalateGroup([entry]);
+    cloudCalls += 1;
+    if (fromCloud) { rendered.push(fromCloud); continue; }
+
+    skipped.push({
+      title: entry.title, filePath: entry.filePath,
+      reason: `local render failed (${result.defect}) and the cloud escalation also failed`,
+    });
+  }
+
+  return { sections: rendered.join('\n\n'), skipped, localCalls, cloudCalls };
+}
