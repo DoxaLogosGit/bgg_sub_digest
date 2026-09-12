@@ -147,8 +147,11 @@ async function main() {
     assert.equal(calls, 0, 'a stub must never reach the model');
     assert.equal(r.defect, null, 'and still produces a valid section');
     assert.ok(!r.section!.includes('INVENTED'), 'nothing is invented');
-    assert.match(r.section!, /not retrievable|no content/i,
+    assert.match(r.section!, /does not expose|not retrievable|nothing to summarise/i,
       'the section says plainly that there is no content');
+    assert.ok(r.section!.includes(entry.title),
+      'the stub summary names the subscription — 32 identical summaries in a real ' +
+      'workspace drove isVacuousDigest to 0.326 against its 0.30 floor');
     assert.equal(r.calls, 0);
   }
 

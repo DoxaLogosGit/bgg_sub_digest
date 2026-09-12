@@ -61,9 +61,16 @@ function stubSection(entry: ManifestEntry, content: string): string {
   // The parenthetical reason index.ts recorded, e.g. "content fetch failed".
   const why = /you subscribe to \(([^)]+)\)/.exec(content)?.[1];
 
+  // The TITLE is included deliberately. A real workspace is mostly stubs — 32
+  // of 50 on 2026-09-12 — and identical summaries drove isVacuousDigest's
+  // distinct-summary ratio to 0.326 against its 0.30 floor. That guard exists
+  // to catch a model repeating itself, and a pile of code-written boilerplate
+  // must not be mistaken for it.
+  const context = entry.parentName ? ` (${entry.parentName})` : '';
   const summary =
-    `BGG reported new activity on this ${entry.type}, but its content is not ` +
-    `retrievable through the API${why ? ` (${why})` : ''}, so there is nothing to summarise here.`;
+    `New activity on "${entry.title}"${context}, but BGG does not expose this ` +
+    `${entry.type}'s content through the API${why ? ` (${why})` : ''}, so there is ` +
+    `nothing to summarise here.`;
 
   const bullet = `Open the ${entry.type} to see what changed — ${entry.url}`;
 

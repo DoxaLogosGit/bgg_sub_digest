@@ -51,10 +51,12 @@ import { detectThreadSelfActivity, detectGeeklistSelfActivity } from './bgg/self
 import { rankEntries, chunkEntries, renderInterestsMarkdown } from './interests';
 import { renderLocalFirst } from './local/render';
 import { askLocalProse } from './local/ask';
+import { summaryLines, mechanicalHighlights } from './local/highlights';
 import type { InterestsConfig } from './interests';
 import {
   runChunkedDigest,
   stripHighlightsBlock,
+  extractHighlightsBlock,
   formatThreadContent,
   formatGeeklistContent,
   writeSubscriptionFile,
@@ -901,6 +903,36 @@ async function runAgentAndWriteDigest(
         },
       });
 
+      // ---- Highlights from the Summary lines only ----
+      //
+      // A fraction of the assembled digest, so the synthesis pass stays inside
+      // the input budget that the sections themselves respect. If the model
+      // cannot manage it, the mechanical block costs nothing and cannot be
+      // wrong — and a digest must never ship without Highlights, because
+      // isMissingHighlights reads that as a defective generation.
+      let highlights = '';
+      if (localResult.sections.trim()) {
+        try {
+          const raw = await askLocalProse(
+            config.digest.localModel,
+            summaryLines(localResult.sections),
+            true,
+          );
+          highlights = extractHighlightsBlock(raw);
+          if (!highlights && raw.trim()) {
+            // The model wrote a summary without the header. The header is
+            // structure, so we supply it — same principle as the sections.
+            highlights = `## ⭐ Highlights\n\n${raw.trim()}`;
+          }
+        } catch (err) {
+          log.warn('Local highlights pass failed', { err: String(err) });
+        }
+      }
+      if (!highlights) {
+        log.info('Using mechanical highlights (no model call)');
+        highlights = mechanicalHighlights(ranked, interestsConfig);
+      }
+
       log.info('Local-first digest complete', {
         localCalls: localResult.localCalls,
         cloudCalls: localResult.cloudCalls,
@@ -909,7 +941,7 @@ async function runAgentAndWriteDigest(
       });
 
       digestResult = {
-        body:           localResult.sections,
+        body:           `${highlights}\n\n${localResult.sections}`,
         inputTokens:    0,
         outputTokens:   0,
         costUsd:        0,

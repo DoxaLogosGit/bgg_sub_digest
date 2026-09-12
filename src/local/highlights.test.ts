@@ -1,0 +1,82 @@
+// ============================================================
+// local/highlights.test.ts — the cross-subscription block, cheaply
+// ============================================================
+//
+// Standalone. Run: npx tsx src/local/highlights.test.ts
+
+import assert from 'node:assert/strict';
+import { summaryLines, mechanicalHighlights } from './highlights';
+import type { ManifestEntry } from '../agent';
+import type { InterestsConfig } from '../interests';
+
+const cfg: InterestsConfig = {
+  priorityTitles: ['SGOYT'], trackedGames: ['Spirit Island'], keywords: ['solo'], notes: '',
+};
+
+function entry(over: Partial<ManifestEntry> & { title: string }): ManifestEntry {
+  return {
+    subscriptionId: 1, type: 'thread', url: 'https://boardgamegeek.com/thread/1',
+    filePath: '/tmp/x.md', itemCount: 1, unreadCount: 1, notificationDate: null, ...over,
+  };
+}
+
+// ---- summaryLines extracts only what the synthesis pass needs ----
+//
+// Feeding 46 full sections (~31KB) back to a 9B model recreates exactly the
+// overwhelm this whole design avoids. The Summary lines are a fraction of
+// that and are what a highlights block is built from anyway.
+{
+  const sections = [
+    '### [A](https://x/1)\n\n**Summary:** First thing happened in detail.\n\n**New Activity:**\n- a — x\n\n**Topics Mentioned:** solo',
+    '### [B](https://x/2)\n\n**Summary:** Second thing happened in detail.\n\n**New Activity:**\n- b — y\n\n**Topics Mentioned:** none',
+  ].join('\n\n');
+
+  const out = summaryLines(sections);
+  assert.match(out, /A — First thing happened in detail\./);
+  assert.match(out, /B — Second thing happened in detail\./);
+  assert.ok(!out.includes('- a — x'), 'bullets are excluded');
+  assert.ok(out.length < sections.length / 2, 'the result is substantially smaller');
+}
+
+// ---- a bracketed title survives ----
+//
+// Real BGG titles open with a bracket: "[Detective Hawk] Wayfarers ...".
+{
+  const s = '### [[Detective Hawk] Wayfarers of the South Tigris](https://x/3)\n\n**Summary:** A deal was posted.';
+  assert.match(summaryLines(s), /Detective Hawk/);
+}
+
+// ---- mechanicalHighlights needs no model at all ----
+{
+  const entries = [
+    entry({ title: 'SGOYT September', selfActivity: { reasons: ['1 comment on your item "Tarawa 1943"'], replyCount: 1 } }),
+    entry({ title: 'Random thread', parentName: 'Spirit Island' }),
+    entry({ title: 'Unrelated thread' }),
+  ];
+  const hl = mechanicalHighlights(entries, cfg);
+
+  assert.ok(hl.startsWith('## ⭐ Highlights'), 'uses the exact header the post-processor looks for');
+  assert.match(hl, /Replies to you.*Tarawa 1943/, 'replies to you lead');
+  assert.match(hl, /SGOYT September/, 'priority subscriptions are named');
+  assert.match(hl, /Spirit Island/, 'tracked games are named');
+  assert.ok(!hl.includes('Unrelated thread'), 'ordinary subscriptions are not highlighted');
+}
+
+// ---- with nothing notable, it still produces a valid block ----
+//
+// A Highlights block with no bullets reads as a generation failure, and
+// isMissingHighlights would treat the digest as defective.
+{
+  const hl = mechanicalHighlights([entry({ title: 'Unrelated thread' })], cfg);
+  assert.ok(hl.startsWith('## ⭐ Highlights'));
+  assert.match(hl, /^- /m, 'always at least one bullet');
+}
+
+// ---- the block satisfies the pipeline's own guard ----
+{
+  const hl = mechanicalHighlights([entry({ title: 'SGOYT September' })], cfg);
+  assert.match(hl, /^##[ \t]+⭐[ \t]+Highlights[ \t]*$/m,
+    'matches the header liftHighlightsToTop and isMissingHighlights key on');
+}
+
+console.log('highlights.test.ts: all assertions passed ✓');
