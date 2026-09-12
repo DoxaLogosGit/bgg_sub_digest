@@ -23,6 +23,25 @@ const OLLAMA = process.env.OLLAMA_HOST ?? 'http://127.0.0.1:11434';
 // prompt plus the answer.
 const NUM_CTX = 8192;
 
+// Output budget for one call.
+//
+// omnicoder-oc is a THINKING model: its reasoning is generated before the
+// visible answer and spends the same budget. At 2048 it can reason itself out
+// of room and return an EMPTY string — measured 2026-09-12, where a 4.7KB
+// geeklist burned 2-8 minutes per attempt and produced nothing, three attempts
+// running. The same input at 4096 answered in 10 seconds.
+//
+// Do NOT "fix" a recurrence with think:false. That was tried: the model then
+// leaks its reasoning into the answer ("The user wants me to summarize...").
+const NUM_PREDICT = 4096;
+
+// Hard ceiling on a single local call.
+//
+// One subscription must not be able to eat the night. Nothing healthy has
+// taken longer than ~60s (the slowest good render measured was 38s), so this
+// is generous, and a call that exceeds it is failing rather than working.
+const CALL_TIMEOUT_MS = 150_000;
+
 // The attribution rules from BGG-DATA-GUIDE.md, restated here because this
 // path deliberately does not load the workspace. Misattributing quoted text is
 // the error the reader notices most, and both local models handled it
@@ -56,16 +75,28 @@ export async function askLocalProse(
     'Summarise this BoardGameGeek activity for a daily digest.\n\n' +
     `Output EXACTLY this and nothing else:\n\n${shape}\n\n${RULES}\n\nACTIVITY:\n${input}`;
 
-  const res = await fetch(`${OLLAMA}/api/generate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model,
-      prompt,
-      stream: false,
-      options: { num_ctx: NUM_CTX, temperature: 0.3, num_predict: 2048 },
-    }),
-  });
+  // A stuck call returns '' rather than throwing, so the caller treats it as
+  // an ordinary defective render and retries — which is exactly right, since
+  // an over-long call is a failing one.
+  let res: Response;
+  try {
+    res = await fetch(`${OLLAMA}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+      body: JSON.stringify({
+        model,
+        prompt,
+        stream: false,
+        options: { num_ctx: NUM_CTX, temperature: 0.3, num_predict: NUM_PREDICT },
+      }),
+    });
+  } catch (err) {
+    if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      return '';
+    }
+    throw err;
+  }
 
   if (!res.ok) {
     throw new Error(`ollama returned ${res.status} for model ${model}`);
