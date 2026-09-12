@@ -474,8 +474,16 @@ invalid digest.
 Only the part that fails at *every* size is lost. If the first half of a group
 never renders but the second half does, the second half ships.
 
-Whatever is still lost is reported as skipped and **BGG notices are not
-cleared** — the night re-fetches tomorrow rather than disappearing.
+Whatever is still lost is reported as skipped, and the digest names each one
+with its **BGG link**. Notices ARE cleared on a partial run: the reader can see
+exactly what was missed and open it, and withholding instead meant the same
+failures were re-fetched and re-failed every night.
+
+That link is the precondition, not a nicety. `filePath` points into
+`digest-data/`, which is deleted at the start of the next run, so the digest
+line is the only surviving record of a skipped subscription once its notice is
+gone. A run that produces **no** usable digest (`invalid` or `error`) still
+clears nothing.
 
 ### Workspace-based agent invocation
 

@@ -654,6 +654,14 @@ export async function generateGuardedDigest(
 export interface DigestSkippedEntry {
   title:    string;
   filePath: string;
+
+  // The BGG url. REQUIRED, because a skipped subscription's only remaining
+  // trace is this line in the digest: filePath points into digest-data/, which
+  // is rm -rf'd at the start of every run, so by the next morning it is a
+  // dangling path. Notices are now cleared on a partial run (2026-09-13), and
+  // that is only safe while the reader can still reach what was missed.
+  url:      string;
+
   reason:   string;
 }
 
@@ -2333,7 +2341,7 @@ export async function runChunkedDigest(
 
     const giveUp = (reason: string): void => {
       log.error(`Digest ${label} failed — ${reason}; its ${group.length} subscription(s) are skipped`);
-      skipped.push(...group.map((e) => ({ title: e.title, filePath: e.filePath, reason: `${label}: ${reason}` })));
+      skipped.push(...group.map((e) => ({ title: e.title, filePath: e.filePath, url: e.url, reason: `${label}: ${reason}` })));
     };
 
     const split = async (reason: string): Promise<void> => {
@@ -2417,7 +2425,7 @@ export async function runChunkedDigest(
       // notice-clearing for these too — they are just as unsummarised as the
       // chunk that failed.
       skipped.push(...chunks[i].map((e) => ({
-        title: e.title, filePath: e.filePath,
+        title: e.title, filePath: e.filePath, url: e.url,
         reason: `not attempted — run aborted: ${abortReason}`,
       })));
       continue;

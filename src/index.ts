@@ -1075,8 +1075,10 @@ async function runAgentAndWriteDigest(
     );
   } else if (status === 'partial' || skipped.length > 0) {
     bannerLine = (
-      `> ⚠️ **Partial digest** — ${skipped.length} subscription(s) failed to summarize after retry and are linked below for manual review:\n` +
-      skipped.map((s) => `> - [${s.title}] — \`${s.filePath}\``).join('\n') +
+      `> ⚠️ **Partial digest** — ${skipped.length} subscription(s) could not be summarised. ` +
+      `Their BGG notices HAVE been cleared, so these links are the only remaining ` +
+      `record — open them if you want to see what was missed:\n` +
+      skipped.map((s) => `> - [${s.title}](${s.url})`).join('\n') +
       `\n\n`
     );
   }
@@ -1105,24 +1107,31 @@ async function runAgentAndWriteDigest(
   // clearSafe=false on a failed run (template-echo 'invalid' OR a crashed
   // 'error' fallback) tells the caller to skip clearViewdates so the unread BGG
   // notices survive to the next run instead of being silently lost.
-  // clearSafe=false on a failed run AND on any run that lost subscriptions.
+  // clearSafe=false ONLY on a run that produced no usable digest.
   //
-  // The skipped-entries case is new (2026-09-10): with the digest built in
-  // chunks, a single bad chunk means ~12 subscriptions were never summarised.
-  // Clearing their BGG notices would lose that activity exactly the way the
-  // 09-10 run lost 90 notices. Not clearing means tomorrow re-fetches the
-  // whole night — duplicated effort, which is cheap, instead of data loss,
-  // which is not.
-  const lostSubscriptions = skipped.length > 0;
-  if (lostSubscriptions) {
-    log.warn(
-      `${skipped.length} subscription(s) were not summarised — NOT clearing BGG ` +
-      `notices, so tonight's activity survives to the next run`,
+  // A partial run DOES clear (changed 2026-09-13, at the reader's request).
+  // The earlier rule withheld clearing whenever anything was skipped, which
+  // was right when a skipped subscription vanished silently — that is how the
+  // 09-10 run lost 90 notices. It is no longer true: the banner above names
+  // every skipped subscription with a working BGG link, so the reader can see
+  // exactly what was missed and decide for himself.
+  //
+  // Withholding instead meant the same failures were re-fetched and re-failed
+  // every night, and he was clearing them by hand.
+  //
+  // THE LINK IS THE PRECONDITION. filePath points into digest-data/, which is
+  // rm -rf'd at the start of the next run; if these entries ever lose their
+  // url the digest becomes the only record of activity that no longer exists
+  // anywhere, and this decision has to be revisited.
+  if (skipped.length > 0) {
+    log.info(
+      `${skipped.length} subscription(s) were not summarised — clearing notices ` +
+      `anyway; each is listed in the digest with its BGG link`,
     );
   }
   return {
     digestPath,
-    clearSafe: status !== 'invalid' && status !== 'error' && !lostSubscriptions,
+    clearSafe: status !== 'invalid' && status !== 'error',
   };
 }
 

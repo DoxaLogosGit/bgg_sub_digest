@@ -317,7 +317,7 @@ export async function renderLocalFirst(params: {
       // Every member of the group is unrendered, so every member is skipped —
       // otherwise the caller would clear notices for entries never summarised.
       skipped.push(...group.map((e) => ({
-        title: e.title, filePath: e.filePath,
+        title: e.title, filePath: e.filePath, url: e.url,
         reason: `local call budget of ${budget} exhausted before this subscription`,
       })));
       continue;
@@ -350,7 +350,7 @@ export async function renderLocalFirst(params: {
 
     if (!escalates) {
       skipped.push(...group.map((e) => ({
-        title: e.title, filePath: e.filePath,
+        title: e.title, filePath: e.filePath, url: e.url,
         reason: `local render failed (${result.defect}) and escalation is disabled`,
       })));
       continue;
@@ -358,7 +358,7 @@ export async function renderLocalFirst(params: {
 
     if (meteredExhausted) {
       skipped.push(...group.map((e) => ({
-        title: e.title, filePath: e.filePath,
+        title: e.title, filePath: e.filePath, url: e.url,
         reason: `local render failed (${result.defect}); the metered tier is exhausted`,
       })));
       continue;
@@ -389,7 +389,7 @@ export async function renderLocalFirst(params: {
     if (fromCloud) { rendered.push(fromCloud); continue; }
 
     skipped.push(...group.map((e) => ({
-      title: e.title, filePath: e.filePath,
+      title: e.title, filePath: e.filePath, url: e.url,
       reason: `local render failed (${result.defect}) and the cloud escalation also failed`,
     })));
   }
