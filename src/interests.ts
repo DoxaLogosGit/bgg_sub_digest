@@ -64,7 +64,7 @@ function matchesAny(haystack: string, needles: string[]): boolean {
 // A BGG notice about an image added to a game page. Its url is
 // /image/<id>/<slug> and there is no body to summarise — the digest can say
 // how many arrived and link them, nothing more.
-export function isImageUpload(entry: ManifestEntry): boolean {
+export function isImageUpload(entry: { url: string }): boolean {
   return /\/image\/\d+/.test(entry.url);
 }
 

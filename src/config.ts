@@ -107,6 +107,20 @@ const ConfigSchema = z.object({
     // `pi --list-models < /dev/null` — and note the stdin redirect, because
     // pi blocks forever when stdin is left open. A wrong name fails instantly
     // with "Model not found" rather than hanging.
+    // Process BGG image-upload notices at all?
+    //
+    // BGG emits ONE NOTICE PER IMAGE. On 2026-09-12 a single game picked up 32
+    // uploads, which arrived as 32 "subscriptions" — 64% of that night's feed —
+    // carrying no readable content whatsoever. Fetching, writing and
+    // summarising them spends time and model context to say "somebody added a
+    // picture" thirty-two times.
+    //
+    // Dropped by default. Their BGG notices are still CLEARED, because
+    // clearItems comes from the notice feed and not from the manifest —
+    // excluding a notice is not the same as failing to summarise one, and only
+    // the latter withholds clearing.
+    includeImageUploads: z.boolean().default(false),
+
     localModel: z.string().default('omnicoder-oc'),
 
     // The METERED model, used only for subscriptions the local model could

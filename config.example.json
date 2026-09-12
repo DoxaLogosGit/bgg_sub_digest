@@ -10,6 +10,7 @@
     "maxNewItemsPerSubscription": 15,
     "chunkSize": 12,
     "maxModelCalls": 12,
+    "includeImageUploads": false,
     "localModel": "omnicoder-oc",
     "cloudModel": "nemotron-3-super:cloud",
     "maxLocalCalls": 120,

@@ -48,7 +48,7 @@ import {
   itemsWithActivityNewerThan,
 } from './bgg/api';
 import { detectThreadSelfActivity, detectGeeklistSelfActivity } from './bgg/self-activity';
-import { rankEntries, chunkEntries, renderInterestsMarkdown } from './interests';
+import { rankEntries, chunkEntries, renderInterestsMarkdown, isImageUpload } from './interests';
 import { renderLocalFirst } from './local/render';
 import { askLocalProse } from './local/ask';
 import { summaryLines, mechanicalHighlights } from './local/highlights';
@@ -313,7 +313,30 @@ async function main(): Promise<void> {
       const apiRequest = browser.request;
       const authToken  = await getAuthToken(apiRequest);
       const feed       = await fetchNoticeFeed(apiRequest, authToken);
-      const { subscriptions, clearItems } = transformNotices(feed);
+      const { subscriptions: allSubscriptions, clearItems } = transformNotices(feed);
+
+      // ---- Drop image uploads before anything is fetched ----
+      //
+      // BGG emits one notice per image; 32 of 50 subscriptions on 2026-09-12
+      // were uploads to a single game. They have no readable content, so
+      // fetching them, writing a data file and handing them to a model spends
+      // time and context to say "somebody added a picture" many times over.
+      //
+      // Their notices are still cleared: clearItems comes from the feed, not
+      // from the manifest. Excluding a notice is NOT the same as failing to
+      // summarise one — only the latter withholds clearing.
+      const subscriptions = config.digest.includeImageUploads
+        ? allSubscriptions
+        : allSubscriptions.filter((s) => !isImageUpload(s));
+
+      const droppedImages = allSubscriptions.length - subscriptions.length;
+      if (droppedImages > 0) {
+        log.info(
+          `Skipping ${droppedImages} image-upload notice(s) — no content to summarise; ` +
+          `their notices are still cleared`,
+        );
+      }
+
       log.info(`Fetched ${feed.notices.length} notice(s) → ${subscriptions.length} subscription(s)`);
 
       // If BGG shows no outstanding notifications, there's nothing to do.
@@ -807,6 +830,7 @@ async function runAgentAndWriteDigest(
       outputDir: string; chunkSize: number; maxModelCalls: number;
       localModel: string; cloudModel: string;
       maxLocalCalls: number; maxLocalInputChars: number;
+      includeImageUploads: boolean;
     };
     email?: Parameters<typeof sendDigestEmail>[0];
   },
@@ -843,7 +867,17 @@ async function runAgentAndWriteDigest(
     // response to failure, not the default. A night the model can handle costs
     // ONE call, exactly as 09-05 through 09-09 did. A night it cannot costs one
     // wasted call and then chunks, which is what 09-10 and 09-11 needed anyway.
-    const ranked = rankEntries(entries, interestsConfig);
+    // Filter again here, not only at fetch time: --reuse-data replays a
+    // manifest written before this rule existed, and the whole point is that
+    // these never reach a model.
+    const considered = config.digest.includeImageUploads
+      ? entries
+      : entries.filter((e) => !isImageUpload(e));
+    if (considered.length !== entries.length) {
+      log.info(`Excluding ${entries.length - considered.length} image-upload entr(ies) from the digest`);
+    }
+
+    const ranked = rankEntries(considered, interestsConfig);
 
     // Every model invocation for this run goes through here, so the ceiling
     // cannot be talked past by any amount of retrying or splitting.

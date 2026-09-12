@@ -13,7 +13,7 @@
 // what is in the others. Rank the whole set here, THEN split.
 
 import assert from 'node:assert/strict';
-import { rankEntries, chunkEntries, renderInterestsMarkdown } from './interests';
+import { rankEntries, chunkEntries, renderInterestsMarkdown, isImageUpload } from './interests';
 import type { ManifestEntry, InterestsConfig } from './interests';
 
 const cfg: InterestsConfig = {
@@ -120,6 +120,22 @@ function e(over: Partial<ManifestEntry> & { title: string }): ManifestEntry {
   ], cfg);
   assert.equal(ranked[0].title, 'Custom Models',
     'somebody responding to the reader outranks the de-emphasis');
+}
+
+// ---- 4d. isImageUpload recognises the notice shape, and only that ----
+//
+// The rule keys on BGG's /image/<id>/ url. Anything else — a thread, a
+// geeklist, a file page — is real content and must never be dropped.
+{
+  assert.equal(isImageUpload({ url: 'https://boardgamegeek.com/image/9797585/lotr' }), true);
+  assert.equal(isImageUpload({ url: 'https://boardgamegeek.com/thread/3765831/best-train' }), false);
+  assert.equal(isImageUpload({ url: 'https://boardgamegeek.com/geeklist/383712' }), false);
+  assert.equal(isImageUpload({ url: 'https://boardgamegeek.com/filepage/328738/gi-joe' }), false);
+  assert.equal(isImageUpload({ url: 'https://boardgamegeek.com/blog/2414/blogpost/190813' }), false);
+
+  // A thread that merely mentions the word is not an image notice.
+  assert.equal(isImageUpload({ url: 'https://boardgamegeek.com/thread/1/image-quality-question' }), false,
+    'the pattern requires /image/<digits>, not the word anywhere in a slug');
 }
 
 // ---- 5. chunking preserves the ranked order across chunk boundaries ----
