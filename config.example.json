@@ -13,7 +13,7 @@
     "localModel": "omnicoder-oc",
     "cloudModel": "nemotron-3-super:cloud",
     "maxLocalCalls": 120,
-    "maxLocalInputChars": 12000,
+    "maxLocalInputChars": 8000,
     "headless": true,
     "interestsFile": "./interests.toml",
     "clearSubs": false

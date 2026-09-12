@@ -37,6 +37,65 @@ function bulletsOf(answer: string): string[] {
     .map((line) => line.trim());
 }
 
+// ---- isStubContent ----------------------------------------------
+//
+// A stub is what index.ts writes when BGG reported activity we could not
+// fetch: blog posts, file pages, a thread whose replies are past the XML API
+// window. Its entire body is "New activity on a BGG <type> you subscribe to",
+// a context line and a link.
+//
+// 33 of the 50 subscriptions in the 2026-09-11 workspace were stubs. Handing
+// one to a model is pointless and actively harmful: BGG-DATA-GUIDE.md section
+// 3 exists to say DO NOT INFER CONTENT for exactly this case, and a model
+// asked to summarise "there is no content" will either return nothing (six
+// did on 2026-09-12) or invent something unverifiable.
+function isStubContent(content: string): boolean {
+  return /^New activity on a BGG .+ you subscribe to/m.test(content);
+}
+
+// ---- stubSection ------------------------------------------------
+//
+// Rendered entirely in code, costing no model call. Says plainly that the
+// content was not retrievable, which is what the data guide asks for.
+function stubSection(entry: ManifestEntry, content: string): string {
+  // The parenthetical reason index.ts recorded, e.g. "content fetch failed".
+  const why = /you subscribe to \(([^)]+)\)/.exec(content)?.[1];
+
+  const summary =
+    `BGG reported new activity on this ${entry.type}, but its content is not ` +
+    `retrievable through the API${why ? ` (${why})` : ''}, so there is nothing to summarise here.`;
+
+  const bullet = `Open the ${entry.type} to see what changed — ${entry.url}`;
+
+  return [
+    `**Summary:** ${summary}`,
+    '',
+    '**New Activity:**',
+    `- ${bullet}`,
+  ].join('\n');
+}
+
+// ---- normaliseProse ---------------------------------------------
+//
+// The model writes prose; the MARKERS are structure and belong to us.
+//
+// Observed 2026-09-12 on the SGOYT split path: the summary call returned a
+// perfectly good sentence with no "**Summary:**" prefix and the section was
+// thrown away for "no Summary line" — a 61KB subscription lost to a missing
+// six characters. Repair rather than reject.
+function normaliseSummary(answer: string): string {
+  const trimmed = answer.trim();
+  if (!trimmed) return '';
+
+  const marked = /^\*{0,2}Summary:?\*{0,2}[ \t]*([\s\S]*)$/i.exec(trimmed);
+  const text   = (marked ? marked[1] : trimmed).trim();
+
+  // Drop anything the model appended after the summary — a bullet list it was
+  // not asked for, or a second heading. The caller owns the bullets.
+  const firstBlock = text.split(/\n\s*\n|\n(?=[ \t]*[-*][ \t]+)|\n(?=\*\*)/)[0].trim();
+  return firstBlock;
+}
+
 export async function renderSubscriptionLocally(params: {
   entry: ManifestEntry;
   content: string;
@@ -47,24 +106,45 @@ export async function renderSubscriptionLocally(params: {
 }): Promise<LocalRenderResult> {
   const { entry, content, interests, maxInputChars, askProse } = params;
   const topics = matchTopics(content, interests);
-  const parts  = splitSubscriptionContent(content, maxInputChars);
   let calls = 0;
 
+  if (!content.trim()) {
+    return { section: null, defect: 'no content to summarise', calls };
+  }
+
+  // ---- stubs never reach the model ----
+  //
+  // There is no content to summarise, and asking anyway invites invention.
+  // Free, deterministic, and honest about what BGG did not give us.
+  if (isStubContent(content)) {
+    const section = assembleSection(entry, stubSection(entry, content), topics);
+    const defect  = sectionDefect(section);
+    return defect ? { section: null, defect, calls } : { section, defect: null, calls };
+  }
+
+  const parts = splitSubscriptionContent(content, maxInputChars);
   if (parts.length === 0) {
     return { section: null, defect: 'no content to summarise', calls };
   }
 
   // ---- the common case: one part, one call, Summary and bullets together ----
   if (parts.length === 1) {
-    const prose = await askProse(parts[0], true);
+    const answer = await askProse(parts[0], true);
     calls += 1;
 
     // Measured 2026-09-11: the local model returns an empty string with no
-    // error above ~3K input tokens. Name it rather than letting an empty
+    // error when the input is too long. Name it rather than letting an empty
     // section fall through to a confusing downstream defect.
-    if (!prose.trim()) {
+    if (!answer.trim()) {
       return { section: null, defect: 'model returned empty output', calls };
     }
+
+    // The model supplies prose; we own the markers. A good summary that
+    // forgot its prefix must not cost the whole subscription.
+    const bullets = bulletsOf(answer);
+    const prose = bullets.length > 0
+      ? `**Summary:** ${normaliseSummary(answer)}\n\n**New Activity:**\n${bullets.join('\n')}`
+      : `**Summary:** ${normaliseSummary(answer)}`;
 
     const section = assembleSection(entry, prose, topics);
     const defect  = sectionDefect(section);
@@ -89,7 +169,7 @@ export async function renderSubscriptionLocally(params: {
   const summary = await askProse(bulletLines.join('\n'), true);
   calls += 1;
 
-  const prose   = `${summary.trim()}\n\n**New Activity:**\n${bulletLines.join('\n')}`;
+  const prose = `**Summary:** ${normaliseSummary(summary)}\n\n**New Activity:**\n${bulletLines.join('\n')}`;
   const section = assembleSection(entry, prose, topics);
   const defect  = sectionDefect(section);
   return defect ? { section: null, defect, calls } : { section, defect: null, calls };

@@ -127,6 +127,72 @@ async function main() {
     assert.ok(r.defect && /bullet/i.test(r.defect), `got ${r.defect}`);
   }
 
+  // ---- a STUB costs no model call at all ----
+  //
+  // 33 of the 50 subscriptions in a real workspace are stubs: files whose
+  // entire content is "New activity on a BGG <type> you subscribe to." There
+  // is nothing to summarise. BGG-DATA-GUIDE.md section 3 exists to say DO NOT
+  // INFER CONTENT for these, and handing one to a model invites exactly that
+  // invention — several returned empty on 2026-09-12, and the rest are
+  // unverifiable.
+  {
+    let calls = 0;
+    const stub = '# Custom Models\n\nNew activity on a BGG unknown you subscribe to.\n\n' +
+                 '**Context:** The Lord of the Rings: Fate of the Fellowship\n\n' +
+                 '**Link:** https://boardgamegeek.com/thing/1\n';
+    const r = await renderSubscriptionLocally({
+      entry, content: stub, interests, maxInputChars: 100_000,
+      askProse: async () => { calls += 1; return 'INVENTED CONTENT'; },
+    });
+    assert.equal(calls, 0, 'a stub must never reach the model');
+    assert.equal(r.defect, null, 'and still produces a valid section');
+    assert.ok(!r.section!.includes('INVENTED'), 'nothing is invented');
+    assert.match(r.section!, /not retrievable|no content/i,
+      'the section says plainly that there is no content');
+    assert.equal(r.calls, 0);
+  }
+
+  // ---- the model may omit the **Summary:** marker; code adds it ----
+  //
+  // Observed 2026-09-12 on the SGOYT split path: the summary call returned a
+  // perfectly good sentence with no "**Summary:**" prefix, and the section was
+  // rejected for "no Summary line". The marker is STRUCTURE, and this module's
+  // whole premise is that code writes structure and the model writes prose.
+  {
+    const r = await renderSubscriptionLocally({
+      entry, content, interests, maxInputChars: 100_000,
+      askProse: async () =>
+        'Members posted six solo sessions this week with scores and short reviews.\n\n' +
+        '**New Activity:**\n- member1 — played Spirit Island and won at level 3.',
+    });
+    assert.equal(r.defect, null, 'a missing Summary marker is repaired, not rejected');
+    assert.match(r.section!, /^\*\*Summary:\*\* Members posted six solo sessions/m);
+  }
+
+  // ---- a doubled marker is not produced ----
+  {
+    const r = await renderSubscriptionLocally({
+      entry, content, interests, maxInputChars: 100_000,
+      askProse: async () => GOOD_PROSE,
+    });
+    assert.equal((r.section!.match(/\*\*Summary:\*\*/g) ?? []).length, 1,
+      'exactly one Summary marker');
+  }
+
+  // ---- the same repair applies on the SPLIT path ----
+  {
+    const r = await renderSubscriptionLocally({
+      entry, content, interests, maxInputChars: 700,
+      askProse: async (_i, wantSummary) => (wantSummary
+        ? 'Six members posted solo sessions with scores and short reviews of each game.'
+        : BULLETS_ONLY),
+    });
+    assert.equal(r.defect, null, 'the split path repairs the marker too');
+    assert.match(r.section!, /^\*\*Summary:\*\* Six members posted/m);
+    assert.equal((r.section!.match(/\*\*New Activity:\*\*/g) ?? []).length, 1,
+      'exactly one New Activity heading');
+  }
+
   // ---- calls are counted so the caller can enforce a budget ----
   {
     const r = await renderSubscriptionLocally({

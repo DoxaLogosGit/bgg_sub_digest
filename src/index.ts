@@ -30,7 +30,7 @@ import * as path from 'path';
 //
 // `import type { ... }` imports only the type (erased at compile time).
 // `import { ... }` imports the actual runtime value.
-import { loadConfig, loadInterests, loadInterestsConfig } from './config';
+import { loadConfig, loadInterests, loadInterestsConfig, resolveTiers } from './config';
 import { log } from './logger';
 import { createBrowserContext, ensureLoggedIn } from './bgg/auth';
 import {
@@ -49,9 +49,12 @@ import {
 } from './bgg/api';
 import { detectThreadSelfActivity, detectGeeklistSelfActivity } from './bgg/self-activity';
 import { rankEntries, chunkEntries, renderInterestsMarkdown } from './interests';
+import { renderLocalFirst } from './local/render';
+import { askLocalProse } from './local/ask';
 import type { InterestsConfig } from './interests';
 import {
   runChunkedDigest,
+  stripHighlightsBlock,
   formatThreadContent,
   formatGeeklistContent,
   writeSubscriptionFile,
@@ -797,7 +800,14 @@ async function runAgentAndWriteDigest(
   entries: ManifestEntry[],
   digestDataDir: string,
   // Inline shape — only the fields we actually need from the full Config.
-  config: { digest: { outputDir: string; chunkSize: number; maxModelCalls: number }; email?: Parameters<typeof sendDigestEmail>[0] },
+  config: {
+    digest: {
+      outputDir: string; chunkSize: number; maxModelCalls: number;
+      localModel: string; cloudModel: string;
+      maxLocalCalls: number; maxLocalInputChars: number;
+    };
+    email?: Parameters<typeof sendDigestEmail>[0];
+  },
   runStart: Date,
   // Structured interests, used to rank subscriptions before chunking.
   interestsConfig: InterestsConfig,
@@ -850,6 +860,67 @@ async function runAgentAndWriteDigest(
       return runDigest(agent, mp, interests, model);
     };
 
+    // ---- Local first ------------------------------------------------
+    //
+    // Local inference is unmetered, so a typical night should cost nothing at
+    // all. The cloud path below is unchanged and now serves as escalation for
+    // the individual subscriptions the local model could not render.
+    //
+    // See docs/superpowers/specs/2026-09-11-local-first-digest-design.md
+    const tiers    = resolveTiers(process.argv, config.digest);
+    const useLocal = tiers.models[0] === config.digest.localModel;
+
+    if (useLocal) {
+      log.info(
+        `Local-first digest: ${ranked.length} subscription(s) on ${config.digest.localModel}` +
+        (tiers.escalates ? `, escalating failures to ${config.digest.cloudModel}` : ' (--local-only)'),
+      );
+
+      const contents = new Map(ranked.map((e) => [
+        e.filePath,
+        fs.existsSync(e.filePath) ? fs.readFileSync(e.filePath, 'utf-8') : '',
+      ]));
+
+      const localResult = await renderLocalFirst({
+        entries:       ranked,
+        contents,
+        interests:     interestsConfig,
+        maxInputChars: config.digest.maxLocalInputChars,
+        escalates:     tiers.escalates,
+        maxLocalCalls: config.digest.maxLocalCalls,
+        askLocal: (input, wantSummary) =>
+          askLocalProse(config.digest.localModel, input, wantSummary),
+        escalateGroup: async (group) => {
+          // One metered call for this subscription alone, through the existing
+          // guarded cloud path. runOne enforces maxModelCalls.
+          const chunkManifest = writeManifest(group, digestDataDir);
+          const r = await generateGuardedDigest(
+            () => runOne(chunkManifest), group.length, { requireHighlights: false },
+          );
+          return r.status === 'invalid' ? null : stripHighlightsBlock(r.body);
+        },
+      });
+
+      log.info('Local-first digest complete', {
+        localCalls: localResult.localCalls,
+        cloudCalls: localResult.cloudCalls,
+        sections:   (localResult.sections.match(/^### \[/gm) ?? []).length,
+        skipped:    localResult.skipped.length,
+      });
+
+      digestResult = {
+        body:           localResult.sections,
+        inputTokens:    0,
+        outputTokens:   0,
+        costUsd:        0,
+        durationMs:     Date.now() - runStart.getTime(),
+        status:         localResult.skipped.length > 0 ? 'partial' : undefined,
+        completedCount: (localResult.sections.match(/^### \[/gm) ?? []).length,
+        totalCount:     ranked.length,
+        skipped:        localResult.skipped.length > 0 ? localResult.skipped : undefined,
+      };
+    } else {
+
     writeManifest(ranked, digestDataDir);
     digestResult = await generateGuardedDigest(
       () => runOne(manifestPath),
@@ -874,7 +945,9 @@ async function runAgentAndWriteDigest(
       );
     }
 
-    log.info(`Digest used ${modelCalls} model call(s) of a ${callBudget} budget`);
+    }   // end of the cloud-only branch
+
+    log.info(`Digest used ${modelCalls} metered call(s) of a ${callBudget} budget`);
   } catch (err) {
     log.error(`${agent} digest run failed`, { err: String(err) });
     // Fallback — show a minimal digest pointing at the data files so the user

@@ -118,10 +118,15 @@ const ConfigSchema = z.object({
     // rather than to ration spend.
     maxLocalCalls: z.number().int().positive().default(120),
 
-    // Largest input handed to the local model in one call. Measured
-    // 2026-09-11: above roughly 3K tokens it returns SILENT EMPTY OUTPUT.
-    // 12000 chars is ~3K tokens with margin. See local/split.ts.
-    maxLocalInputChars: z.number().int().positive().default(12000),
+    // Largest input handed to the local model in one call.
+    //
+    // Measured 2026-09-11: above roughly 3K tokens the model returns SILENT
+    // EMPTY OUTPUT. 12000 was the first guess and proved too generous — on
+    // 2026-09-12 an 11,441-byte thread came back empty, because the real
+    // budget also has to cover the instruction preamble and the answer inside
+    // the same 8192-token context. 8000 chars (~2K tokens) leaves room for
+    // both and matches the 10-item geeklist size that rendered cleanly.
+    maxLocalInputChars: z.number().int().positive().default(8000),
 
     // Whether to actually clear (mark-as-read) each processed subscription on BGG.
     // true  = click BGG's remove button on each notification row after processing.
