@@ -55,12 +55,18 @@ async function main() {
       askLocal: async () => { attempts += 1; return attempts === 1 ? '' : GOOD; },
       escalateGroup: async () => { cloud += 1; return null; },
     });
-    assert.equal(attempts, 2, 'a defective local render is retried locally once');
+    assert.equal(attempts, 2, 'a successful retry stops immediately — no wasted attempts');
     assert.equal(cloud, 0, 'and a successful retry never reaches the metered tier');
     assert.equal(r.skipped.length, 0);
   }
 
-  // ---- the retry is not infinite ----
+  // ---- retries are BOUNDED but generous, because they are free ----
+  //
+  // Measured 2026-09-12: the local model returns an empty response
+  // intermittently — the very same 565-byte input that failed twice in a run
+  // produced good output on a manual retry six seconds later. It is flakiness,
+  // not a property of the input. Local calls cost nothing, so retry several
+  // times before spending a metered token.
   {
     let attempts = 0, cloud = 0;
     await renderLocalFirst({
@@ -68,8 +74,20 @@ async function main() {
       askLocal: async () => { attempts += 1; return ''; },
       escalateGroup: async () => { cloud += 1; return null; },
     });
-    assert.equal(attempts, 2, 'exactly one retry, then escalate');
-    assert.equal(cloud, 1);
+    assert.equal(attempts, 3, 'three local attempts before escalating');
+    assert.equal(cloud, 1, 'then exactly one metered call');
+  }
+
+  // ---- a late retry still saves the subscription ----
+  {
+    let attempts = 0, cloud = 0;
+    const r = await renderLocalFirst({
+      entries: [entry(1)], contents, interests, maxInputChars: 100_000, escalates: true,
+      askLocal: async () => { attempts += 1; return attempts < 3 ? '' : GOOD; },
+      escalateGroup: async () => { cloud += 1; return null; },
+    });
+    assert.equal(cloud, 0, 'a third-attempt success must never reach the metered tier');
+    assert.equal(r.skipped.length, 0);
   }
 
   // ---- one bad subscription escalates ALONE ----

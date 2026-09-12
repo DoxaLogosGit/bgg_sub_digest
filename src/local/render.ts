@@ -75,6 +75,25 @@ function stubSection(entry: ManifestEntry, content: string): string {
   ].join('\n');
 }
 
+// ---- describeBullets --------------------------------------------
+//
+// A summary of last resort, derived from the bullets rather than from the
+// model. Purely factual — a count and the names that appear — so it can be
+// wrong only if the bullets are.
+function describeBullets(bullets: string[]): string {
+  const names = bullets
+    .map((b) => /^[-*][ \t]+\*{0,2}([^—:*]+?)\*{0,2}[ \t]*[—:-]/.exec(b)?.[1]?.trim())
+    .filter((n): n is string => !!n && n.length < 40);
+
+  const unique = [...new Set(names)];
+  const who = unique.length === 0 ? ''
+    : unique.length <= 3 ? ` from ${unique.join(', ')}`
+    : ` from ${unique.slice(0, 3).join(', ')} and ${unique.length - 3} others`;
+
+  return `${bullets.length} new item${bullets.length === 1 ? '' : 's'}${who}. ` +
+         `A written summary was not available for this subscription, so the activity is listed in full below.`;
+}
+
 // ---- normaliseProse ---------------------------------------------
 //
 // The model writes prose; the MARKERS are structure and belong to us.
@@ -169,7 +188,13 @@ export async function renderSubscriptionLocally(params: {
   const summary = await askProse(bulletLines.join('\n'), true);
   calls += 1;
 
-  const prose = `**Summary:** ${normaliseSummary(summary)}\n\n**New Activity:**\n${bulletLines.join('\n')}`;
+  // A flaky empty summary must not cost a subscription whose bullets are
+  // already in hand. SGOYT September (61KB, 8 parts) was lost exactly this way
+  // on 2026-09-12. The fallback states what the bullets contain and invents
+  // nothing.
+  const summaryText = normaliseSummary(summary) || describeBullets(bulletLines);
+
+  const prose = `**Summary:** ${summaryText}\n\n**New Activity:**\n${bulletLines.join('\n')}`;
   const section = assembleSection(entry, prose, topics);
   const defect  = sectionDefect(section);
   return defect ? { section: null, defect, calls } : { section, defect: null, calls };
@@ -193,6 +218,11 @@ export async function renderSubscriptionLocally(params: {
 
 import type { DigestSkippedEntry } from '../agent';
 import { log } from '../logger';
+
+// How many times to ask the local model before escalating. Three, because the
+// failure it guards against is intermittent emptiness and each attempt is
+// free — see the loop in renderLocalFirst.
+const LOCAL_ATTEMPTS = 3;
 
 export interface LocalFirstResult {
   sections:   string;                 // assembled section markdown, in ranked order
@@ -235,14 +265,19 @@ export async function renderLocalFirst(params: {
       askProse: (input, wantSummary) => askLocal(input, wantSummary, entry),
     });
 
+    // Retry locally several times before spending anything metered.
+    //
+    // Measured 2026-09-12: the local model returns an empty response
+    // INTERMITTENTLY. The same 565-byte thread that failed twice inside a run
+    // produced good output on a manual retry moments later, so this is
+    // flakiness rather than a property of the input. Local calls cost only
+    // time, and time is free at 03:00 — so buy several.
     let result = await attempt();
     localCalls += result.calls;
 
-    // ONE local retry before spending anything metered. Local calls cost time
-    // only, so this is near-free insurance against a one-off bad generation.
-    if (!result.section) {
+    for (let tryNo = 2; !result.section && tryNo <= LOCAL_ATTEMPTS; tryNo++) {
       log.debug('Local render defective — retrying locally', {
-        title: entry.title, defect: result.defect,
+        title: entry.title, defect: result.defect, attempt: tryNo,
       });
       result = await attempt();
       localCalls += result.calls;

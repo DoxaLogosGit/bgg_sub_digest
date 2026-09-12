@@ -193,6 +193,24 @@ async function main() {
       'exactly one New Activity heading');
   }
 
+  // ---- an empty SUMMARY call does not lose a split subscription ----
+  //
+  // Observed 2026-09-12: SGOYT September (61KB, 8 parts) produced all its
+  // bullets and was then thrown away because the final summary call returned
+  // nothing. Losing 50 items of the reader's most-valued subscription to one
+  // flaky call is absurd when the bullets are already in hand — code can state
+  // what they contain without inventing anything.
+  {
+    const r = await renderSubscriptionLocally({
+      entry, content, interests, maxInputChars: 700,
+      askProse: async (_i, wantSummary) => (wantSummary ? '' : BULLETS_ONLY),
+    });
+    assert.equal(r.defect, null, 'the subscription survives an empty summary call');
+    assert.ok(r.section!.includes('- member1'), 'the bullets are kept');
+    assert.match(r.section!, /^\*\*Summary:\*\* .{40,}/m,
+      'and a factual summary is derived from them in code');
+  }
+
   // ---- calls are counted so the caller can enforce a budget ----
   {
     const r = await renderSubscriptionLocally({
