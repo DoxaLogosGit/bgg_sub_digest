@@ -16,6 +16,7 @@
 
 import type { ManifestEntry } from '../agent';
 import type { InterestsConfig } from '../interests';
+import { isImageUpload } from '../interests';
 
 // ---- summaryLines ------------------------------------------------
 //
@@ -69,7 +70,15 @@ export function mechanicalHighlights(entries: ManifestEntry[], cfg: InterestsCon
   const matches = (hay: string | undefined, needles: string[]): boolean =>
     !!hay && needles.some((n) => n && hay.toLowerCase().includes(n.toLowerCase()));
 
+  // Image uploads are excluded from every bullet below. Highlights is what the
+  // reader sees first, and 32 image notices on a tracked game would own that
+  // bullet and bury the discussion the game is tracked FOR (2026-09-12). They
+  // still get their own grouped section further down.
+  const notable = entries.filter((e) => !isImageUpload(e));
+
   // Replies to the reader lead — the one thing here that may be waiting on him.
+  // Checked against the FULL list: somebody commenting on the reader's image is
+  // still a reply to him.
   const replies = entries.filter((e) => e.selfActivity);
   if (replies.length > 0) {
     lines.push(`- 💬 **Replies to you** — ${replies
@@ -77,13 +86,13 @@ export function mechanicalHighlights(entries: ManifestEntry[], cfg: InterestsCon
       .join(' | ')}`);
   }
 
-  const priority = entries.filter((e) => !e.selfActivity && matches(e.title, cfg.priorityTitles));
+  const priority = notable.filter((e) => !e.selfActivity && matches(e.title, cfg.priorityTitles));
   if (priority.length > 0) {
     lines.push(`- ⭐ **Priority subscriptions** — ${nameList(priority)}`);
   }
 
   for (const game of cfg.trackedGames) {
-    const hits = entries.filter((e) => matches(e.parentName, [game]) || matches(e.title, [game]));
+    const hits = notable.filter((e) => matches(e.parentName, [game]) || matches(e.title, [game]));
     if (hits.length > 0) {
       lines.push(`- ⭐ **${game}** — activity in ${nameList(hits)}`);
     }

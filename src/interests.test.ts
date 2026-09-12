@@ -91,6 +91,37 @@ function e(over: Partial<ManifestEntry> & { title: string }): ManifestEntry {
     'equal-tier entries keep their original order');
 }
 
+// ---- 4b. image uploads rank LAST, even on a tracked game ----
+//
+// 2026-09-12: BGG emits one notice per image. A tracked game that gained 32
+// images put all 32 in TIER_TRACKED_GAME — above every ordinary subscription —
+// so the digest opened with an image flood. An upload notice carries no
+// content to read; it belongs at the bottom whatever it is attached to.
+{
+  const ranked = rankEntries([
+    e({ title: 'Custom Models', url: 'https://boardgamegeek.com/image/9797585/lotr',
+        parentName: "Star Trek: Captain's Chair" }),
+    e({ title: 'Unrelated orphan thread' }),
+    e({ title: 'A wave 3 question', parentName: "Star Trek: Captain's Chair" }),
+  ], cfg);
+
+  assert.equal(ranked[ranked.length - 1].title, 'Custom Models',
+    'an image upload sorts below even an unrelated orphan thread');
+  assert.equal(ranked[0].title, 'A wave 3 question',
+    'and the real tracked-game discussion keeps its place');
+}
+
+// ---- 4c. a reply to YOU still outranks the image rule ----
+{
+  const ranked = rankEntries([
+    e({ title: 'Ordinary thread' }),
+    e({ title: 'Custom Models', url: 'https://boardgamegeek.com/image/1/x',
+        selfActivity: { reasons: ['1 comment on your image'], replyCount: 1 } }),
+  ], cfg);
+  assert.equal(ranked[0].title, 'Custom Models',
+    'somebody responding to the reader outranks the de-emphasis');
+}
+
 // ---- 5. chunking preserves the ranked order across chunk boundaries ----
 {
   const ranked = rankEntries(

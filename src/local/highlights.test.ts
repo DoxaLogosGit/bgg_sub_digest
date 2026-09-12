@@ -72,6 +72,32 @@ function entry(over: Partial<ManifestEntry> & { title: string }): ManifestEntry 
   assert.match(hl, /^- /m, 'always at least one bullet');
 }
 
+// ---- image uploads never appear in Highlights ----
+//
+// Highlights is what the reader sees first. 32 image notices on a tracked game
+// would otherwise own that bullet, burying the discussion the game is tracked
+// FOR. They still get their own grouped section at the bottom.
+{
+  const entries = [
+    entry({ title: 'Custom Models', url: 'https://boardgamegeek.com/image/1/x', parentName: 'Spirit Island' }),
+    entry({ title: 'Custom Models', url: 'https://boardgamegeek.com/image/2/x', parentName: 'Spirit Island' }),
+    entry({ title: 'Rules question', parentName: 'Spirit Island' }),
+  ];
+  const hl = mechanicalHighlights(entries, cfg);
+  const bullet = hl.split('\n').find((l) => l.includes('Spirit Island')) ?? '';
+  assert.match(bullet, /Rules question/, 'real discussion is highlighted');
+  assert.ok(!bullet.includes('Custom Models'), 'image uploads are not');
+}
+
+// ---- a game with ONLY image uploads earns no highlight at all ----
+{
+  const hl = mechanicalHighlights([
+    entry({ title: 'Custom Models', url: 'https://boardgamegeek.com/image/1/x', parentName: 'Spirit Island' }),
+  ], cfg);
+  assert.ok(!hl.includes('Spirit Island'),
+    'images alone are not a reason to highlight a tracked game');
+}
+
 // ---- a game with 30 identical entries is COUNTED, not enumerated ----
 //
 // 2026-09-12: BGG emitted one notice per image, and the tracked-game bullet
