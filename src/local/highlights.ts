@@ -37,6 +37,29 @@ export function summaryLines(sections: string): string {
   return out.join('\n');
 }
 
+// ---- nameList ----------------------------------------------------
+//
+// Titles for one bullet: deduplicated, capped, and counted.
+//
+// 2026-09-12: BGG emits one notice per image, so a game that gained 30 images
+// produced "activity in Custom Models, Custom Models, Custom Models, ..."
+// thirty times over. A highlight is an index, not an inventory — it must stay
+// one readable line whatever the feed does.
+const MAX_NAMES = 4;
+
+function nameList(entries: ManifestEntry[]): string {
+  const unique = [...new Set(entries.map((e) => e.title))];
+
+  // A repeated title means several notices about the same thing; the count is
+  // the information, not the repetition.
+  if (unique.length === 1 && entries.length > 1) {
+    return `${entries.length} × ${unique[0]}`;
+  }
+
+  if (unique.length <= MAX_NAMES) return unique.join(', ');
+  return `${unique.slice(0, MAX_NAMES).join(', ')} and ${unique.length - MAX_NAMES} more`;
+}
+
 // ---- mechanicalHighlights ----------------------------------------
 //
 // Built entirely from the manifest. No model, no cost, no invention.
@@ -56,13 +79,13 @@ export function mechanicalHighlights(entries: ManifestEntry[], cfg: InterestsCon
 
   const priority = entries.filter((e) => !e.selfActivity && matches(e.title, cfg.priorityTitles));
   if (priority.length > 0) {
-    lines.push(`- ⭐ **Priority subscriptions** — ${priority.map((e) => e.title).join(', ')}`);
+    lines.push(`- ⭐ **Priority subscriptions** — ${nameList(priority)}`);
   }
 
   for (const game of cfg.trackedGames) {
     const hits = entries.filter((e) => matches(e.parentName, [game]) || matches(e.title, [game]));
     if (hits.length > 0) {
-      lines.push(`- ⭐ **${game}** — activity in ${hits.map((e) => e.title).join(', ')}`);
+      lines.push(`- ⭐ **${game}** — activity in ${nameList(hits)}`);
     }
   }
 

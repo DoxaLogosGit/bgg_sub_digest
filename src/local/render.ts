@@ -18,6 +18,7 @@
 import type { ManifestEntry } from '../agent';
 import type { InterestsConfig } from '../interests';
 import { splitSubscriptionContent } from './split';
+import { groupDuplicateEntries } from './group';
 import { assembleSection, matchTopics } from './section';
 import { sectionDefect } from './validate';
 
@@ -53,32 +54,64 @@ function isStubContent(content: string): boolean {
   return /^New activity on a BGG .+ you subscribe to/m.test(content);
 }
 
+// A readable noun for a subscription type. `entry.type` is an API value and
+// 'unknown' reads badly in prose ("this unknown's content"); an image upload
+// is the commonest thing behind it.
+function nounFor(type: string): string {
+  switch (type) {
+    case 'unknown':            return 'page';
+    case 'boardgame':
+    case 'boardgameexpansion': return 'game page';
+    case 'filepage':           return 'file page';
+    case 'blog':               return 'blog post';
+    default:                   return type;
+  }
+}
+
 // ---- stubSection ------------------------------------------------
 //
 // Rendered entirely in code, costing no model call. Says plainly that the
-// content was not retrievable, which is what the data guide asks for.
-function stubSection(entry: ManifestEntry, content: string): string {
+// content was not retrievable, which is what BGG-DATA-GUIDE.md asks for.
+//
+// Covers a GROUP of identical stubs, because BGG emits one notice per image:
+// a game that gained 30 images arrives as 30 "subscriptions" with the same
+// title and parent. One section with a count reads far better than 30
+// near-identical blocks — the reader's complaint on 2026-09-12.
+function stubSection(group: ManifestEntry[], content: string): string {
+  const entry = group[0];
+  const noun  = nounFor(entry.type);
+
   // The parenthetical reason index.ts recorded, e.g. "content fetch failed".
   const why = /you subscribe to \(([^)]+)\)/.exec(content)?.[1];
 
-  // The TITLE is included deliberately. A real workspace is mostly stubs — 32
-  // of 50 on 2026-09-12 — and identical summaries drove isVacuousDigest's
-  // distinct-summary ratio to 0.326 against its 0.30 floor. That guard exists
-  // to catch a model repeating itself, and a pile of code-written boilerplate
-  // must not be mistaken for it.
-  const context = entry.parentName ? ` (${entry.parentName})` : '';
-  const summary =
-    `New activity on "${entry.title}"${context}, but BGG does not expose this ` +
-    `${entry.type}'s content through the API${why ? ` (${why})` : ''}, so there is ` +
-    `nothing to summarise here.`;
+  // The TITLE is included deliberately. A real workspace is mostly stubs, and
+  // identical summaries drove isVacuousDigest's distinct-summary ratio to
+  // 0.326 against its 0.30 floor. That guard catches a model repeating itself
+  // and must not be tripped by our own boilerplate.
+  const context = entry.parentName ? ` on ${entry.parentName}` : '';
 
-  const bullet = `Open the ${entry.type} to see what changed — ${entry.url}`;
+  const summary = group.length > 1
+    ? `${group.length} new "${entry.title}" ${noun}s${context}. BGG does not expose ` +
+      `their content through the API, so they are listed rather than summarised.`
+    : `New activity on "${entry.title}"${context}, but BGG does not expose this ` +
+      `${noun}'s content through the API${why ? ` (${why})` : ''}, so there is ` +
+      `nothing to summarise here.`;
+
+  // Cap the link list. Thirty raw urls is the repetition being fixed, not a
+  // feature; the first few let the reader jump in, the count tells them the
+  // scale, and nothing is hidden because the count is exact.
+  const MAX_LINKS = 5;
+  const shown = group.slice(0, MAX_LINKS);
+  const bullets = shown.map((e) => `- ${e.url}`);
+  if (group.length > shown.length) {
+    bullets.push(`- …and ${group.length - shown.length} more, all on ${entry.parentName ?? entry.title}`);
+  }
 
   return [
     `**Summary:** ${summary}`,
     '',
     '**New Activity:**',
-    `- ${bullet}`,
+    ...bullets,
   ].join('\n');
 }
 
@@ -124,6 +157,9 @@ function normaliseSummary(answer: string): string {
 
 export async function renderSubscriptionLocally(params: {
   entry: ManifestEntry;
+  // Identical sibling stubs rendered by this same section, if any. BGG emits
+  // one notice per image, so a game with 30 new images arrives as 30 entries.
+  group?: ManifestEntry[];
   content: string;
   interests: InterestsConfig;
   maxInputChars: number;
@@ -131,6 +167,7 @@ export async function renderSubscriptionLocally(params: {
   askProse: (input: string, wantSummary: boolean) => Promise<string>;
 }): Promise<LocalRenderResult> {
   const { entry, content, interests, maxInputChars, askProse } = params;
+  const group = params.group ?? [entry];
   const topics = matchTopics(content, interests);
   let calls = 0;
 
@@ -143,7 +180,7 @@ export async function renderSubscriptionLocally(params: {
   // There is no content to summarise, and asking anyway invites invention.
   // Free, deterministic, and honest about what BGG did not give us.
   if (isStubContent(content)) {
-    const section = assembleSection(entry, stubSection(entry, content), topics);
+    const section = assembleSection(entry, stubSection(group, content), topics);
     const defect  = sectionDefect(section);
     return defect ? { section: null, defect, calls } : { section, defect: null, calls };
   }
@@ -256,19 +293,32 @@ export async function renderLocalFirst(params: {
   const skipped:  DigestSkippedEntry[] = [];
   let localCalls = 0, cloudCalls = 0;
 
-  for (const entry of entries) {
+  // Collapse identical stubs before rendering. BGG emits one notice per image,
+  // so a game that gained 30 images arrives as 30 entries with the same title
+  // and parent; one section with a count reads far better than 30 blocks.
+  // Only stubs group — merging two real subscriptions would merge their
+  // content, a worse bug than the repetition being fixed.
+  const groups = groupDuplicateEntries(entries, (e) => {
+    const c = contents.get(e.filePath) ?? '';
+    return isStubContent(c);
+  });
+
+  for (const group of groups) {
+    const entry   = group[0];
     const content = contents.get(entry.filePath) ?? '';
 
     if (localCalls >= budget) {
-      skipped.push({
-        title: entry.title, filePath: entry.filePath,
+      // Every member of the group is unrendered, so every member is skipped —
+      // otherwise the caller would clear notices for entries never summarised.
+      skipped.push(...group.map((e) => ({
+        title: e.title, filePath: e.filePath,
         reason: `local call budget of ${budget} exhausted before this subscription`,
-      });
+      })));
       continue;
     }
 
     const attempt = (): Promise<LocalRenderResult> => renderSubscriptionLocally({
-      entry, content, interests, maxInputChars,
+      entry, group, content, interests, maxInputChars,
       askProse: (input, wantSummary) => askLocal(input, wantSummary, entry),
     });
 
@@ -293,24 +343,24 @@ export async function renderLocalFirst(params: {
     if (result.section) { rendered.push(result.section); continue; }
 
     if (!escalates) {
-      skipped.push({
-        title: entry.title, filePath: entry.filePath,
+      skipped.push(...group.map((e) => ({
+        title: e.title, filePath: e.filePath,
         reason: `local render failed (${result.defect}) and escalation is disabled`,
-      });
+      })));
       continue;
     }
 
     log.info('Escalating one subscription to the metered model', {
       title: entry.title, defect: result.defect,
     });
-    const fromCloud = await escalateGroup([entry]);
+    const fromCloud = await escalateGroup(group);
     cloudCalls += 1;
     if (fromCloud) { rendered.push(fromCloud); continue; }
 
-    skipped.push({
-      title: entry.title, filePath: entry.filePath,
+    skipped.push(...group.map((e) => ({
+      title: e.title, filePath: e.filePath,
       reason: `local render failed (${result.defect}) and the cloud escalation also failed`,
-    });
+    })));
   }
 
   return { sections: rendered.join('\n\n'), skipped, localCalls, cloudCalls };

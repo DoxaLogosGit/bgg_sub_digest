@@ -72,6 +72,33 @@ function entry(over: Partial<ManifestEntry> & { title: string }): ManifestEntry 
   assert.match(hl, /^- /m, 'always at least one bullet');
 }
 
+// ---- a game with 30 identical entries is COUNTED, not enumerated ----
+//
+// 2026-09-12: BGG emitted one notice per image, and the tracked-game bullet
+// read "activity in Custom Models, Custom Models, Custom Models, ..." thirty
+// times over. The reader's complaint was exactly this.
+{
+  const many = Array.from({ length: 30 }, () =>
+    entry({ title: 'Custom Models', parentName: 'Spirit Island' }));
+  const hl = mechanicalHighlights(many, cfg);
+
+  const bullet = hl.split('\n').find((l) => l.includes('Spirit Island')) ?? '';
+  assert.ok((bullet.match(/Custom Models/g) ?? []).length <= 1,
+    `a repeated title must appear at most once, got: ${bullet.slice(0, 120)}`);
+  assert.match(bullet, /30/, 'the count is reported instead');
+  assert.ok(bullet.length < 200, `the bullet stays readable, was ${bullet.length} chars`);
+}
+
+// ---- a long list of DISTINCT titles is truncated with a count ----
+{
+  const many = Array.from({ length: 12 }, (_, i) =>
+    entry({ title: `Thread number ${i}`, parentName: 'Spirit Island' }));
+  const hl = mechanicalHighlights(many, cfg);
+  const bullet = hl.split('\n').find((l) => l.includes('Spirit Island')) ?? '';
+  assert.ok(bullet.length < 250, `long bullets are truncated, was ${bullet.length}`);
+  assert.match(bullet, /more/, 'and say how many were not listed');
+}
+
 // ---- the block satisfies the pipeline's own guard ----
 {
   const hl = mechanicalHighlights([entry({ title: 'SGOYT September' })], cfg);
