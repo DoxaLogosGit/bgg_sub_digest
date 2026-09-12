@@ -48,6 +48,7 @@ const TIER_PRIORITY      = 1;  // title matches interests.toml priority_titles
 const TIER_TRACKED_GAME  = 2;  // parent game is one the reader tracks
 const TIER_HAS_PARENT    = 3;  // belongs to some game's forum
 const TIER_EVERYTHING    = 4;  // orphan threads, unrelated geeklists
+const TIER_IMAGE_UPLOAD  = 5;  // an image was added to a game page — no content to read
 
 function matchesAny(haystack: string, needles: string[]): boolean {
   if (!haystack) return false;
@@ -58,12 +59,31 @@ function matchesAny(haystack: string, needles: string[]): boolean {
   return needles.some((n) => n && lower.includes(n.toLowerCase()));
 }
 
+// ---- isImageUpload ---------------------------------------------
+//
+// A BGG notice about an image added to a game page. Its url is
+// /image/<id>/<slug> and there is no body to summarise — the digest can say
+// how many arrived and link them, nothing more.
+export function isImageUpload(entry: { url: string }): boolean {
+  return /\/image\/\d+/.test(entry.url);
+}
+
 // ---- tierOf ----------------------------------------------------
 //
 // Which ranking tier does this subscription belong to? First match wins, in
 // the order below — a subscription is only ever counted once.
 export function tierOf(entry: ManifestEntry, cfg: InterestsConfig): number {
   if (entry.selfActivity) return TIER_REPLY_TO_YOU;
+
+  // Image uploads sink to the bottom, ahead of every other consideration
+  // except somebody replying to the reader.
+  //
+  // 2026-09-12: BGG emits ONE NOTICE PER IMAGE, and a tracked game that gained
+  // 32 images put all 32 in TIER_TRACKED_GAME — so the digest opened with an
+  // image flood ranked above every real discussion. An upload notice has no
+  // content to read; its parent being a tracked game does not change that.
+  if (isImageUpload(entry)) return TIER_IMAGE_UPLOAD;
+
   if (matchesAny(entry.title, cfg.priorityTitles)) return TIER_PRIORITY;
   if (entry.parentName && matchesAny(entry.parentName, cfg.trackedGames)) return TIER_TRACKED_GAME;
   if (entry.parentName) return TIER_HAS_PARENT;

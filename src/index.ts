@@ -30,7 +30,7 @@ import * as path from 'path';
 //
 // `import type { ... }` imports only the type (erased at compile time).
 // `import { ... }` imports the actual runtime value.
-import { loadConfig, loadInterests, loadInterestsConfig } from './config';
+import { loadConfig, loadInterests, loadInterestsConfig, resolveTiers } from './config';
 import { log } from './logger';
 import { createBrowserContext, ensureLoggedIn } from './bgg/auth';
 import {
@@ -48,10 +48,15 @@ import {
   itemsWithActivityNewerThan,
 } from './bgg/api';
 import { detectThreadSelfActivity, detectGeeklistSelfActivity } from './bgg/self-activity';
-import { rankEntries, chunkEntries, renderInterestsMarkdown } from './interests';
+import { rankEntries, chunkEntries, renderInterestsMarkdown, isImageUpload } from './interests';
+import { renderLocalFirst } from './local/render';
+import { askLocalProse } from './local/ask';
+import { summaryLines, mechanicalHighlights } from './local/highlights';
 import type { InterestsConfig } from './interests';
 import {
   runChunkedDigest,
+  stripHighlightsBlock,
+  extractHighlightsBlock,
   formatThreadContent,
   formatGeeklistContent,
   writeSubscriptionFile,
@@ -308,7 +313,30 @@ async function main(): Promise<void> {
       const apiRequest = browser.request;
       const authToken  = await getAuthToken(apiRequest);
       const feed       = await fetchNoticeFeed(apiRequest, authToken);
-      const { subscriptions, clearItems } = transformNotices(feed);
+      const { subscriptions: allSubscriptions, clearItems } = transformNotices(feed);
+
+      // ---- Drop image uploads before anything is fetched ----
+      //
+      // BGG emits one notice per image; 32 of 50 subscriptions on 2026-09-12
+      // were uploads to a single game. They have no readable content, so
+      // fetching them, writing a data file and handing them to a model spends
+      // time and context to say "somebody added a picture" many times over.
+      //
+      // Their notices are still cleared: clearItems comes from the feed, not
+      // from the manifest. Excluding a notice is NOT the same as failing to
+      // summarise one — only the latter withholds clearing.
+      const subscriptions = config.digest.includeImageUploads
+        ? allSubscriptions
+        : allSubscriptions.filter((s) => !isImageUpload(s));
+
+      const droppedImages = allSubscriptions.length - subscriptions.length;
+      if (droppedImages > 0) {
+        log.info(
+          `Skipping ${droppedImages} image-upload notice(s) — no content to summarise; ` +
+          `their notices are still cleared`,
+        );
+      }
+
       log.info(`Fetched ${feed.notices.length} notice(s) → ${subscriptions.length} subscription(s)`);
 
       // If BGG shows no outstanding notifications, there's nothing to do.
@@ -797,7 +825,15 @@ async function runAgentAndWriteDigest(
   entries: ManifestEntry[],
   digestDataDir: string,
   // Inline shape — only the fields we actually need from the full Config.
-  config: { digest: { outputDir: string; chunkSize: number; maxModelCalls: number }; email?: Parameters<typeof sendDigestEmail>[0] },
+  config: {
+    digest: {
+      outputDir: string; chunkSize: number; maxModelCalls: number;
+      localModel: string; cloudModel: string;
+      maxLocalCalls: number; maxLocalInputChars: number;
+      includeImageUploads: boolean;
+    };
+    email?: Parameters<typeof sendDigestEmail>[0];
+  },
   runStart: Date,
   // Structured interests, used to rank subscriptions before chunking.
   interestsConfig: InterestsConfig,
@@ -831,7 +867,17 @@ async function runAgentAndWriteDigest(
     // response to failure, not the default. A night the model can handle costs
     // ONE call, exactly as 09-05 through 09-09 did. A night it cannot costs one
     // wasted call and then chunks, which is what 09-10 and 09-11 needed anyway.
-    const ranked = rankEntries(entries, interestsConfig);
+    // Filter again here, not only at fetch time: --reuse-data replays a
+    // manifest written before this rule existed, and the whole point is that
+    // these never reach a model.
+    const considered = config.digest.includeImageUploads
+      ? entries
+      : entries.filter((e) => !isImageUpload(e));
+    if (considered.length !== entries.length) {
+      log.info(`Excluding ${entries.length - considered.length} image-upload entr(ies) from the digest`);
+    }
+
+    const ranked = rankEntries(considered, interestsConfig);
 
     // Every model invocation for this run goes through here, so the ceiling
     // cannot be talked past by any amount of retrying or splitting.
@@ -849,6 +895,101 @@ async function runAgentAndWriteDigest(
       log.debug(`Model call ${modelCalls}/${callBudget}`);
       return runDigest(agent, mp, interests, model);
     };
+
+    // ---- Local first ------------------------------------------------
+    //
+    // Local inference is unmetered, so a typical night should cost nothing at
+    // all. The cloud path below is unchanged and now serves as escalation for
+    // the individual subscriptions the local model could not render.
+    //
+    // See docs/superpowers/specs/2026-09-11-local-first-digest-design.md
+    const tiers    = resolveTiers(process.argv, config.digest);
+    const useLocal = tiers.models[0] === config.digest.localModel;
+
+    if (useLocal) {
+      log.info(
+        `Local-first digest: ${ranked.length} subscription(s) on ${config.digest.localModel}` +
+        (tiers.escalates ? `, escalating failures to ${config.digest.cloudModel}` : ' (--local-only)'),
+      );
+
+      const contents = new Map(ranked.map((e) => [
+        e.filePath,
+        fs.existsSync(e.filePath) ? fs.readFileSync(e.filePath, 'utf-8') : '',
+      ]));
+
+      const localResult = await renderLocalFirst({
+        entries:       ranked,
+        contents,
+        interests:     interestsConfig,
+        maxInputChars: config.digest.maxLocalInputChars,
+        escalates:     tiers.escalates,
+        maxLocalCalls: config.digest.maxLocalCalls,
+        askLocal: (input, wantSummary) =>
+          askLocalProse(config.digest.localModel, input, wantSummary),
+        escalateGroup: async (group) => {
+          // One metered call for this subscription alone, through the existing
+          // guarded cloud path. runOne enforces maxModelCalls.
+          const chunkManifest = writeManifest(group, digestDataDir);
+          const r = await generateGuardedDigest(
+            () => runOne(chunkManifest), group.length, { requireHighlights: false },
+          );
+          return r.status === 'invalid' ? null : stripHighlightsBlock(r.body);
+        },
+      });
+
+      // ---- Highlights from the Summary lines only ----
+      //
+      // A fraction of the assembled digest, so the synthesis pass stays inside
+      // the input budget that the sections themselves respect. If the model
+      // cannot manage it, the mechanical block costs nothing and cannot be
+      // wrong — and a digest must never ship without Highlights, because
+      // isMissingHighlights reads that as a defective generation.
+      let highlights = '';
+      if (localResult.sections.trim()) {
+        const lines = summaryLines(localResult.sections);
+        // Retried like the sections are, and for the same reason: the local
+        // model returns empty intermittently. On 2026-09-12 a single attempt
+        // came back empty and the run fell through to the mechanical block —
+        // correct, but a real written summary is better content and costs
+        // only time.
+        for (let tryNo = 1; tryNo <= 3 && !highlights; tryNo++) {
+          try {
+            const raw = await askLocalProse(config.digest.localModel, lines, true);
+            highlights = extractHighlightsBlock(raw);
+            if (!highlights && raw.trim()) {
+              // The model wrote a summary without the header. The header is
+              // structure, so we supply it — same principle as the sections.
+              highlights = `## ⭐ Highlights\n\n${raw.trim()}`;
+            }
+          } catch (err) {
+            log.warn('Local highlights pass failed', { err: String(err), attempt: tryNo });
+          }
+        }
+      }
+      if (!highlights) {
+        log.info('Using mechanical highlights (no model call)');
+        highlights = mechanicalHighlights(ranked, interestsConfig);
+      }
+
+      log.info('Local-first digest complete', {
+        localCalls: localResult.localCalls,
+        cloudCalls: localResult.cloudCalls,
+        sections:   (localResult.sections.match(/^### \[/gm) ?? []).length,
+        skipped:    localResult.skipped.length,
+      });
+
+      digestResult = {
+        body:           `${highlights}\n\n${localResult.sections}`,
+        inputTokens:    0,
+        outputTokens:   0,
+        costUsd:        0,
+        durationMs:     Date.now() - runStart.getTime(),
+        status:         localResult.skipped.length > 0 ? 'partial' : undefined,
+        completedCount: (localResult.sections.match(/^### \[/gm) ?? []).length,
+        totalCount:     ranked.length,
+        skipped:        localResult.skipped.length > 0 ? localResult.skipped : undefined,
+      };
+    } else {
 
     writeManifest(ranked, digestDataDir);
     digestResult = await generateGuardedDigest(
@@ -874,7 +1015,9 @@ async function runAgentAndWriteDigest(
       );
     }
 
-    log.info(`Digest used ${modelCalls} model call(s) of a ${callBudget} budget`);
+    }   // end of the cloud-only branch
+
+    log.info(`Digest used ${modelCalls} metered call(s) of a ${callBudget} budget`);
   } catch (err) {
     log.error(`${agent} digest run failed`, { err: String(err) });
     // Fallback — show a minimal digest pointing at the data files so the user

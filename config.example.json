@@ -10,6 +10,11 @@
     "maxNewItemsPerSubscription": 15,
     "chunkSize": 12,
     "maxModelCalls": 12,
+    "includeImageUploads": false,
+    "localModel": "omnicoder-oc",
+    "cloudModel": "nemotron-3-super:cloud",
+    "maxLocalCalls": 120,
+    "maxLocalInputChars": 8000,
     "headless": true,
     "interestsFile": "./interests.toml",
     "clearSubs": false
