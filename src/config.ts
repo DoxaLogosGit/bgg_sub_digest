@@ -100,6 +100,29 @@ const ConfigSchema = z.object({
     // splitting while making a runaway impossible.
     maxModelCalls: z.number().int().positive().default(12),
 
+    // The LOCAL (unmetered) model, tried first on every subscription.
+    //
+    // This is PI'S catalog name, which differs from `ollama list`: it is
+    // `omnicoder-oc`, NOT `omnicoder-oc:latest`. Check with
+    // `pi --list-models < /dev/null` — and note the stdin redirect, because
+    // pi blocks forever when stdin is left open. A wrong name fails instantly
+    // with "Model not found" rather than hanging.
+    localModel: z.string().default('omnicoder-oc'),
+
+    // The METERED model, used only for subscriptions the local model could
+    // not render.
+    cloudModel: z.string().default('nemotron-3-super:cloud'),
+
+    // Ceiling on LOCAL calls for one run. Local calls cost time, not money,
+    // so this is far above maxModelCalls and exists to stop a runaway loop
+    // rather than to ration spend.
+    maxLocalCalls: z.number().int().positive().default(120),
+
+    // Largest input handed to the local model in one call. Measured
+    // 2026-09-11: above roughly 3K tokens it returns SILENT EMPTY OUTPUT.
+    // 12000 chars is ~3K tokens with margin. See local/split.ts.
+    maxLocalInputChars: z.number().int().positive().default(12000),
+
     // Whether to actually clear (mark-as-read) each processed subscription on BGG.
     // true  = click BGG's remove button on each notification row after processing.
     // false = log "[DEBUG] Would click..." but don't click — useful for testing.
@@ -260,3 +283,43 @@ export function loadInterestsConfig(interestsFilePath: string): InterestsConfig 
 // `import type` is a TypeScript-only import — it vanishes at compile time
 // and generates no runtime code. It's only for type checking.
 export type AppConfig = z.infer<typeof ConfigSchema>;
+
+// ---- resolveTiers ----------------------------------------------
+//
+// Which models does this run use, and in what order?
+//
+// The default is local-first: every subscription is attempted on the
+// unmetered model and only escalates to the metered one if it fails.
+// Escalation is per SUBSCRIPTION, not per run — one stubborn subscription
+// costs one metered call, not a night's worth. That containment is the whole
+// point: on 2026-09-11 an unconditional fallback would have spent 50.
+//
+// PYTHON CONTEXT: pure function over argv. Returns the model list to try in
+// order, plus whether escalation past the first tier is permitted at all.
+export function resolveTiers(
+  argv: string[],
+  cfg: { localModel: string; cloudModel: string },
+): { models: string[]; escalates: boolean } {
+  const localOnly = argv.includes('--local-only');
+  const cloudOnly = argv.includes('--cloud-only');
+
+  if (localOnly && cloudOnly) {
+    throw new Error(
+      'Cannot pass both --local-only and --cloud-only. Pick one, or neither ' +
+      'for the default (local first, cloud escalation).',
+    );
+  }
+
+  // An explicit --model is a direct instruction and wins over the tiers.
+  // Silently running a different model than the one named would be worse than
+  // any tiering benefit.
+  const modelIdx = argv.indexOf('--model');
+  if (modelIdx !== -1 && argv[modelIdx + 1] && !argv[modelIdx + 1].startsWith('--')) {
+    return { models: [argv[modelIdx + 1]], escalates: false };
+  }
+
+  if (cloudOnly) return { models: [cfg.cloudModel], escalates: false };
+  if (localOnly) return { models: [cfg.localModel], escalates: false };
+
+  return { models: [cfg.localModel, cfg.cloudModel], escalates: true };
+}
