@@ -16,6 +16,8 @@
 // a 9B model to 8.3 GB and forced an 18% CPU spill on an 8188 MiB card. At
 // 8192 the same model runs 100% on GPU (measured 2026-09-11).
 
+import { log } from '../logger';
+
 const OLLAMA = process.env.OLLAMA_HOST ?? 'http://127.0.0.1:11434';
 
 // Context window for a local call. The caller already caps the INPUT
@@ -37,10 +39,15 @@ const NUM_PREDICT = 4096;
 
 // Hard ceiling on a single local call.
 //
-// One subscription must not be able to eat the night. Nothing healthy has
-// taken longer than ~60s (the slowest good render measured was 38s), so this
-// is generous, and a call that exceeds it is failing rather than working.
-const CALL_TIMEOUT_MS = 150_000;
+// One subscription must not be able to eat the night, and the ceiling is the
+// dominant cost when calls fail. Measured 2026-09-12: a healthy render of a
+// 6.6KB thread takes 32s, while a failing subscription burned 3 x 150s doing
+// nothing — about a quarter of a 33-minute run spent waiting on calls that
+// were never going to answer.
+//
+// 75s is roughly 2x the slowest healthy render observed (38s). A call past
+// that is failing, and failing fast is free because the retry is free.
+const CALL_TIMEOUT_MS = 75_000;
 
 // The attribution rules from BGG-DATA-GUIDE.md, restated here because this
 // path deliberately does not load the workspace. Misattributing quoted text is
@@ -75,6 +82,8 @@ export async function askLocalProse(
     'Summarise this BoardGameGeek activity for a daily digest.\n\n' +
     `Output EXACTLY this and nothing else:\n\n${shape}\n\n${RULES}\n\nACTIVITY:\n${input}`;
 
+  const startedAt = Date.now();
+
   // A stuck call returns '' rather than throwing, so the caller treats it as
   // an ordinary defective render and retries — which is exactly right, since
   // an over-long call is a failing one.
@@ -93,6 +102,7 @@ export async function askLocalProse(
     });
   } catch (err) {
     if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      log.warn('Local call timed out', { model, inputChars: input.length, timeoutMs: CALL_TIMEOUT_MS });
       return '';
     }
     throw err;
@@ -102,5 +112,16 @@ export async function askLocalProse(
     throw new Error(`ollama returned ${res.status} for model ${model}`);
   }
   const body = (await res.json()) as { response?: string };
-  return body.response ?? '';
+  const answer = body.response ?? '';
+
+  // Timing is logged because it was guessed at twice before it was measured.
+  // A healthy call is ~30s; anything much longer is the model reasoning itself
+  // into an empty answer, and that is worth seeing in the log rather than
+  // inferring from a run's total duration.
+  const elapsedMs = Date.now() - startedAt;
+  const line = { model, inputChars: input.length, elapsedMs, outChars: answer.length };
+  if (elapsedMs > 60_000 || !answer.trim()) log.warn('Slow or empty local call', line);
+  else log.debug('Local call', line);
+
+  return answer;
 }
