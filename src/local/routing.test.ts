@@ -134,6 +134,39 @@ async function main() {
     assert.ok(r.skipped[0].reason.length > 0, 'the reason is recorded for the morning');
   }
 
+  // ---- a THROWING escalation must not discard the night's work ----
+  //
+  // escalateGroup was unwrapped: a 429 from the metered model threw straight
+  // out of renderLocalFirst, taking every already-rendered section with it.
+  // That is the exact shape of a quota-exhausted night.
+  {
+    const r = await renderLocalFirst({
+      entries, contents, interests, maxInputChars: 100_000, escalates: true,
+      askLocal: async (_i, _w, e) => (e.subscriptionId === 1 ? '' : GOOD),
+      escalateGroup: async () => { throw new Error('429 Too Many Requests: monthly usage limit'); },
+    });
+
+    assert.ok(r.sections.includes('Sub 2'), 'sections rendered before the failure survive');
+    assert.ok(r.sections.includes('Sub 3'), 'and the run continues past it');
+    assert.deepEqual(r.skipped.map((s) => s.title), ['Sub 1'],
+      'only the subscription that could not be rendered is lost');
+  }
+
+  // ---- once the metered tier is exhausted, stop calling it ----
+  //
+  // Every later escalation would fail identically. On 2026-09-11 continuing
+  // through them cost 22 doomed calls and hours.
+  {
+    let cloud = 0;
+    const r = await renderLocalFirst({
+      entries, contents, interests, maxInputChars: 100_000, escalates: true,
+      askLocal: async () => '',
+      escalateGroup: async () => { cloud += 1; throw new Error('429 Too Many Requests: usage limit'); },
+    });
+    assert.equal(cloud, 1, `a quota failure must stop further escalation, saw ${cloud}`);
+    assert.equal(r.skipped.length, 3, 'all three are still recorded as lost');
+  }
+
   // ---- the local budget halts the run ----
   {
     let local = 0;

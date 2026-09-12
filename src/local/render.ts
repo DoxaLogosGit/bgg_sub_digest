@@ -261,6 +261,7 @@ export async function renderSubscriptionLocally(params: {
 // is what keeps a bad night from becoming lost activity.
 
 import type { DigestSkippedEntry } from '../agent';
+import { isFatalRunError } from '../agent';
 import { log } from '../logger';
 
 // How many times to ask the local model before escalating. Three, because the
@@ -292,6 +293,11 @@ export async function renderLocalFirst(params: {
   const rendered: string[] = [];
   const skipped:  DigestSkippedEntry[] = [];
   let localCalls = 0, cloudCalls = 0;
+
+  // Set when the metered tier refuses for a reason that dooms every later
+  // call — an exhausted quota or budget. Local rendering continues; only
+  // escalation stops.
+  let meteredExhausted = false;
 
   // Collapse identical stubs before rendering. BGG emits one notice per image,
   // so a game that gained 30 images arrives as 30 entries with the same title
@@ -350,10 +356,35 @@ export async function renderLocalFirst(params: {
       continue;
     }
 
+    if (meteredExhausted) {
+      skipped.push(...group.map((e) => ({
+        title: e.title, filePath: e.filePath,
+        reason: `local render failed (${result.defect}); the metered tier is exhausted`,
+      })));
+      continue;
+    }
+
     log.info('Escalating one subscription to the metered model', {
       title: entry.title, defect: result.defect,
     });
-    const fromCloud = await escalateGroup(group);
+
+    // An escalation that THROWS must not take the night with it. Unwrapped,
+    // a 429 from the metered model propagated out of this function and
+    // discarded every section already rendered — the exact shape of a
+    // quota-exhausted night (2026-09-11, both providers in one day).
+    let fromCloud: string | null = null;
+    try {
+      fromCloud = await escalateGroup(group);
+    } catch (err) {
+      if (isFatalRunError(err)) {
+        // Every later escalation fails identically; continuing through them
+        // cost 22 doomed calls on 2026-09-11. Stop asking.
+        meteredExhausted = true;
+        log.error('Metered tier exhausted — remaining failures will be skipped', { err: String(err) });
+      } else {
+        log.warn('Cloud escalation threw', { title: entry.title, err: String(err) });
+      }
+    }
     cloudCalls += 1;
     if (fromCloud) { rendered.push(fromCloud); continue; }
 
