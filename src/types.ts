@@ -103,6 +103,12 @@ export interface BggSubscription {
   // (boardgame/blog/filepage — no XML API) this is the only content we have
   // to show. For thread/geeklist subs it's available as a fallback.
   rowText?: string;
+
+  // The notice trackingItems belonging to THIS subscription — the subset of
+  // the run's clearItems that marks it viewed. Lets a subscription whose
+  // content could not be fetched keep its notices for the next run.
+  // Python: list[dict]  (empty when built outside the notice feed)
+  clearItems?: { type: string; id: string }[];
 }
 
 // ---- Thread types ----------------------------------------------

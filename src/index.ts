@@ -38,6 +38,8 @@ import {
   fetchNoticeFeed,
   transformNotices,
   clearViewdates,
+  withholdClearItems,
+  type ClearItem,
 } from './bgg/notifications';
 import {
   fetchThread,
@@ -377,7 +379,14 @@ async function main(): Promise<void> {
       // clear EVERY feed item after the digest, a stub guarantees nothing the
       // notice feed reported silently disappears — matches the no-data-loss goal.
       // `BggSubscription` is the type of `sub`; `reason` annotates why it's a stub.
+      // Notices of subscriptions whose fetch FAILED. A failure is temporary
+      // (BGG's "queued" 202s outlasting our retries), so these stay unread and
+      // the next run tries again instead of the stub being the last word.
+      const withheldClear: ClearItem[] = [];
+      const FETCH_FAILED = 'temporary fetch failure — will retry next run';
+
       const writeStub = (sub: BggSubscription, reason?: string): void => {
+        if (reason === FETCH_FAILED) withheldClear.push(...(sub.clearItems ?? []));
         const stubMarkdown =
           `# ${sub.title}\n\n` +
           `New activity on a BGG ${sub.type} you subscribe to${reason ? ` (${reason})` : ''}.\n\n` +
@@ -428,7 +437,7 @@ async function main(): Promise<void> {
           const thread = await fetchThread(sub.id, config.bgg.apiKey, apiRequest, lookback);
           if (!thread) {
             log.warn(`Could not fetch thread ${sub.id} — emitting stub so it isn't lost`);
-            writeStub(sub, 'content fetch failed');
+            writeStub(sub, FETCH_FAILED);
             await sleep(1_000);
             continue;  // `continue` skips the rest of this loop iteration — same as Python
           }
@@ -567,7 +576,7 @@ async function main(): Promise<void> {
           const geeklist = await fetchGeeklist(sub.id, config.bgg.apiKey, apiRequest);
           if (!geeklist) {
             log.warn(`Could not fetch geeklist ${sub.id} — emitting stub so it isn't lost`);
-            writeStub(sub, 'content fetch failed');
+            writeStub(sub, FETCH_FAILED);
             await sleep(1_000);
             continue;
           }
@@ -750,7 +759,12 @@ async function main(): Promise<void> {
       if (!digestOutcome.clearSafe) {
         log.warn(`Digest invalid — skipping clearViewdates so ${clearItems.length} notice item(s) survive to the next run`);
       } else if (config.digest.clearSubs) {
-        await clearViewdates(apiRequest, authToken, clearItems);
+        // Subscriptions BGG would not return tonight keep their notices.
+        const toClear = withholdClearItems(clearItems, withheldClear);
+        if (toClear.length < clearItems.length) {
+          log.warn(`Leaving ${clearItems.length - toClear.length} notice item(s) unread — their content fetch failed and will be retried next run`);
+        }
+        await clearViewdates(apiRequest, authToken, toClear);
       } else {
         log.info(`[clearSubs:false] Would clear ${clearItems.length} notice item(s) — skipping`);
       }
@@ -988,6 +1002,10 @@ async function runAgentAndWriteDigest(
         completedCount: (localResult.sections.match(/^### \[/gm) ?? []).length,
         totalCount:     ranked.length,
         skipped:        localResult.skipped.length > 0 ? localResult.skipped : undefined,
+        modelLabel:     `${config.digest.localModel}, ${localResult.localCalls} local call(s)` +
+                        (tiers.escalates
+                          ? `, ${localResult.cloudCalls} escalated to ${config.digest.cloudModel}`
+                          : ', --local-only'),
       };
     } else {
 
@@ -1153,7 +1171,9 @@ function formatTokenUsage(result: DigestResult, agent: AgentName, model: string)
   // differ (compared on the bare model name, ignoring any provider/ prefix),
   // show both so the fallback is visible in the digest itself.
   const bare = (m: string) => m.split('/').pop();
-  const agentStr = result.actualModel && bare(result.actualModel) !== bare(model)
+  const agentStr = result.modelLabel
+    ? `Agent: ${agent} (${result.modelLabel})`
+    : result.actualModel && bare(result.actualModel) !== bare(model)
     ? `Agent: ${agent} (${result.actualModel}, requested ${model})`
     : `Agent: ${agent} (${result.actualModel ?? model})`;
 

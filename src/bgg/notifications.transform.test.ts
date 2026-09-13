@@ -11,7 +11,7 @@
 // grouping/mapping logic.
 
 import assert from 'node:assert/strict';
-import { transformNotices, type NoticeFeed } from './notifications';
+import { transformNotices, withholdClearItems, type NoticeFeed } from './notifications';
 
 // One real notice of each observed item type, plus a SECOND article in the same
 // thread as one of them (3614520) so we can prove grouping + multi-id collection.
@@ -88,5 +88,14 @@ assert.deepEqual(
   ['blogpost:187181', 'geeklist:337500', 'listitem:6233310', 'thread:3614520', 'thread:3720323', 'video:615021'].sort(),
   `clear list wrong: ${clearKeys.join(', ')}`,
 );
+
+// --- per-subscription clear refs: a failed fetch withholds exactly its own
+//     notices (2026-09-13, "SGOYT made me buy this!" cleared after a 202 timeout).
+const thr = subscriptions.find((s) => s.id === 3614520)!;
+assert.deepEqual(thr.clearItems, [{ type: 'thread', id: '3614520' }],
+  'a subscription carries its own deduped trackingItems');
+const kept = withholdClearItems(clearItems, thr.clearItems!).map((c) => `${c.type}:${c.id}`);
+assert.ok(!kept.includes('thread:3614520'), 'the failed subscription stays unread');
+assert.equal(kept.length, clearKeys.length - 1, 'every other notice is still cleared');
 
 console.log('✓ notifications.transform.test.ts — all assertions passed');

@@ -28,6 +28,10 @@ export interface LocalRenderResult {
   calls:   number;          // model calls spent, for the caller's budget
 }
 
+// How many times to ask for one PART of a split subscription. Local calls cost
+// only time; a failed part otherwise costs its items.
+const PART_ATTEMPTS = 3;
+
 // Pull the bullet lines out of whatever the model returned. Anything that is
 // not a bullet (a stray preamble, a repeated Summary) is discarded — the
 // caller supplies the structure.
@@ -81,8 +85,20 @@ function stubSection(group: ManifestEntry[], content: string): string {
   const entry = group[0];
   const noun  = nounFor(entry.type);
 
-  // The parenthetical reason index.ts recorded, e.g. "content fetch failed".
+  // The parenthetical reason index.ts recorded, e.g. "new items beyond API window".
   const why = /you subscribe to \(([^)]+)\)/.exec(content)?.[1];
+
+  // A failed fetch is NOT "BGG does not expose this" — the same list loaded
+  // fine in August. Say what happened, and that its notice was kept.
+  if (why && /temporary fetch failure/.test(why)) {
+    return [
+      `**Summary:** BGG did not return the content of "${entry.title}" tonight (a temporary ` +
+      `API failure). Its notice has been left unread, so the next run will try again.`,
+      '',
+      '**New Activity:**',
+      `- ${entry.url}`,
+    ].join('\n');
+  }
 
   // The TITLE is included deliberately. A real workspace is mostly stubs, and
   // identical summaries drove isVacuousDigest's distinct-summary ratio to
@@ -115,6 +131,37 @@ function stubSection(group: ManifestEntry[], content: string): string {
   ].join('\n');
 }
 
+// ---- listRecords ------------------------------------------------
+//
+// Bullets for a part the model never summarised, written entirely in code:
+// who posted, what it was about, and a link. No prose, so nothing invented.
+//
+// WHY (2026-09-13): 5 of the ~8 parts of SGOYT September timed out. Their
+// items contributed no bullets, the section still validated on the survivors,
+// the run was stamped complete and the notices cleared — about 25 of 50 items,
+// including the reader's own, vanished without a trace. A plain listing is a
+// poor substitute for a summary and an infinitely better one than silence.
+//
+// Record shapes come from agent.ts's formatters:
+//   [Item by NAME posted D, last activity D] [NEW ITEM] — GAME   + "Link: url"
+//   [Post by NAME on D]                     + "Subject: s"       + "Link: url"
+export function listRecords(part: string): string[] {
+  const bullets: string[] = [];
+  for (const record of part.split(/^(?=\[(?:Item|Post) by )/m)) {
+    const head = /^\[(?:Item|Post) by (.+?) (?:posted|on) [^\]]*\](.*)$/m.exec(record);
+    if (!head) continue;                               // the file header, not a record
+
+    const who     = head[1].trim();
+    const game    = /—\s*(.+)$/.exec(head[2])?.[1]?.trim();
+    const subject = /^Subject:[ \t]*(.+)$/m.exec(record)?.[1]?.trim();
+    const link    = /^Link:[ \t]*(\S+)/m.exec(record)?.[1];
+    const what    = game ?? subject ?? 'post';
+
+    bullets.push(`- ${who} — ${link ? `[${what}](${link})` : what} (not summarised)`);
+  }
+  return bullets;
+}
+
 // ---- describeBullets --------------------------------------------
 //
 // A summary of last resort, derived from the bullets rather than from the
@@ -131,7 +178,7 @@ function describeBullets(bullets: string[]): string {
     : ` from ${unique.slice(0, 3).join(', ')} and ${unique.length - 3} others`;
 
   return `${bullets.length} new item${bullets.length === 1 ? '' : 's'}${who}. ` +
-         `A written summary was not available for this subscription, so the activity is listed in full below.`;
+         `A written summary was not available for this subscription, so the activity is listed below.`;
 }
 
 // ---- normaliseProse ---------------------------------------------
@@ -215,28 +262,53 @@ export async function renderSubscriptionLocally(params: {
   }
 
   // ---- split: bullets per part, then one Summary over all of them ----
-  const bulletLines: string[] = [];
+  const bulletLines: string[] = [];   // everything shown, in source order
+  const summarised:  string[] = [];   // only what the model wrote
+  let unsummarisedItems = 0;
+
   for (const part of parts) {
-    const answer = await askProse(part, false);
-    calls += 1;
-    // A part that comes back empty costs its own bullets but not the whole
-    // subscription — the merged result is still validated below, so a total
-    // loss is caught while a partial one still ships what survived.
-    bulletLines.push(...bulletsOf(answer));
+    // Retry each part on its own. The whole-subscription retry in
+    // renderLocalFirst fires only when the section is DEFECTIVE, and one good
+    // part is enough to make it valid — so without this a dead part was never
+    // retried at all (2026-09-13).
+    let bullets: string[] = [];
+    for (let tryNo = 1; bullets.length === 0 && tryNo <= PART_ATTEMPTS; tryNo++) {
+      bullets = bulletsOf(await askProse(part, false));
+      calls += 1;
+    }
+
+    if (bullets.length > 0) {
+      bulletLines.push(...bullets);
+      summarised.push(...bullets);
+    } else {
+      // Still nothing: list the part's records in code rather than drop them.
+      const listed = listRecords(part);
+      bulletLines.push(...listed);
+      unsummarisedItems += listed.length;
+    }
   }
 
-  if (bulletLines.length === 0) {
+  // No part summarised at all is still a defect, so the caller's retry and
+  // escalation ladder gets its turn before settling for a bare listing.
+  if (summarised.length === 0) {
     return { section: null, defect: 'no bullets from any part', calls };
   }
 
-  const summary = await askProse(bulletLines.join('\n'), true);
+  const summary = await askProse(summarised.join('\n'), true);
   calls += 1;
 
   // A flaky empty summary must not cost a subscription whose bullets are
   // already in hand. SGOYT September (61KB, 8 parts) was lost exactly this way
   // on 2026-09-12. The fallback states what the bullets contain and invents
   // nothing.
-  const summaryText = normaliseSummary(summary) || describeBullets(bulletLines);
+  let summaryText = normaliseSummary(summary) || describeBullets(summarised);
+
+  // Say so when part of the section is a bare listing — otherwise the reader
+  // takes the summary as covering everything below it.
+  if (unsummarisedItems > 0) {
+    summaryText += ` ${unsummarisedItems} item${unsummarisedItems === 1 ? '' : 's'} ` +
+      `could not be summarised and ${unsummarisedItems === 1 ? 'is' : 'are'} listed by title only.`;
+  }
 
   const prose = `**Summary:** ${summaryText}\n\n**New Activity:**\n${bulletLines.join('\n')}`;
   const section = assembleSection(entry, prose, topics);

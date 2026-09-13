@@ -264,6 +264,7 @@ export function transformNotices(feed: NoticeFeed): NoticesResult {
       unreadCount: acc.count,
       parentName,
       rowText: ei?.label ? `${ei.label}: ${title}` : title,
+      clearItems: dedupeRefs(acc.clear),
     });
   }
 
@@ -314,6 +315,23 @@ function canonicalUrl(type: string, id: string): string {
 }
 
 // De-duplicate {type,id} refs (used for the clear list).
+// ---- withholdClearItems ------------------------------------------
+//
+// The run's clearItems minus those of subscriptions that must stay unread.
+//
+// WHY (2026-09-13): BGG answered "queued" for "SGOYT made me buy this!" until
+// the retries ran out. The digest showed a placeholder, the run was complete,
+// and the notice was cleared with everything else — so the list was never
+// fetched again. A failed fetch is temporary; its notices must survive so the
+// next run tries again.
+//
+// Matching is by type:id, so a ref shared with another subscription is also
+// kept. That errs toward re-reporting, which is the safe direction.
+export function withholdClearItems(items: ClearItem[], withheld: ClearItem[]): ClearItem[] {
+  const keep = new Set(withheld.map((r) => `${r.type}:${r.id}`));
+  return items.filter((r) => !keep.has(`${r.type}:${r.id}`));
+}
+
 function dedupeRefs(refs: NoticeRef[]): NoticeRef[] {
   const seen = new Set<string>();
   const out: NoticeRef[] = [];

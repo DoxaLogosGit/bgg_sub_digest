@@ -686,6 +686,12 @@ export interface DigestResult {
   // ran. Format: "provider/model" (e.g. "ollama/minimax-m3:cloud") when the
   // provider is known. Undefined when the agent doesn't report it (plain claude).
   actualModel?: string;
+
+  // Set by the local-first path, which never calls `--model` at all: names the
+  // tiers that actually rendered, e.g. "omnicoder-oc, 0 cloud calls". Replaces
+  // the requested model in the footer — on 2026-09-13 the footer credited
+  // qwen3-coder-next:cloud with a digest it had no part in.
+  modelLabel?: string;
 }
 
 // ============================================================

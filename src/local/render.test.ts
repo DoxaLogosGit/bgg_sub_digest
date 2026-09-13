@@ -8,7 +8,7 @@
 // including the failure paths, which decide whether a bad night costs data.
 
 import assert from 'node:assert/strict';
-import { renderSubscriptionLocally } from './render';
+import { listRecords, renderSubscriptionLocally } from './render';
 import type { ManifestEntry } from '../agent';
 import type { InterestsConfig } from '../interests';
 
@@ -115,6 +115,41 @@ async function main() {
     });
     assert.equal(r.defect, null, 'one dead part does not sink the subscription');
     assert.ok(r.section!.includes('- member1'), 'surviving parts still contribute');
+    assert.ok(!/not summarised/.test(r.section!), 'a part that recovers on retry is summarised normally');
+  }
+
+  // ---- a part that stays empty is LISTED, never dropped ----
+  //
+  // 2026-09-13: 5 of ~8 SGOYT parts timed out, the survivors made the section
+  // valid, and ~25 of 50 items vanished while the run reported complete and
+  // cleared its notices. A dead part must be retried on its own, and if it
+  // never answers its items must still appear, with links.
+  {
+    const perPart = new Map<string, number>();
+    const r = await renderSubscriptionLocally({
+      entry, content, interests, maxInputChars: 700,
+      askProse: async (input, wantSummary) => {
+        if (wantSummary) return '**Summary:** Members posted several solo sessions with scores and reviews.';
+        perPart.set(input, (perPart.get(input) ?? 0) + 1);
+        return input.includes('member1 posted') ? '' : BULLETS_ONLY;
+      },
+    });
+    const deadPart = [...perPart.keys()].find((k) => k.includes('member1 posted'))!;
+    assert.equal(perPart.get(deadPart), 3, 'the dead part is retried on its own');
+    assert.equal(r.defect, null);
+    assert.match(r.section!, /^- member1 — \[Spirit Island\]\(https:\/\/x\/#item1\) \(not summarised\)$/m,
+      'its item is listed in code, with a link');
+    assert.match(r.section!, /could not be summarised and (is|are) listed by title only/,
+      'and the summary says part of the section is a bare listing');
+    assert.ok(!/listed in full/.test(r.section!), 'never claims completeness');
+  }
+
+  // ---- listRecords reads thread posts too ----
+  {
+    const thread = '=== Thread: X ===\n\n[Post by zolmikthiat on 9/12/2026]\n' +
+      'Subject: Re: Mage Knight?\nLink: https://boardgamegeek.com/thread/1?article=2\nBody.\n\n';
+    assert.deepEqual(listRecords(thread),
+      ['- zolmikthiat — [Re: Mage Knight?](https://boardgamegeek.com/thread/1?article=2) (not summarised)']);
   }
 
   // ---- every part empty IS a defect ----
@@ -153,6 +188,22 @@ async function main() {
       'the stub summary names the subscription — 32 identical summaries in a real ' +
       'workspace drove isVacuousDigest to 0.326 against its 0.30 floor');
     assert.equal(r.calls, 0);
+  }
+
+  // ---- a FAILED fetch is not described as "BGG does not expose" ----
+  //
+  // 2026-09-13: "SGOYT made me buy this!" 202-timed-out and read as if BGG
+  // never offered its content. It is temporary and its notice is kept.
+  {
+    const stub = '# SGOYT made me buy this!\n\nNew activity on a BGG geeklist you subscribe to ' +
+                 '(temporary fetch failure — will retry next run).\n\n**Link:** https://boardgamegeek.com/geeklist/166714\n';
+    const r = await renderSubscriptionLocally({
+      entry, content: stub, interests, maxInputChars: 100_000,
+      askProse: async () => { throw new Error('a stub must not reach the model'); },
+    });
+    assert.equal(r.defect, null);
+    assert.ok(!/does not expose/.test(r.section!), 'not blamed on the API');
+    assert.match(r.section!, /temporary API failure.*next run will try again/);
   }
 
   // ---- the model may omit the **Summary:** marker; code adds it ----
