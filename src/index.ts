@@ -968,7 +968,7 @@ async function runAgentAndWriteDigest(
         // only time.
         for (let tryNo = 1; tryNo <= 3 && !highlights; tryNo++) {
           try {
-            const raw = await askLocalProse(config.digest.localModel, lines, true);
+            const raw = await askLocalProse(config.digest.localModel, lines, true, 'highlights');
             highlights = extractHighlightsBlock(raw);
             if (!highlights && raw.trim()) {
               // The model wrote a summary without the header. The header is

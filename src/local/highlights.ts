@@ -20,20 +20,46 @@ import { isImageUpload } from '../interests';
 
 // ---- summaryLines ------------------------------------------------
 //
-// "<title> — <summary>" per section, nothing else.
+// "<title> — <summary> (from <authors>)" per section, nothing else.
+//
+// The authors are pulled from the section's bullets in code. Without them the
+// synthesis pass had titles and author-less summaries only, and wrote
+// "Community member — …", "User — …" on 2026-09-13 although every name was
+// sitting in the bullets. Names are cheap; the bullets themselves are not.
+const MAX_AUTHORS = 4;
+
 export function summaryLines(sections: string): string {
   const out: string[] = [];
-  let title = '';
+  let title = '', summary = '';
+  let authors: string[] = [];
+
+  const flush = () => {
+    if (!title || !summary) return;
+    const unique = [...new Set(authors)];
+    const who = unique.length === 0 ? ''
+      : unique.length <= MAX_AUTHORS ? ` (from ${unique.join(', ')})`
+      : ` (from ${unique.slice(0, MAX_AUTHORS).join(', ')} and ${unique.length - MAX_AUTHORS} others)`;
+    out.push(`${title} — ${summary}${who}`);
+  };
 
   for (const line of sections.split('\n')) {
     // Greedy up to the LAST "](", so a title that itself opens with a bracket
     // survives: "### [[Detective Hawk] Wayfarers ...](https://...)".
     const header = /^###[ \t]+\[(.+)\]\(/.exec(line);
-    if (header) { title = header[1]; continue; }
+    if (header) {
+      flush();
+      title = header[1]; summary = ''; authors = [];
+      continue;
+    }
 
-    const summary = /^\*\*Summary:\*\*[ \t]*(.*)$/.exec(line);
-    if (summary && title) out.push(`${title} — ${summary[1].trim()}`);
+    const s = /^\*\*Summary:\*\*[ \t]*(.*)$/.exec(line);
+    if (s) { summary = s[1].trim(); continue; }
+
+    // "- NAME — what they did". A bare-url bullet (a stub) has no author.
+    const bullet = /^[-*][ \t]+([^—\n]{1,40}?)[ \t]+—[ \t]/.exec(line);
+    if (bullet && !/^https?:/.test(bullet[1])) authors.push(bullet[1].trim());
   }
+  flush();
 
   return out.join('\n');
 }

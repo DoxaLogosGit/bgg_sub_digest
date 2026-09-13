@@ -59,6 +59,23 @@ const RULES = [
   '- A line starting with > is a QUOTE of an EARLIER post. Those are NOT the words of the person whose post contains them.',
   '- A "↳ Comment by X" line is a DIFFERENT person replying to that item.',
   '- Every bullet must say what the person argued, asked, or played. A bullet with only a name is useless.',
+  '- Refer to people by their username, including in the Summary. Never "a user", "a community member" or "a hobbyist".',
+  '- Invent nothing. Use only the text below.',
+].join('\n');
+
+// For the highlights pass. Each input line is one subscription:
+// "<title> — <summary> (from <authors>)".
+//
+// Keep this SHORT. Measured 2026-09-13: with these rules the pass answered in
+// 56s; adding "rewrite each line in at most 20 words" and "skip empty ones"
+// produced three 75s timeouts and, given 180s, an empty answer after 98s —
+// the thinking model reasons itself out of its output budget. Condensing is
+// not worth losing the Highlights block to the mechanical fallback.
+const HIGHLIGHT_RULES = [
+  'Rules:',
+  '- Each line of ACTIVITY is one subscription: its title, a dash, a summary, and the people who posted in brackets.',
+  '- Start every bullet with the subscription title. Name people only as they appear in that line\'s brackets.',
+  '- Never write a generic stand-in such as "User", "Community member" or "Hobbyist" in place of a name.',
   '- Invent nothing. Use only the text below.',
 ].join('\n');
 
@@ -66,21 +83,30 @@ export async function askLocalProse(
   model: string,
   input: string,
   wantSummary: boolean,
+  // 'highlights' is the cross-subscription pass over "<title> — <summary>"
+  // lines. It needs its own shape: the per-subscription one demands
+  // "<author> — …" bullets, and with titles as input the model invented
+  // authors — "Community member", "User", "Hobbyist" (2026-09-13).
+  purpose: 'section' | 'highlights' = 'section',
 ): Promise<string> {
   // Two shapes. A summary pass over already-merged bullets must NOT ask for
   // bullets again, or the model rewrites them and duplicates the list.
   const summarisingBullets = wantSummary && /^[ \t]*[-*][ \t]+\S/m.test(input) && !input.includes('[Post by ') && !input.includes('[Item by ');
 
-  const shape = summarisingBullets
+  const shape = purpose === 'highlights'
+    ? '**Summary:** two or three sentences on the most notable activity across all subscriptions.\n' +
+      '**New Activity:**\n- <subscription title, exactly as given> — <what happened there and who, one sentence>'
+    : summarisingBullets
     ? '**Summary:** two or three sentences covering the activity listed below.'
     : wantSummary
       ? '**Summary:** two or three sentences on what is new and the overall tone.\n' +
         '**New Activity:**\n- <author> — <what they said, one sentence>'
       : '**New Activity:**\n- <author> — <what they said, one sentence>';
 
+  const rules = purpose === 'highlights' ? HIGHLIGHT_RULES : RULES;
   const prompt =
     'Summarise this BoardGameGeek activity for a daily digest.\n\n' +
-    `Output EXACTLY this and nothing else:\n\n${shape}\n\n${RULES}\n\nACTIVITY:\n${input}`;
+    `Output EXACTLY this and nothing else:\n\n${shape}\n\n${rules}\n\nACTIVITY:\n${input}`;
 
   const startedAt = Date.now();
 

@@ -35,6 +35,8 @@ function entry(over: Partial<ManifestEntry> & { title: string }): ManifestEntry 
   assert.match(out, /A — First thing happened in detail\./);
   assert.match(out, /B — Second thing happened in detail\./);
   assert.ok(!out.includes('- a — x'), 'bullets are excluded');
+  assert.match(out, /First thing happened in detail\. \(from a\)/,
+    'but their authors are kept — without them Highlights wrote "Community member" (2026-09-13)');
   assert.ok(out.length < sections.length / 2, 'the result is substantially smaller');
 }
 

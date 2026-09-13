@@ -184,6 +184,23 @@ function attr(node: Record<string, unknown>, name: string): string {
   return attrs?.[name] ?? '';
 }
 
+// ---- threadSubject ----------------------------------------------
+//
+// The thread's title is a <subject> CHILD ELEMENT of <thread>, not an
+// attribute. It was read as an attribute from the initial commit until
+// 2026-09-13, so every thread's data file began "=== Thread:  ===" and the
+// model never saw what the thread was called — Highlights fell back to
+// "A community member asked…". Exported for the test.
+export function threadSubject(threadNode: Record<string, unknown>): string {
+  const child = threadNode['subject'];
+  // With explicitArray:false a plain text element parses to a string; one that
+  // ever gains attributes parses to { _: text, $: {...} }.
+  const text = typeof child === 'string'
+    ? child
+    : String((child as Record<string, unknown> | undefined)?.['_'] ?? '');
+  return text.trim() || attr(threadNode, 'subject');
+}
+
 // Parse a BGG date string into a JavaScript Date object.
 // BGG dates look like "Wed, 15 Jan 2024 10:30:00 +0000" (RFC 2822).
 // new Date() handles RFC 2822 and ISO 8601 natively.
@@ -313,8 +330,9 @@ export async function fetchThread(
 
   // ---- Navigate the parsed XML structure ----
   //
-  // BGG v2 thread XML structure:
-  //   <thread id="3456789" subject="SGOYT April" link="https://..." numarticles="42">
+  // BGG v2 thread XML structure (verified live 2026-09-13):
+  //   <thread id="3456789" numarticles="42" link="https://..." termsofuse="...">
+  //     <subject>SGOYT April</subject>
   //     <articles>
   //       <article id="..." username="..." postdate="..." editdate="...">
   //         <subject>...</subject>
@@ -327,7 +345,8 @@ export async function fetchThread(
   // xml2js represents this as:
   //   parsed = {
   //     thread: {
-  //       '$': { id: '3456789', subject: 'SGOYT April', link: '...', numarticles: '42' },
+  //       '$': { id: '3456789', link: '...', numarticles: '42' },
+  //       subject: 'SGOYT April',
   //       articles: {
   //         article: [ { '$': { id: '...', username: '...' }, body: '...', subject: '...' } ]
   //       }
@@ -346,7 +365,7 @@ export async function fetchThread(
 
   // Extract attributes from the <thread> element using our attr() helper
   const threadId_ = parseInt(attr(threadNode, 'id'), 10);
-  const subject   = attr(threadNode, 'subject');
+  const subject   = threadSubject(threadNode);
   const link      = attr(threadNode, 'link');
   const numArticles = parseInt(attr(threadNode, 'numarticles'), 10) || 0;
 
